@@ -43,7 +43,8 @@ def _default_terrain_root() -> str:
 
 
 def _rover_group(ns: str, terrain_dir: str, collection_goal: int,
-                 arrive_r: float, fringe_r: float, reveal_radius: float):
+                 arrive_r: float, fringe_r: float, reveal_radius: float,
+                 map_source: str = "online"):
     """단일 rover 의 5 노드 묶음 — 토픽 모두 /<ns>/... prefix.
 
     terrain_dir 는 T1 Isaac Sim 의 --terrain 인자와 동일한 terrain 폴더 경로.
@@ -51,7 +52,26 @@ def _rover_group(ns: str, terrain_dir: str, collection_goal: int,
     collection_goal 은 각 rover 가 N개 채집 시 RETURN_TO_BASE 전환.
     """
     nsp = "/" + ns
-    return [
+    mapping = []
+    if map_source == "online":
+        # 깊이 카메라 → 위험 지도 (미리 만든 obstacle_grid 대신).
+        mapping.append(Node(
+            package="isaac_drive",
+            executable="hazard_map_node",
+            name="hazard_map_node",
+            namespace=ns,
+            output="screen",
+            parameters=[{
+                "terrain_dir":      terrain_dir,
+                "depth_topic":      f"{nsp}/camera/rover/depth",
+                "info_topic":       f"{nsp}/camera/rover/camera_info",
+                "odom_topic":       f"{nsp}/ground_truth/odom",
+                "joint_topic":      f"{nsp}/joint_states_raw",
+                "detections_topic": f"{nsp}/perception/detections",
+                "map_topic":        f"{nsp}/hazard_map",
+            }],
+        ))
+    return mapping + [
         # T5 cheat 어댑터 — /<ns>/ground_truth/odom → /<ns>/rover/estimated_pose
         Node(
             package="isaac_drive",
@@ -102,6 +122,8 @@ def _rover_group(ns: str, terrain_dir: str, collection_goal: int,
                 "pose_topic":    f"{nsp}/rover/estimated_pose",
                 "cmd_vel_topic": f"{nsp}/coverage/cmd_vel_raw",
                 "terrain_dir": terrain_dir,
+                "map_source": map_source,
+                "hazard_map_topic": f"{nsp}/hazard_map",
                 # matplotlib Starcraft Map viewer 비활성 — Web HUD 의
                 # COVERAGE MAP canvas 가 두 rover 추적 가능해진 시점부터
                 # 더이상 필요 없음. enable_minimap_topics 만 True 로
@@ -151,6 +173,8 @@ def _rover_group(ns: str, terrain_dir: str, collection_goal: int,
                 "mode_topic":         f"{nsp}/mission/mode",
                 "estop_topic":        f"{nsp}/mission/estop",
                 "terrain_dir":        terrain_dir,
+                "map_source":         map_source,
+                "hazard_map_topic":   f"{nsp}/hazard_map",
                 # 협조 param (enable_mineral_claim/enable_rover_avoid 등) 은
                 # main 의 mission_manager_node 에 declare 안 됨 — 단순 namespace
                 # 복사 단계 (옵션 X) 라 미설정. 협조 단계 (옵션 Y) 진입 시
@@ -198,12 +222,13 @@ def _launch_setup(context, *args, **kwargs):
     enable_web_video = LaunchConfiguration("enable_web_video").perform(context)
     web_video_port = LaunchConfiguration("web_video_port").perform(context)
     reveal_radius = float(LaunchConfiguration("reveal_radius").perform(context))
+    map_source = LaunchConfiguration("map_source").perform(context).strip().lower()
     print(f"[mvp_multi] terrain_dir={terrain_dir}  rovers={rovers}  "
-          f"collection_goal={collection_goal} (per rover)")
+          f"collection_goal={collection_goal} (per rover)  map_source={map_source}")
     nodes = []
     for ns in rovers:
         nodes.extend(_rover_group(ns, terrain_dir, collection_goal,
-                                  arrive_r, fringe_r, reveal_radius))
+                                  arrive_r, fringe_r, reveal_radius, map_source))
 
     # Web HUD — 단일 인스턴스가 모든 rover namespace 추적 (옵션 X 단계 2).
     # mission_web_node 의 rover_namespaces param 으로 ns 리스트 전달.
@@ -274,5 +299,10 @@ def generate_launch_description() -> LaunchDescription:
                         "마찰로 든다 (시뮬레이터 --grasp friction 과 짝). contact: "
                         "손끝이 닿을 때까지 내려 부착 (--grasp contact --gripper rg2). "
                         "snap: 예전 방식 (--grasp magic --gripper rg2)."),
+        DeclareLaunchArgument(
+            "map_source", default_value="online",
+            description="장애물 지도의 출처. online: 로버 깊이 카메라로 주행 중에 작성 "
+                        "(hazard_map_node). prebuilt: 지형과 함께 만들어 둔 "
+                        "obstacle_grid.npy (원본 방식, 정답 지도)."),
         OpaqueFunction(function=_launch_setup),
     ])

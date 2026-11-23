@@ -40,6 +40,8 @@ from std_msgs.msg import Empty, String
 from isaac_interfaces.action import ExecuteArmTask
 from isaac_interfaces.msg import BatteryState, Detection, DetectionArray, MissionState
 from isaac_drive.navigation.path_planner import astar, simplify_path
+from isaac_drive.navigation.online_map import (OnlineObstacleLayer,
+                                               basecamp_keepout, blank_terrain)
 from isaac_drive.navigation.terrain_loader import load_terrain
 
 
@@ -120,6 +122,10 @@ class MissionManagerNode(Node):
         self.declare_parameter("battery_topic", "/battery_state")
         self.declare_parameter("min_confidence", 0.6)
         self.declare_parameter("terrain_dir", _default_terrain_dir())
+        # 장애물 지도의 출처. online (기본): hazard_map_node 가 깊이 카메라로
+        # 주행 중에 만드는 지도. prebuilt: obstacle_grid.npy (원본, 정답 지도).
+        self.declare_parameter("map_source", "online")
+        self.declare_parameter("hazard_map_topic", "/hazard_map")
         self.declare_parameter("path_cell_size", 0.2)
         # rover 실제 차폭 (m0609 팔 + 후방 바스켓 포함) ≈ 1.5m.
         # 이력: 0.7m 는 가장자리 충돌 잦아 1.0m 로 올렸으나, 1.0m 는 좁은 통로
@@ -221,15 +227,34 @@ class MissionManagerNode(Node):
         self.explore_entry_ns: int = 0
 
         terrain_dir = str(self.get_parameter("terrain_dir").value)
+        self.map_layer = None
+        self.map_replans = 0
+        map_source = str(self.get_parameter("map_source").value).strip().lower()
         try:
-            _meta, self.ogrid, _fog = load_terrain(
+            loader = blank_terrain if map_source == "online" else load_terrain
+            _meta, self.ogrid, _fog = loader(
                 terrain_dir,
                 cell_size=float(self.get_parameter("path_cell_size").value),
                 robot_radius=float(self.get_parameter("path_robot_radius").value),
             )
-            self.get_logger().info(
-                f"obstacle_grid loaded from {terrain_dir} "
-                f"({self.ogrid.rows}x{self.ogrid.cols} @ {self.ogrid.cell_size:.2f}m)")
+            if map_source == "online":
+                self.map_layer = OnlineObstacleLayer(self.ogrid, basecamp_keepout(_meta))
+                from nav_msgs.msg import OccupancyGrid
+                from rclpy.qos import (DurabilityPolicy, HistoryPolicy,
+                                       QoSProfile, ReliabilityPolicy)
+                self.create_subscription(
+                    OccupancyGrid, str(self.get_parameter("hazard_map_topic").value),
+                    self._on_hazard_map,
+                    QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
+                               durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                               history=HistoryPolicy.KEEP_LAST, depth=1))
+                self.get_logger().info(
+                    f"장애물 지도: 주행 중 작성 (깊이 카메라) — 빈 격자 "
+                    f"{self.ogrid.rows}x{self.ogrid.cols} @ {self.ogrid.cell_size:.2f}m 로 시작")
+            else:
+                self.get_logger().info(
+                    f"obstacle_grid loaded from {terrain_dir} "
+                    f"({self.ogrid.rows}x{self.ogrid.cols} @ {self.ogrid.cell_size:.2f}m)")
         except Exception as e:
             self.get_logger().error(
                 f"terrain load FAILED ({e}) — APPROACH/RTB will fall back to straight-line P-control")
@@ -791,6 +816,20 @@ class MissionManagerNode(Node):
             if dx * dx + dy * dy < skip_r2:
                 return True
         return False
+
+    def _on_hazard_map(self, msg) -> None:
+        """새 위험 지도 → 계획용 격자 갱신. 가던 경로가 막혔으면 버리고 다시 짠다."""
+        self.map_layer.update_from_msg(msg)
+        if not self.waypoints or self.last_odom is None:
+            return
+        p = self.last_odom.pose.pose.position
+        rest = [(p.x, p.y)] + list(self.waypoints[self.wp_idx:])
+        if self.map_layer.path_blocked(rest):
+            self.waypoints = []          # 다음 _maybe_replan 에서 새로 계획
+            self.map_replans += 1
+            self.get_logger().info(
+                f"새로 본 장애물이 경로를 막음 → 다시 계획 (누적 {self.map_replans}회)",
+                throttle_duration_sec=2.0)
 
     def _maybe_replan(self, rx: float, ry: float, tx: float, ty: float) -> None:
         if self.ogrid is None:

@@ -4,7 +4,12 @@ navigation/ 의 coverage 알고리즘(SectorPlanner·Navigator·Mission·FogMap)
 그대로 두고(무수정), 입·출력만 팀 인터페이스에 연결한다:
 
   입력:
-    · I1  terrain 자산 (obstacle_grid.npy / meta.json) — 파일, 시작 시 1회 로드
+    · 장애물 지도 — map_source 파라미터로 고른다
+        online (기본): hazard_map_node 가 깊이 카메라로 주행 중에 만드는
+                       /hazard_map (nav_msgs/OccupancyGrid). 빈 지도로 시작해서
+                       새 장애물이 경로를 막으면 다시 계획한다.
+        prebuilt     : I1 terrain 자산의 obstacle_grid.npy (원본 방식, 정답 지도)
+      어느 쪽이든 meta.json 에서 운용 구역 크기는 읽는다.
     · I5  /rover/estimated_pose (geometry_msgs/PoseWithCovarianceStamped) — pose
   출력:
     · /cmd_vel               (geometry_msgs/Twist)                  — 실제 바퀴 구동
@@ -22,12 +27,17 @@ import sys
 import rclpy
 from geometry_msgs.msg import PoseWithCovarianceStamped, Twist
 from isaac_interfaces.msg import MissionState, SelectedDriveAction
+from nav_msgs.msg import OccupancyGrid
 from rclpy.node import Node
+from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
+                       ReliabilityPolicy)
 
 from isaac_drive.minimap_publisher import MinimapPublisher
 from isaac_drive.navigation.coverage_planner import SectorPlanner
 from isaac_drive.navigation.mission_fsm import Mission
 from isaac_drive.navigation.navigator import Navigator
+from isaac_drive.navigation.online_map import (OnlineObstacleLayer,
+                                               basecamp_keepout, blank_terrain)
 from isaac_drive.navigation.pose_provider import PoseProvider, quat_to_yaw
 from isaac_drive.navigation.terrain_loader import load_terrain
 
@@ -85,6 +95,13 @@ class CoverageNode(Node):
 
         # ── 파라미터 ──
         self.declare_parameter("terrain_dir", _DEFAULT_TERRAIN)
+        self.declare_parameter("map_source", "online")        # online | prebuilt
+        self.declare_parameter("hazard_map_topic", "/hazard_map")
+        # 목표 방향이 이 각도보다 벗어나 있으면 제자리에서 먼저 돈다. online 에서는
+        # 카메라 시야(좌우 30°) 안으로 목표 방향을 넣은 뒤에 전진해야 안 본
+        # 곳으로 들어가지 않는다. 0 이하 = map_source 에 맞춘 기본값
+        # (online 25°, prebuilt 45°).
+        self.declare_parameter("point_turn_deg", 0.0)
         self.declare_parameter("pose_topic", "/rover/estimated_pose")
         self.declare_parameter("cmd_vel_topic", "/cmd_vel")
         self.declare_parameter("tick_hz", 30.0)
@@ -127,13 +144,26 @@ class CoverageNode(Node):
             raise FileNotFoundError(
                 f"terrain_dir 가 없습니다: {terrain_dir} "
                 f"— 파라미터 terrain_dir 로 지정하세요.")
-        self.meta, ogrid, self.fog = load_terrain(
+        self.map_source = str(self.get_parameter("map_source").value).strip().lower()
+        if self.map_source not in ("online", "prebuilt"):
+            raise ValueError(f"map_source 는 online 또는 prebuilt: {self.map_source!r}")
+        loader = blank_terrain if self.map_source == "online" else load_terrain
+        self.meta, ogrid, self.fog = loader(
             terrain_dir,
             cell_size=float(self.get_parameter("cell_size").value),
             robot_radius=float(self.get_parameter("robot_radius").value),
             reveal_radius=reveal_radius,
             grid_n=int(self.get_parameter("grid_n").value),
         )
+        self.ogrid = ogrid
+        self.layer = None
+        self.replans_blocked = 0
+        if self.map_source == "online":
+            self.layer = OnlineObstacleLayer(ogrid, basecamp_keepout(self.meta))
+            self.fog.set_obstacle_mask(self.layer.raw.astype("uint8"))
+        point_turn = float(self.get_parameter("point_turn_deg").value)
+        if point_turn <= 0.0:
+            point_turn = 25.0 if self.map_source == "online" else 45.0
 
         # ── coverage 알고리즘 (navigation/ — 무수정) ──
         # PoseProvider 를 rover 로 주입: Mission/Navigator 는 .get_pose_2d() 만 호출.
@@ -145,6 +175,7 @@ class CoverageNode(Node):
             max_ang=float(self.get_parameter("max_ang").value),
             waypoint_tol=float(self.get_parameter("waypoint_tol").value),
             final_tol=float(self.get_parameter("anchor_final_tol").value),
+            point_turn_deg=point_turn,
         )
         self.mission = Mission(
             self.fog, ogrid, planner, navigator, self.pose,
@@ -154,6 +185,14 @@ class CoverageNode(Node):
         # ── I5 입력: pose 구독 ──
         self.create_subscription(
             PoseWithCovarianceStamped, pose_topic, self._on_pose, 10)
+
+        if self.layer is not None:
+            self.create_subscription(
+                OccupancyGrid, str(self.get_parameter("hazard_map_topic").value),
+                self._on_hazard_map,
+                QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
+                           durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                           history=HistoryPolicy.KEEP_LAST, depth=1))
 
         # External replan trigger — supervisor 가 EXPLORE 재진입 시 publish.
         # 받으면 현재 DRIVE path 무시하고 즉시 PLAN_PATH 로 강제 전환해
@@ -199,7 +238,8 @@ class CoverageNode(Node):
         self.get_logger().info(
             f"coverage_node ready — terrain={os.path.basename(terrain_dir)}, "
             f"map {self.fog.map_w:.0f}x{self.fog.map_h:.0f}m, "
-            f"pose_topic={pose_topic}, tick={tick_hz:.0f}Hz")
+            f"pose_topic={pose_topic}, tick={tick_hz:.0f}Hz, "
+            f"장애물 지도={'주행 중 작성 (깊이 카메라)' if self.layer else 'obstacle_grid.npy'}")
 
     # ── 미니맵 viewer 시작 (scripts/ 의 StateWriter import) ──
     def _start_minimap(self, write_every: int) -> None:
@@ -233,6 +273,23 @@ class CoverageNode(Node):
         q = msg.pose.pose.orientation
         yaw = quat_to_yaw(q.x, q.y, q.z, q.w)
         self.pose.update(p.x, p.y, yaw, tuple(msg.pose.covariance))
+
+    def _on_hazard_map(self, msg: OccupancyGrid) -> None:
+        """새 위험 지도 → 계획용 격자 갱신. 가던 경로가 막혔으면 다시 계획."""
+        raw = self.layer.update_from_msg(msg)
+        self.fog.set_obstacle_mask(raw.astype("uint8"))
+        if (self.mission.state != "DRIVE" or not self.pose.has_pose
+                or self.mission.nav.is_done()):
+            return
+        x, y, _ = self.pose.get_pose_2d()
+        nav = self.mission.nav
+        if self.layer.path_blocked([(x, y)] + list(nav.path[nav.idx:])):
+            if self.mission.replan_keep_target():
+                self.replans_blocked += 1
+                self.get_logger().info(
+                    f"새로 본 장애물이 경로를 막음 → 다시 계획 "
+                    f"(누적 {self.replans_blocked}회)",
+                    throttle_duration_sec=2.0)
 
     def _on_replan_request(self, _msg) -> None:
         # Force a path replan from the rover's current pose. Used after

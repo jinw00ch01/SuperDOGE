@@ -23,6 +23,7 @@ setup(
         "console_scripts": [
             "coverage_node = isaac_drive.coverage_node:main",
             "odom_to_estimated_pose = isaac_drive.odom_to_estimated_pose:main",
+            "hazard_map_node = isaac_drive.hazard_map_node:main",
         ],
     },
 )

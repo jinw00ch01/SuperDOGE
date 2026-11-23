@@ -43,7 +43,8 @@ import os
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.conditions import IfCondition
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import (LaunchConfiguration, PathJoinSubstitution,
+                                  PythonExpression)
 from launch_ros.actions import Node
 
 
@@ -93,6 +94,11 @@ def generate_launch_description() -> LaunchDescription:
         "grasp_mode", default_value="friction",
         description="arm_executor 의 파지 방식 (friction | contact | snap). "
                     "시뮬레이터의 --grasp friction | contact | magic 과 짝을 맞춘다.")
+    map_source_arg = DeclareLaunchArgument(
+        "map_source", default_value="online",
+        description="장애물 지도의 출처. online: 로버 깊이 카메라로 주행 중에 작성 "
+                    "(hazard_map_node). prebuilt: 지형과 함께 만들어 둔 "
+                    "obstacle_grid.npy (원본 방식, 정답 지도).")
     reveal_radius_arg = DeclareLaunchArgument(
         "reveal_radius", default_value="5.0",
         description="coverage_node 의 fog reveal 반경 (m). 시연 가시성 위해 "
@@ -114,6 +120,17 @@ def generate_launch_description() -> LaunchDescription:
             web_video_port_arg,
             reveal_radius_arg,
             grasp_mode_arg,
+            map_source_arg,
+            # 깊이 카메라 → 위험 지도 (map_source:=online 일 때만).
+            Node(
+                package="isaac_drive",
+                executable="hazard_map_node",
+                name="hazard_map_node",
+                output="screen",
+                parameters=[{"terrain_dir": terrain_dir}],
+                condition=IfCondition(PythonExpression(
+                    ["'", LaunchConfiguration("map_source"), "' == 'online'"])),
+            ),
             # T5 cheat 어댑터 — /ground_truth/odom → /rover/estimated_pose.
             Node(
                 package="isaac_drive",
@@ -142,6 +159,7 @@ def generate_launch_description() -> LaunchDescription:
                 remappings=[("/cmd_vel", "/coverage/cmd_vel_raw")],
                 parameters=[{
                     "terrain_dir": terrain_dir,
+                    "map_source": LaunchConfiguration("map_source"),
                     # matplotlib viewer 비활성 — 시연용으론 Web HUD 의 minimap
                     # 위젯만 사용. viewer 는 디버깅용 (별도 `/tmp/starcraft_map_state.npz`
                     # 폴링, partial-write 시 깜박임 발생). topics 는 계속 발행해
@@ -164,6 +182,7 @@ def generate_launch_description() -> LaunchDescription:
                         "approach_lin_speed": 1.2,
                         "collection_goal": LaunchConfiguration("collection_goal"),
                         "terrain_dir": terrain_dir,
+                        "map_source": LaunchConfiguration("map_source"),
                     }
                 ],
             ),

@@ -241,7 +241,7 @@ class FrictionGrasp:
         """닫은 손가락이 광물에 막혀 멈춰 있으면 그 광물 이름 (없으면 "").
 
         status 발행 주기(약 0.1 s)마다 한 번씩 불린다고 가정한다 — 최근 4 번의
-        간격이 2 mm 안에서 변하지 않아야 "멈췄다" 고 본다. 닫히는 도중에는
+        간격이 3 mm 안에서 변하지 않아야 "멈췄다" 고 본다. 닫히는 도중에는
         손가락 사이에 광물이 있어도 쥔 것이 아니다.
         """
         path, gap = self._between(ns)
@@ -250,7 +250,7 @@ class FrictionGrasp:
         hist = self._gap_hist[ns]
         hist.append(gap if gap is not None else -1.0)
         del hist[:-4]
-        if not path or len(hist) < 4 or max(hist) - min(hist) > 0.002:
+        if not path or len(hist) < 4 or max(hist) - min(hist) > 0.003:
             self.last_held[ns] = ""
         else:
             self.last_held[ns] = path.rsplit("/", 1)[-1]

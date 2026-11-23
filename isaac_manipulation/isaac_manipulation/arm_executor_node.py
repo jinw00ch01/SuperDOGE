@@ -955,10 +955,16 @@ class ArmExecutorNode(Node):
             goal_handle.abort()
             return ExecuteArmTask.Result(success=False, message=message)
 
-        def still_held(wait: float = 0.5) -> str:
+        def still_held(timeout: float = 2.0) -> str:
+            """지금도 쥐고 있는지. 팔이 막 멈춘 직후에는 손가락 간격이 잠깐
+            흔들려 '쥠' 이 한두 번 빠질 수 있으므로 timeout 동안 기다려 본다."""
             t0 = time.monotonic()
-            time.sleep(wait)
-            return self._held_now(t0)
+            while time.monotonic() - t0 < timeout:
+                time.sleep(0.1)
+                name = self._held_now(t0)
+                if name:
+                    return name
+            return ""
 
         # ── 하강 (직선, 손가락 벌린 채) ──
         n_steps = max(2, int(round((z_start - z_end) / speed * publish_hz)))
@@ -1015,7 +1021,7 @@ class ArmExecutorNode(Node):
         settle = float(self.get_parameter("cargo_settle_sec").value)
         if settle > 0.0:
             time.sleep(settle)
-        carried = still_held(0.3)
+        carried = still_held()
         # 열기 = 시뮬레이터가 그 순간 손가락 사이에 있는 광물을 적재 처리.
         self._publish_grasp("release")
         fb = ExecuteArmTask.Feedback()

@@ -145,7 +145,16 @@ class Mission:
 
         if not self.ogrid.is_free(*start_ij):
             # 로버가 inflate 영역 안에 있음 (시작셀 막혔다고 표시됨). 일시 free 처리.
-            cells = astar(self._free_start_grid(start_ij), start_ij, goal_ij)
+            # 주행 중에 만든 지도에서는 장애물을 가까이 와서야 알게 되어 깊이
+            # 들어와 있을 수 있다 → 가장 가까운 빈 칸으로 먼저 빠져나온다.
+            escape = self._nearest_free_cell(start_ij)
+            cells = None
+            if escape is not None:
+                tail = astar(self.ogrid.grid, escape, goal_ij)
+                if tail is not None:
+                    cells = [start_ij] + tail
+            if cells is None:
+                cells = astar(self._free_start_grid(start_ij), start_ij, goal_ij)
         else:
             cells = astar(self.ogrid.grid, start_ij, goal_ij)
 
@@ -163,6 +172,28 @@ class Mission:
         self.state = "DRIVE"
         self._log(f"[mission] → anchor ({target[0]:+.1f},{target[1]:+.1f}), "
                   f"path {len(path)}점")
+
+    def replan_keep_target(self) -> bool:
+        """가고 있던 anchor 를 버리지 않고 경로만 다시 짠다 (지도가 바뀌었을 때)."""
+        if self.state != "DRIVE" or not self.nav.path:
+            return False
+        self.anchor_queue.insert(0, self.nav.path[-1])
+        self.nav.set_path([])
+        self.state = "PLAN_PATH"
+        return True
+
+    def _nearest_free_cell(self, cell, max_radius_m=3.0):
+        g = self.ogrid.grid
+        i0, j0 = cell
+        r = int(np.ceil(max_radius_m / self.ogrid.cell_size))
+        a0, a1 = max(0, i0 - r), min(g.shape[0], i0 + r + 1)
+        b0, b1 = max(0, j0 - r), min(g.shape[1], j0 + r + 1)
+        fi, fj = np.nonzero(g[a0:a1, b0:b1] == 0)
+        if len(fi) == 0:
+            return None
+        d2 = (fi + a0 - i0) ** 2 + (fj + b0 - j0) ** 2
+        k = int(np.argmin(d2))
+        return (int(fi[k] + a0), int(fj[k] + b0)) if d2[k] <= r * r else None
 
     def _switch_to_next_sector(self):
         self.visit_idx += 1
