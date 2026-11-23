@@ -99,6 +99,13 @@ def generate_launch_description() -> LaunchDescription:
         description="장애물 지도의 출처. online: 로버 깊이 카메라로 주행 중에 작성 "
                     "(hazard_map_node). prebuilt: 지형과 함께 만들어 둔 "
                     "obstacle_grid.npy (원본 방식, 정답 지도).")
+    drive_governor_arg = DeclareLaunchArgument(
+        "drive_governor", default_value="false",
+        description="true: 학습한 구동 조절기(drive_governor_node)가 주행 명령을 차체 "
+                    "상태에 맞춰 깎는다. 시뮬레이터를 --drive-limits off 로 띄워야 한다. "
+                    "false: 시뮬레이터의 고정 제한만 사용.")
+    governor_on = PythonExpression(
+        ["'", LaunchConfiguration("drive_governor"), "'.lower() in ('true', '1', 'yes')"])
     reveal_radius_arg = DeclareLaunchArgument(
         "reveal_radius", default_value="5.0",
         description="coverage_node 의 fog reveal 반경 (m). 시연 가시성 위해 "
@@ -121,6 +128,21 @@ def generate_launch_description() -> LaunchDescription:
             reveal_radius_arg,
             grasp_mode_arg,
             map_source_arg,
+            drive_governor_arg,
+            # 학습한 구동 조절기 (drive_governor:=true 일 때만): /cmd_vel_raw → /cmd_vel.
+            Node(
+                package="isaac_drive",
+                executable="drive_governor_node",
+                name="drive_governor_node",
+                output="screen",
+                parameters=[{
+                    "cmd_in_topic": "/cmd_vel_raw",
+                    "cmd_out_topic": "/cmd_vel",
+                    "odom_topic": "/ground_truth/odom",
+                    "joint_topic": "/joint_states_raw",
+                }],
+                condition=IfCondition(governor_on),
+            ),
             # 깊이 카메라 → 위험 지도 (map_source:=online 일 때만).
             Node(
                 package="isaac_drive",
@@ -183,6 +205,8 @@ def generate_launch_description() -> LaunchDescription:
                         "collection_goal": LaunchConfiguration("collection_goal"),
                         "terrain_dir": terrain_dir,
                         "map_source": LaunchConfiguration("map_source"),
+                        "cmd_vel_topic": PythonExpression(
+                            ["'/cmd_vel_raw' if ", governor_on, " else '/cmd_vel'"]),
                     }
                 ],
             ),

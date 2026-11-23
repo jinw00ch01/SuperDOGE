@@ -10,6 +10,9 @@ __pycache__/
 .colcon/
 *.pt
 !isaac_perception/models/mineral_yolo_best.pt
+# 구동 조절기: 학습 중간 산출물은 제외, 이어서 학습할 때 쓰는 체크포인트만 추적.
+isaac_sim/rl/runs/
+!isaac_sim/rl/checkpoints/*.pt
 
 .agents/
 .codex/
