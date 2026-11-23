@@ -55,16 +55,14 @@
     <figure class="viewport viewport-chase">
       <figcaption>Rover — Chase <span class="vp-tag">/camera/chase</span></figcaption>
       <div class="vp-frame">
-        <img id="cam-chase" src="{{ cam_chase }}" alt="chase cam"
-             onerror="this.classList.add('cam-down');" />
+        <img id="cam-chase" src="{{ cam_chase }}" alt="chase cam" />
         <div class="cam-down-overlay">chase cam offline</div>
       </div>
     </figure>
     <figure class="viewport viewport-wrist">
       <figcaption>Body — YOLO <span class="vp-tag">/perception/image_annotated</span></figcaption>
       <div class="vp-frame">
-        <img id="cam-wrist" src="{{ cam_wrist }}" alt="body cam"
-             onerror="this.classList.add('cam-down');" />
+        <img id="cam-wrist" src="{{ cam_wrist }}" alt="body cam" />
         <div class="cam-down-overlay">body cam offline</div>
       </div>
     </figure>
@@ -74,17 +72,17 @@
        │  MINIMAP (LL)    │  STATUS / PORTRAIT (C)   │ 3x3 GRID (R) │
        └──────────────────┴──────────────────────────┴──────────────┘ -->
   <section class="hud">
-    <!-- 좌하단 — terrain preview (작은 참고용. coverage map 은 메인 viewport 로 승격됨) -->
+    <!-- 좌하단 — 팔(M0609) 손목 카메라. 공구 z 축 방향(집게가 향하는 쪽)을 본다.
+         지도 없이 주행하므로 지형 전체를 내려다본 그림(terrain preview)은 두지 않는다. -->
     <div class="hud-cell hud-minimap">
       <div class="hud-cell-title">
-        <span>TERRAIN OVERVIEW</span>
-        <span id="terrain-name" class="hud-cell-tag">{{ terrain_name }}</span>
+        <span>ARM CAM — M0609 TOOL Z</span>
+        <span class="hud-cell-tag">/perception/wrist_image_annotated</span>
       </div>
       <div class="minimap-wrap">
-        <img id="cam-overview" src="{{ terrain_preview }}" alt="terrain preview"
-             class="terrain-preview-img"
-             onerror="this.classList.add('cam-down');" />
-        <div class="cam-down-overlay">terrain preview missing</div>
+        <img id="cam-arm" src="{{ cam_arm }}" alt="arm wrist cam"
+             class="terrain-preview-img" />
+        <div class="cam-down-overlay">arm cam offline</div>
       </div>
     </div>
 

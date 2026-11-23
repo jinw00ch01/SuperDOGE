@@ -411,7 +411,8 @@ def main(args: list[str] | None = None) -> None:
             # (cam_wrist 변수명은 viewport-wrist class/css 호환 위해 유지).
             cam_wrist=mjpeg(topics["body"]),
             cam_chase=mjpeg(topics["chase"]),
-            terrain_preview="/terrain/preview",
+            # 좌하단 슬롯 — 팔(M0609) 손목 카메라. 예전의 terrain preview 자리.
+            cam_arm=mjpeg(topics["wrist"]),
             terrain_name=terrain_name,
         )
 

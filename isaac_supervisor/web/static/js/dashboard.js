@@ -151,42 +151,43 @@
     }
   }
 
-  /* ── Active-rover camera viewport src 토글 ───────────────────── */
+  /* ── 카메라 viewport: active rover 의 스트림으로 연결 + 끊기면 다시 연결 ──
+     web_video_server 는 raw topic path 를 받는다 (URL encoding 하면 /stream
+     핸들러가 토픽을 인식 못 해 검은 화면이 된다).
+     스택(시뮬레이터·web_video_server)이 페이지보다 늦게 뜨거나 재시작되면 <img> 는
+     한 번 error 가 난 뒤 스스로 다시 시도하지 않는다. 그래서
+       · error 가 나면 3 초 뒤 다시 연결하고,
+       · socket 이 (다시) 연결될 때 = 스택이 다시 떴을 때 전부 새로 연결한다. */
+  const CAMERAS = [
+    // [img id, rover namespace 아래의 topic]
+    ["cam-wrist", "perception/image_annotated"],        // 차체 카메라 + YOLO
+    ["cam-chase", "camera/chase/image_raw"],            // 로버 뒤에서 따라가는 카메라
+    ["cam-arm",   "perception/wrist_image_annotated"],  // M0609 손목 카메라 (공구 z 축)
+  ];
+  const camRetryTimers = {};
+
+  function connectCamera(id, topicTail) {
+    const img = $(id);
+    if (!img) return;
+    if (!img.dataset.srcTemplate) {
+      img.dataset.srcTemplate = img.getAttribute("src") || "";   // 첫 실행 시 캐시
+    }
+    const tmpl = img.dataset.srcTemplate;
+    if (!tmpl) return;
+    const topic = activeRover ? `/${activeRover}/${topicTail}` : `/${topicTail}`;
+    clearTimeout(camRetryTimers[id]);
+    img.classList.remove("cam-down");
+    // _t: 같은 URL 이면 브라우저가 다시 요청하지 않으므로 매번 다르게.
+    img.src = tmpl.replace(/topic=[^&]+/, `topic=${topic}`) + `&_t=${Date.now()}`;
+    img.onerror = () => {
+      img.classList.add("cam-down");
+      clearTimeout(camRetryTimers[id]);
+      camRetryTimers[id] = setTimeout(() => connectCamera(id, topicTail), 3000);
+    };
+  }
+
   function refreshCameraSrcs() {
-    // body cam image (id=cam-wrist viewport 이름 그대로) src 를 active ns 로
-    // redirect. mission_web_node 의 cam_wrist URL 은 첫 로드 시 단일 토픽이라
-    // multi 모드에선 namespace 토픽으로 강제 교체 필요.
-    const bodyImg = $("cam-wrist");
-    if (bodyImg && activeRover) {
-      // mjpeg URL 형태: http://host:PORT/stream?topic=/perception/image_annotated&type=mjpeg&...
-      // activeRover 의 토픽으로 topic 파라미터 교체.
-      const base = bodyImg.getAttribute("data-src-template")
-        || bodyImg.src;
-      if (!bodyImg.dataset.srcTemplate) {
-        bodyImg.dataset.srcTemplate = base; // 첫 실행 시 캐시
-      }
-      // template 의 absolute topic ("/perception/image_annotated") 부분만 namespace 적용
-      const tmpl = bodyImg.dataset.srcTemplate;
-      const wantTopic = activeRover
-        ? `/${activeRover}/perception/image_annotated`
-        : `/perception/image_annotated`;
-      // web_video_server 는 raw topic path 를 받는다 — URL encoding 하면
-      // /stream 핸들러가 토픽을 인식 못 해 검은 화면이 된다.
-      bodyImg.src = tmpl.replace(/topic=[^&]+/, `topic=${wantTopic}`);
-    }
-    const chaseImg = $("cam-chase");
-    if (chaseImg && activeRover) {
-      // multi 모드: per-rover chase cam (run_vehicle_v3 가 각 rover 마다
-      // /<ns>/camera/chase/image_raw 발행).
-      if (!chaseImg.dataset.srcTemplate) {
-        chaseImg.dataset.srcTemplate = chaseImg.src;
-      }
-      const tmpl = chaseImg.dataset.srcTemplate;
-      const wantTopic = activeRover
-        ? `/${activeRover}/camera/chase/image_raw`
-        : `/camera/chase/image_raw`;
-      chaseImg.src = tmpl.replace(/topic=[^&]+/, `topic=${wantTopic}`);
-    }
+    CAMERAS.forEach(([id, tail]) => connectCamera(id, tail));
   }
 
   function refreshActiveViews() {
