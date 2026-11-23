@@ -147,13 +147,25 @@ class ArmExecutorNode(Node):
         self.declare_parameter("ik_approach_dz", 0.30)
         self.declare_parameter("ik_descend_dz", 0.05)
         # 부착 방식 — 시뮬레이터의 --grasp 와 맞춰야 한다.
-        #   contact (기본): 손끝을 광물 위로 가져가 닿을 때까지 천천히 내린다.
-        #                   시뮬레이터는 손끝이 광물에 닿은 순간에만 부착한다.
-        #   snap          : 예전 방식 (광물 근처로 팔만 뻗고 순간이동 부착).
-        self.declare_parameter("grasp_mode", "contact")
+        #   friction (기본): 넓은 집게를 벌린 채 광물 위로 내려 닫고, 손가락
+        #                    마찰만으로 든다 (시뮬레이터 --grasp friction --gripper wide).
+        #   contact        : RG2 손끝을 광물 위로 가져가 닿을 때까지 천천히 내린다.
+        #                    시뮬레이터는 손끝이 광물에 닿은 순간에만 FixedJoint 로
+        #                    부착한다 (--grasp contact --gripper rg2).
+        #   snap           : 예전 방식 (광물 근처로 팔만 뻗고 순간이동 부착).
+        self.declare_parameter("grasp_mode", "friction")
+        # 넓은 집게 치수 (isaac_sim/scripts/wide_gripper.py 와 같아야 한다).
+        self.declare_parameter("friction_palm_offset_m", 0.097)    # link_6 → palm 아랫면
+        self.declare_parameter("friction_finger_length_m", 0.17)   # palm 아랫면 → 손가락 끝
+        # palm 아랫면을 광물 윗면보다 이만큼 위에서 멈추고 닫는다.
+        self.declare_parameter("friction_palm_clearance_m", 0.03)
+        # 손목 카메라가 윗면 높이를 못 쟀을 때 쓰는 값 (광물 중심 → 윗면).
+        self.declare_parameter("friction_top_above_center_m", 0.114)
+        self.declare_parameter("friction_descend_speed", 0.06)     # m/s
+        self.declare_parameter("friction_close_timeout_sec", 4.0)
         # link_6 원점 → 손끝까지 거리 (vehicle_v3.usd 의 RG2-FT inner finger 끝).
         self.declare_parameter("tool_tip_offset_m", 0.194)
-        # 손끝의 시작·최저 높이 (인식한 광물 중심 기준). 광물 높이는 약 0.26 m 라
+        # 손끝의 시작·최저 높이 (인식한 광물 중심 기준). 광물 높이는 약 0.23 m 라
         # 윗면은 중심 +0.10~0.13 m 에 있다. 시작은 그보다 넉넉히 위, 최저는
         # 윗면보다 한참 아래 — 인식 높이가 틀려도 그 사이 어딘가에서 닿는다.
         self.declare_parameter("contact_start_above_m", 0.24)
@@ -335,7 +347,8 @@ class ArmExecutorNode(Node):
         if command == "pick_mineral":
             if bool(self.get_parameter("enable_ik").value):
                 if bool(self.get_parameter("use_world_target_ik").value):
-                    if str(self.get_parameter("grasp_mode").value) == "contact":
+                    if str(self.get_parameter("grasp_mode").value) in (
+                            "contact", "friction"):
                         return self._execute_pick_contact(goal_handle)
                     return self._execute_pick_world_target(goal_handle)
                 return self._execute_pick_ik(goal_handle)
@@ -617,11 +630,15 @@ class ArmExecutorNode(Node):
             time.sleep(0.05)
         return time.monotonic() - t0
 
-    def _wrist_measure(self, expected: np.ndarray) -> Optional[np.ndarray]:
-        """손목 카메라 검출로 광물 중심을 팔 받침대 좌표로 잰다.
+    def _wrist_measure(self, expected: np.ndarray):
+        """손목 카메라 검출로 광물 중심과 윗면을 팔 받침대 좌표로 잰다.
 
         expected (받침대 좌표) 에서 수평으로 gate 안에 있는 검출만 쓰고, 서로
         다른 영상 5 장의 중앙값을 돌려준다. 3 장도 못 모으면 None.
+
+        return: (중심, 표면) — 표면은 카메라가 실제로 본 점 (위에서 내려다보므로
+        윗면). 인식 노드는 표면 점을 물체 반지름만큼 시선 방향으로 밀어 중심을
+        만들고 그 반지름을 bbox_size_m.z (= 지름) 로 같이 보내므로 되돌릴 수 있다.
         """
         gate = float(self.get_parameter("wrist_correction_gate_m").value)
         min_conf = float(self.get_parameter("min_confidence").value)
@@ -654,28 +671,41 @@ class ArmExecutorNode(Node):
                     p_base = T[:3, :3] @ (R_oc @ xyz + mount) + T[:3, 3]
                     off = float(np.linalg.norm((p_base - expected)[:2]))
                     if off < gate and (best is None or off < best[0]):
-                        best = (off, p_base)
+                        dist = float(np.linalg.norm(xyz))
+                        r_obj = min(0.5 * float(d.bbox_size_m.z), 0.9 * dist)
+                        surf = xyz * (1.0 - r_obj / dist)
+                        s_base = T[:3, :3] @ (R_oc @ surf + mount) + T[:3, 3]
+                        best = (off, p_base, s_base)
                     elif off >= gate:
                         rejected.append(f"{d.class_name} conf={d.confidence:.2f} "
                                         f"예상 위치에서 {off * 100:.0f} cm")
                 if best is not None:
-                    samples.append(best[1])
+                    samples.append(np.concatenate([best[1], best[2]]))
             time.sleep(0.05)
         if len(samples) < 3:
             self.get_logger().info(
                 f"wrist measure: 쓸 수 있는 검출 {len(samples)}장 — 버린 것: "
                 f"{rejected[-4:] if rejected else '검출 자체가 없음'}")
             return None
-        return np.median(np.array(samples), axis=0)
+        med = np.median(np.array(samples), axis=0)
+        return med[:3], med[3:]
 
     def _execute_pick_contact(self, goal_handle):
-        """손끝을 광물 위로 가져가 닿을 때까지 내리는 pick (접촉 조건부 부착).
+        """광물 바로 위에서 수직으로 내려가 집는 pick. grasp_mode 에 따라 둘로 갈린다.
 
+        contact (RG2 + 접촉 조건부 부착)
           HOME → ABOVE (손끝이 광물 중심 위, 공구 축 수직 아래)
                → 천천히 하강하면서 pickup 을 계속 보냄
                → 시뮬레이터가 "손끝이 광물에 닿음" 을 status 로 알리면 정지
                → ABOVE → HOME → CARGO → release → HOME
-        최저 높이까지 내려가도 닿지 않으면 실패로 끝낸다 (수집으로 세지 않음).
+          최저 높이까지 내려가도 닿지 않으면 실패로 끝낸다 (수집으로 세지 않음).
+
+        friction (넓은 집게 + 마찰 파지)
+          HOME → ABOVE → 손목 카메라로 수평 위치와 윗면 높이를 잰다
+               → 손가락을 벌린 채 palm 이 윗면 바로 위에 올 때까지 하강
+               → 닫기 → 시뮬레이터가 "손가락 사이에 광물이 끼어 멈춤" 을 알리면
+               → 들어올린 뒤 아직 쥐고 있는지 확인 → HOME → CARGO → 열기 → HOME
+          닫았는데 아무것도 안 끼었거나, 들거나 옮기다 떨어뜨리면 실패.
         """
         req = goal_handle.request
         mineral_world = np.array(
@@ -699,10 +729,22 @@ class ArmExecutorNode(Node):
         # 광물 중심을 팔 받침대 좌표로 (roll/pitch 포함 — 경사에서 yaw 만 쓰면
         # 팔 길이 0.5 m 에 기울기 10° 면 9 cm 가 어긋난다).
         center = base_R.T @ (mineral_world - base_xyz)
-        tip = float(self.get_parameter("tool_tip_offset_m").value)
-        z_start = float(self.get_parameter("contact_start_above_m").value)
-        z_end = float(self.get_parameter("contact_end_above_m").value)
-        speed = max(0.005, float(self.get_parameter("contact_descend_speed").value))
+        friction = str(self.get_parameter("grasp_mode").value) == "friction"
+        if friction:
+            # 여기서 tip 은 link_6 → palm 아랫면, above 는 "광물 중심에서 palm
+            # 아랫면까지의 높이" 다. 시작은 손가락 끝이 윗면보다 5 cm 위.
+            tip = float(self.get_parameter("friction_palm_offset_m").value)
+            finger_len = float(self.get_parameter("friction_finger_length_m").value)
+            clearance = float(self.get_parameter("friction_palm_clearance_m").value)
+            top_above = float(self.get_parameter("friction_top_above_center_m").value)
+            z_start = top_above + 0.05 + finger_len
+            z_end = top_above + clearance
+            speed = max(0.005, float(self.get_parameter("friction_descend_speed").value))
+        else:
+            tip = float(self.get_parameter("tool_tip_offset_m").value)
+            z_start = float(self.get_parameter("contact_start_above_m").value)
+            z_end = float(self.get_parameter("contact_end_above_m").value)
+            speed = max(0.005, float(self.get_parameter("contact_descend_speed").value))
 
         # 공구 축(link_6 z)이 받침대 기준 수직 아래, 손가락 벌림 축은 광물 방향에
         # 수직 — HOME 자세를 광물 방위각만큼 돌린 자세.
@@ -772,25 +814,34 @@ class ArmExecutorNode(Node):
         fresh = base_R.T @ (mineral_world - base_xyz)
         if float(np.linalg.norm(fresh - center)) > 0.005:
             retarget(fresh, "odom 재계산")
+        top_seen = None          # 손목 카메라가 잰 윗면 높이 (받침대 z)
         if bool(self.get_parameter("use_wrist_correction").value):
             for attempt in range(2):
-                seen = self._wrist_measure(center)
-                if seen is None:
+                measured = self._wrist_measure(center)
+                if measured is None:
                     self.get_logger().warn(
                         "contact pick: 손목 카메라에 광물이 안 잡힘 — 로버 카메라 "
                         "추정값 그대로 진행")
                     break
+                seen, surface = measured
+                top_seen = float(surface[2])
                 shift = seen[:2] - center[:2]
                 self.get_logger().info(
                     f"contact pick: 손목 카메라 보정 #{attempt + 1} "
                     f"dx={shift[0] * 100:+.1f} cm dy={shift[1] * 100:+.1f} cm "
-                    f"(높이 차 {(seen[2] - center[2]) * 100:+.1f} cm 는 참고만)")
+                    f"(중심 높이 차 {(seen[2] - center[2]) * 100:+.1f} cm 는 참고만, "
+                    f"윗면은 인식 중심 +{(top_seen - center[2]) * 100:.1f} cm)")
                 if float(np.linalg.norm(shift)) < 0.005:
                     break
                 trial = center.copy()
                 trial[:2] = seen[:2]
                 if not retarget(trial, "손목 카메라 보정"):
                     break
+
+        if friction:
+            return self._finish_pick_friction(
+                goal_handle, solve, center, mineral_world, q_above, deg_above,
+                z_start, top_seen)
 
         # ── 하강: 직선(Cartesian)으로 조금씩, 매 스텝 pickup 발행 + status 확인 ──
         publish_hz = max(5.0, float(self.get_parameter("publish_hz").value))
@@ -864,6 +915,125 @@ class ArmExecutorNode(Node):
         self.get_logger().info("pick_mineral (contact) done")
         return ExecuteArmTask.Result(
             success=True, message=f"pick_mineral completed (contact, {held})")
+
+    def _finish_pick_friction(self, goal_handle, solve, center, mineral_world,
+                              q_above, deg_above, z_start, top_seen):
+        """ABOVE 에 정렬된 뒤의 마찰 파지 절차 (하강 → 닫기 → 들기 → 적재)."""
+        log = self.get_logger()
+        clearance = float(self.get_parameter("friction_palm_clearance_m").value)
+        finger_len = float(self.get_parameter("friction_finger_length_m").value)
+        top_above = float(self.get_parameter("friction_top_above_center_m").value)
+        if top_seen is not None:
+            # 윗면을 직접 쟀으면 그 값을 쓴다 (인식 중심의 높이 오차와 무관해짐).
+            top_above = float(np.clip(top_seen - center[2], 0.02, 0.20))
+        z_end = top_above + clearance
+        speed = max(0.005, float(self.get_parameter("friction_descend_speed").value))
+        publish_hz = max(5.0, float(self.get_parameter("publish_hz").value))
+        dt = 1.0 / publish_hz
+        log.info(
+            f"friction pick: 윗면 = 인식 중심 +{top_above * 100:.1f} cm "
+            f"({'손목 카메라 실측' if top_seen is not None else '기본값'}) → palm 을 "
+            f"+{z_end * 100:.1f} cm 까지 내림 (손가락 끝은 중심 "
+            f"{(z_end - finger_len) * 100:+.1f} cm)")
+
+        pickup = Twist()
+        pickup.linear.x, pickup.linear.y, pickup.linear.z = (
+            float(mineral_world[0]), float(mineral_world[1]), float(mineral_world[2]))
+        pickup.angular.x = 1.0
+        release = Twist()
+        release.angular.x = -1.0
+
+        def give_up(cur, message: str):
+            """집게를 열고 HOME 으로 돌아가 실패로 끝낸다."""
+            for _ in range(6):
+                self.grasp_pub.publish(release)
+                time.sleep(0.1)
+            if cur is not deg_above:
+                self._goto(cur, deg_above, goal_handle, "RETREAT", 0.45, 0.6, duration=2.0)
+            self._goto(deg_above, HOME_DEG, goal_handle, "HOME_ABORT", 0.6, 1.0)
+            self._publish_joint_state(HOME_DEG)
+            goal_handle.abort()
+            return ExecuteArmTask.Result(success=False, message=message)
+
+        def still_held(wait: float = 0.5) -> str:
+            t0 = time.monotonic()
+            time.sleep(wait)
+            return self._held_now(t0)
+
+        # ── 하강 (직선, 손가락 벌린 채) ──
+        n_steps = max(2, int(round((z_start - z_end) / speed * publish_hz)))
+        q = q_above
+        cur_deg = deg_above
+        for k in range(1, n_steps + 1):
+            above = z_start + (z_end - z_start) * k / n_steps
+            q_next, ok, _ = solve(above, q)
+            if not ok:
+                log.warn(f"friction pick: IK 실패 (palm +{above:.3f} m) — 실패")
+                return give_up(cur_deg, "out of reach during descent")
+            q = q_next
+            cur_deg = list(np.degrees(q))
+            self._publish_joint_state(cur_deg)
+            fb = ExecuteArmTask.Feedback()
+            fb.state = "DESCEND_OPEN"
+            fb.progress = float(0.25 + 0.15 * k / n_steps)
+            fb.message = f"palm +{above:.3f} m"
+            goal_handle.publish_feedback(fb)
+            time.sleep(dt)
+        time.sleep(0.8)          # 팔이 명령을 따라잡을 시간 (실측 지연 0.3~0.4 s)
+
+        # ── 닫기: 손가락이 광물에 막혀 멈출 때까지 ──
+        t_close = time.monotonic()
+        deadline = t_close + float(self.get_parameter("friction_close_timeout_sec").value)
+        held = ""
+        while time.monotonic() < deadline and not held:
+            self.grasp_pub.publish(pickup)
+            time.sleep(0.1)
+            held = self._held_now(t_close)
+        if not held:
+            log.warn("friction pick: 집게를 닫았지만 손가락 사이에 광물이 없음 — 실패")
+            return give_up(cur_deg, "nothing between the fingers")
+        log.info(f"friction pick: 쥠 — {held} ({time.monotonic() - t_close:.1f} s)")
+        fb = ExecuteArmTask.Feedback()
+        fb.state = "GRASP_CLOSE"
+        fb.progress = 0.45
+        fb.message = held
+        goal_handle.publish_feedback(fb)
+        time.sleep(0.5)
+
+        # ── 들기: 마찰만으로 버티는지 확인 ──
+        self._goto(cur_deg, deg_above, goal_handle, "LIFT", 0.45, 0.6, duration=2.5)
+        cur_deg = deg_above
+        if not still_held():
+            log.warn("friction pick: 들어올리다 놓침 — 실패")
+            return give_up(cur_deg, "mineral slipped during lift")
+        log.info("friction pick: 들어올림 — 마찰로 유지 중")
+
+        self._goto(cur_deg, HOME_DEG, goal_handle, "HOME_MID", 0.6, 0.7)
+        cur_deg = list(HOME_DEG)
+        self._goto(cur_deg, CARGO_DEG, goal_handle, "CARGO_SWING", 0.7, 0.85)
+        cur_deg = list(CARGO_DEG)
+        settle = float(self.get_parameter("cargo_settle_sec").value)
+        if settle > 0.0:
+            time.sleep(settle)
+        carried = still_held(0.3)
+        # 열기 = 시뮬레이터가 그 순간 손가락 사이에 있는 광물을 적재 처리.
+        self._publish_grasp("release")
+        fb = ExecuteArmTask.Feedback()
+        fb.state = "RELEASE"
+        fb.progress = 0.9
+        fb.message = "release published"
+        goal_handle.publish_feedback(fb)
+        self._goto(cur_deg, HOME_DEG, goal_handle, "HOME_POST", 0.9, 1.0)
+        self._publish_joint_state(HOME_DEG)
+        if not carried:
+            log.warn("friction pick: 적재함으로 옮기다 떨어뜨림 — 실패")
+            goal_handle.abort()
+            return ExecuteArmTask.Result(
+                success=False, message="mineral dropped during transport")
+        goal_handle.succeed()
+        log.info("pick_mineral (friction) done")
+        return ExecuteArmTask.Result(
+            success=True, message=f"pick_mineral completed (friction, {carried})")
 
     def _execute_pick_ik(self, goal_handle):
         """pick_mineral with IK + wrist-cam servo (Phase 3b-3, off by default).

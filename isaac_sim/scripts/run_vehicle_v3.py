@@ -57,10 +57,17 @@ _p.add_argument("--physics", choices=["mars", "earth"], default="mars",
                 help="물리 환경. mars(기본): 중력 3.72 m/s² + 레골리스·바위·바퀴 "
                      "접촉 재질 + terrain meta 의 구역별 마찰. earth: 손대지 "
                      "않음 (9.81, PhysX 기본 마찰 — 예전 동작).")
-_p.add_argument("--grasp", choices=["contact", "magic"], default="contact",
-                help="광물 부착 방식. contact(기본): 그리퍼 손끝이 광물에 닿았을 "
-                     "때만 그 자리에서 부착. magic: 예전 방식 — 팔 받침대 2.5 m "
-                     "안의 가장 가까운 광물을 손가락으로 순간이동시켜 부착.")
+_p.add_argument("--grasp", choices=["friction", "contact", "magic"], default="friction",
+                help="광물을 드는 방식. friction(기본): 넓은 집게가 조여서 마찰로 "
+                     "든다 (부착 joint 없음, --gripper wide 필요). contact: 손끝이 "
+                     "광물에 닿았을 때만 그 자리에서 부착. magic: 예전 방식 — 팔 "
+                     "받침대 2.5 m 안의 가장 가까운 광물을 손가락으로 순간이동시켜 부착.")
+_p.add_argument("--gripper", choices=["wide", "rg2"], default="wide",
+                help="wide(기본): 0.27 m 까지 벌어지는 평행 집게로 교체. "
+                     "rg2: 원래의 OnRobot RG2-FT (최대 0.10 m — 광물을 쥘 수 없음).")
+_p.add_argument("--mineral-mass", default="auto",
+                help="광물 질량(kg). auto(기본): --physics mars 면 4.0 (암석 밀도 기준), "
+                     "earth 면 지형 파일 값(0.3) 그대로. 0 = 항상 그대로.")
 _p.add_argument("--drive-limits", default="auto",
                 help="구동부 속도·가속 제한. auto(기본): --physics 의 중력에 맞춘 값 "
                      "(earth 는 제한 없음 = 원래 동작). off: 제한 없음. "
@@ -70,6 +77,12 @@ _p.add_argument("--kit-arg", action="append", default=[],
                 help="Kit 에 그대로 넘길 인자 (반복 가능). 예: "
                      "--kit-arg=--/rtx/reflections/enabled=false")
 _a, _ = _p.parse_known_args()
+if _a.grasp == "friction" and _a.gripper != "wide":
+    _p.error("--grasp friction 은 --gripper wide 에서만 됩니다 "
+             "(RG2 는 광물보다 좁습니다). --grasp contact 를 쓰세요.")
+if _a.grasp != "friction" and _a.gripper == "wide":
+    _p.error("--gripper wide 는 --grasp friction 과 같이 씁니다 "
+             "(contact/magic 은 RG2 손가락 링크에 부착합니다). --gripper rg2 를 주세요.")
 
 from isaacsim import SimulationApp
 
@@ -108,8 +121,9 @@ from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux, UsdPhysics, UsdShade
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
-from planet_physics import apply_planet_physics  # noqa: E402
+from planet_physics import MINERAL_MASS_KG, apply_mineral_mass, apply_planet_physics  # noqa: E402
 from contact_grasp import ContactGrasp  # noqa: E402
+from wide_gripper import FrictionGrasp, install_wide_gripper  # noqa: E402
 from drive_limits import apply_drive_limits, limits_for_gravity, parse_limits  # noqa: E402
 ISAAC_SIM = os.path.dirname(HERE)
 WORLD = f"{ISAAC_SIM}/worlds/{_a.terrain}.usd"
@@ -933,12 +947,17 @@ class GraspBridge:
                 node.create_publisher(_String, status_topic, 10), joint_path)
         self._node = node
 
-    def publish_status(self, stage) -> None:
-        """각 rover 의 grasp FixedJoint 존재 여부를 /<ns>/grasp/status 로 발행."""
-        for pub, joint_path in self._status.values():
+    def publish_status(self, stage, held_fn=None) -> None:
+        """각 rover 가 들고 있는 광물 이름을 /<ns>/grasp/status 로 발행.
+
+        held_fn(ns) 가 있으면 그 결과를, 없으면 grasp FixedJoint 존재 여부를 쓴다.
+        """
+        for ns, (pub, joint_path) in self._status.items():
             held = ""
             jp = stage.GetPrimAtPath(joint_path)
-            if jp and jp.IsValid():
+            if held_fn is not None:
+                held = held_fn(ns)
+            elif jp and jp.IsValid():
                 targets = UsdPhysics.FixedJoint(jp).GetBody1Rel().GetTargets()
                 held = targets[0].name if targets else "unknown"
             msg = self._String()
@@ -1138,9 +1157,9 @@ def _patch_script_nodes(stage, rover_root: str, ns: str) -> int:
             ok = (isinstance(check, str) and "_find_rover_root" in check)
             print(f"[run_v3]     {script_attr.GetPath()} ← ReadGtPose ({len(new_src)} chars, self-introspect={'OK' if ok else 'FAIL'})")
             patched += 1
-        elif name == "GraspScript" and _a.grasp == "contact":
+        elif name == "GraspScript" and _a.grasp in ("contact", "friction"):
             script_attr.Set(GRASP_SCRIPT_NOOP)
-            print(f"[run_v3]     {script_attr.GetPath()} ← 비움 (--grasp contact)")
+            print(f"[run_v3]     {script_attr.GetPath()} ← 비움 (--grasp {_a.grasp})")
             patched += 1
         elif name == "GraspScript":
             # 모든 rover 에 동일한 스크립트 (전 rover 의 root→joint 테이블 포함).
@@ -1271,6 +1290,11 @@ def main() -> None:
     physics_info = apply_planet_physics(
         stage, world, _a.physics, meta=terrain_meta,
         scene_root="/World/MarsScene", rover_roots=rover_roots)
+    if _a.mineral_mass == "auto":
+        mineral_mass = MINERAL_MASS_KG if _a.physics != "earth" else None
+    else:
+        mineral_mass = float(_a.mineral_mass)
+    apply_mineral_mass(stage, mineral_mass, scene_root="/World/MarsScene")
     drive_limits = None
     if _a.drive_limits != "off":
         base = (limits_for_gravity(physics_info["gravity"])
@@ -1283,7 +1307,8 @@ def main() -> None:
             drive_limits = base
     apply_drive_limits(stage, rover_roots, drive_limits)
     contact_grasp = None
-    if _a.grasp == "contact":
+    friction_grasp = None
+    if _a.grasp in ("contact", "friction"):
         if _a.rovers:
             table = _grasp_joint_table()
             grasp_rovers = {ns.strip("/").strip(): (
@@ -1296,7 +1321,14 @@ def main() -> None:
                 if (prim.GetTypeName() == "OmniGraphNode"
                         and prim.GetName() == "GraspScript"):
                     prim.GetAttribute("inputs:script").Set(GRASP_SCRIPT_NOOP)
-        contact_grasp = ContactGrasp(stage, grasp_rovers)
+        if _a.grasp == "contact":
+            contact_grasp = ContactGrasp(stage, grasp_rovers)
+        else:
+            friction_grasp = FrictionGrasp(stage, {
+                ns: install_wide_gripper(stage, root)
+                for ns, (root, _joint) in grasp_rovers.items()})
+            for _ in range(5):
+                app.update()
     world.reset()
     world.play()
     render_every = max(1, int(_a.render_every))
@@ -1367,18 +1399,33 @@ def main() -> None:
                         grasp_executor.spin_once(timeout_sec=0.0)
                     sim_now = float(world.current_time)
                     for ns in grasp_bridge.drain_releases():
+                        if friction_grasp is not None:
+                            friction_grasp.open(ns)
+                            continue
                         if contact_grasp is not None:
                             contact_grasp.disarm(ns)
                         _force_release_for_ns(stage, ns)
-                    if contact_grasp is not None:
-                        for ns in grasp_bridge.drain_pickups():
+                    pickups = grasp_bridge.drain_pickups()
+                    if friction_grasp is not None:
+                        for ns in pickups:
+                            friction_grasp.close(ns)
+                    elif contact_grasp is not None:
+                        for ns in pickups:
                             contact_grasp.arm(ns, sim_now)
                         contact_grasp.step(sim_now)
                     if step % 6 == 0:
-                        grasp_bridge.publish_status(stage)
+                        grasp_bridge.publish_status(
+                            stage, friction_grasp.held if friction_grasp else None)
                 except Exception as exc:
                     print(f"[run_v3] grasp bridge tick error: {exc}")
-            if _a.debug_grasp and step % 12 == 0:
+            if _a.debug_grasp and friction_grasp is not None and step % 30 == 0:
+                for ns in bridge_namespaces:
+                    ns_norm = (ns or "").strip("/").strip()
+                    gap = friction_grasp.gap(ns_norm)
+                    if gap is not None:
+                        print(f"[grasp-dbg] step={step} {ns_norm} 간격 {gap * 100:.1f} cm "
+                              f"쥠={friction_grasp.last_held.get(ns_norm) or '-'}")
+            elif _a.debug_grasp and step % 12 == 0:
                 _debug_grasp_trace(stage, bridge_namespaces, step)
             # 단일 모드 chase cam.
             if chase_xform_op is not None:

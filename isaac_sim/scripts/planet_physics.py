@@ -25,6 +25,11 @@ PhysX 는 강체 접촉만 푼다. 그래서 화성 환경 중 여기서 맞출 
     sand 0.30 = tan(16.7°) 는 Viking drift material (15.6~20.4°) 범위이고,
     MSL 시험 차량이 점착 없는 모래에서 10° 는 오르고 17° 에서 파묻힌
     결과와도 맞는다.
+  · 광물 질량: 지형 생성기는 모든 광물에 0.3 kg 을 넣는다. 광물 mesh 의
+    convex hull 부피는 2.98 L (0.17 × 0.19 × 0.23 m) 이고 결정 다발 모양이라
+    실제 부피를 그 절반(약 1.5 L)으로 보면, 암석 밀도 2700 kg/m³ 에서 약
+    4 kg 이다 — 0.3 kg 은 스티로폼 수준이다. 화성 모드에서는 4 kg 으로 바꾼다
+    (화성 무게 14.9 N = 지구에서 1.5 kg 을 드는 것과 같음).
 """
 from __future__ import annotations
 
@@ -34,6 +39,35 @@ import numpy as np
 from pxr import Gf, PhysxSchema, Usd, UsdGeom, UsdPhysics, UsdShade, Vt
 
 MATERIAL_ROOT = "/World/PhysicsMaterials"
+MINERAL_MASS_KG = 4.0
+
+
+def apply_mineral_mass(stage, mass: float | None,
+                       scene_root: str = "/World/MarsScene") -> int:
+    """<scene_root>/**/Minerals 아래 광물의 질량을 mass (kg) 로 바꾼다.
+
+    mass 가 None 이거나 0 이하면 아무것도 바꾸지 않는다. return: 바꾼 개수.
+    """
+    if not mass or mass <= 0.0:
+        print("[physics] 광물 질량: 지형 파일 값 그대로")
+        return 0
+    root = stage.GetPrimAtPath(scene_root)
+    n, before = 0, set()
+    if root and root.IsValid():
+        for prim in Usd.PrimRange(root):
+            if prim.GetName() != "Minerals":
+                continue
+            for m in prim.GetChildren():
+                if not m.HasAPI(UsdPhysics.RigidBodyAPI):
+                    continue
+                attr = UsdPhysics.MassAPI.Apply(m).CreateMassAttr()
+                old = attr.Get()
+                if old is not None:
+                    before.add(round(float(old), 3))
+                attr.Set(float(mass))
+                n += 1
+    print(f"[physics] 광물 질량: {sorted(before) or '?'} kg → {mass} kg ({n}개)")
+    return n
 
 PLANETS = {
     "mars": {

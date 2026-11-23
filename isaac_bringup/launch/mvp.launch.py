@@ -90,9 +90,9 @@ def generate_launch_description() -> LaunchDescription:
                      "차지하는 일이 있어 충돌 회피용으로 8090 default. "
                      "mission_web_node 에 WEB_VIDEO_PORT 환경변수로 자동 전달."))
     grasp_mode_arg = DeclareLaunchArgument(
-        "grasp_mode", default_value="contact",
-        description="arm_executor 의 부착 방식 (contact | snap). 시뮬레이터의 "
-                    "--grasp contact | magic 과 짝을 맞춘다.")
+        "grasp_mode", default_value="friction",
+        description="arm_executor 의 파지 방식 (friction | contact | snap). "
+                    "시뮬레이터의 --grasp friction | contact | magic 과 짝을 맞춘다.")
     reveal_radius_arg = DeclareLaunchArgument(
         "reveal_radius", default_value="5.0",
         description="coverage_node 의 fog reveal 반경 (m). 시연 가시성 위해 "

@@ -269,9 +269,10 @@ def generate_launch_description() -> LaunchDescription:
             description="coverage_node 의 fog reveal 반경 (m). 멀티 rover 시연 "
                         "가시성 위해 default 5.0. 더 키우려면 reveal_radius:=7.0."),
         DeclareLaunchArgument(
-            "grasp_mode", default_value="contact",
-            description="arm_executor 의 부착 방식. contact: 손끝이 닿을 때까지 "
-                        "내림 (시뮬레이터 --grasp contact 와 짝). snap: 예전 방식 "
-                        "(--grasp magic 과 짝)."),
+            "grasp_mode", default_value="friction",
+            description="arm_executor 의 파지 방식. friction: 넓은 집게로 쥐어 "
+                        "마찰로 든다 (시뮬레이터 --grasp friction 과 짝). contact: "
+                        "손끝이 닿을 때까지 내려 부착 (--grasp contact --gripper rg2). "
+                        "snap: 예전 방식 (--grasp magic --gripper rg2)."),
         OpaqueFunction(function=_launch_setup),
     ])
