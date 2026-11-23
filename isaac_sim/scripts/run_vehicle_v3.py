@@ -34,11 +34,53 @@ _p.add_argument("--rovers", nargs="*", default=[],
 _p.add_argument("--spawn-spacing", type=float, default=0.0,
                 help="다중 rover 시 사이 간격 (m). >0 이면 meta spawn_locations "
                      "무시하고 spawn[0] 기준 X 방향으로 N 미터씩 배치 (A* 회피 검증용).")
+_p.add_argument("--render-every", type=int, default=1,
+                help="N step 마다 1회만 렌더 (기본 1 = 매 step). 렌더가 병목인 "
+                     "GPU 에서 2 로 주면 물리는 그대로, 카메라/토픽 발행만 "
+                     "sim-time 기준 절반 주기 → 실시간 배율(RTF) 상승.")
+_p.add_argument("--max-rtf", type=float, default=None,
+                help="실시간 배율 상한 (sim-time/wall-time). 0 = 무제한. 기본: "
+                     "--render-every 1 이면 무제한(기존 동작), 2 이상이면 1.0 — "
+                     "ROS 노드가 wall-clock 기준이라 sim 이 실시간보다 빨라지면 "
+                     "제어 주기가 어긋남.")
+_p.add_argument("--no-viewport", action="store_true",
+                help="GUI 메인 뷰포트 렌더 중단 — 창은 뜨지만 3D 화면은 갱신 안 됨. "
+                     "카메라 토픽은 정상. Web HUD 로만 볼 때 GPU 절약.")
+_p.add_argument("--render-preset", choices=["default", "performance"],
+                default="default",
+                help="performance = RTX 반사/간접광/AO/반투명 끄고 DLSS Performance. "
+                     "화면 톤이 달라지므로 YOLO 검출률 확인 필요.")
+_p.add_argument("--debug-grasp", action="store_true",
+                help="grasp FixedJoint 가 있는 동안 finger / mineral world 좌표와 "
+                     "간격을 주기적으로 출력 (magic grasp 진단용).")
+_p.add_argument("--kit-arg", action="append", default=[],
+                help="Kit 에 그대로 넘길 인자 (반복 가능). 예: "
+                     "--kit-arg=--/rtx/reflections/enabled=false")
 _a, _ = _p.parse_known_args()
 
 from isaacsim import SimulationApp
 
-app = SimulationApp({"headless": _a.headless})
+_PERF_PRESET_ARGS = [
+    "--/rtx/translucency/enabled=false",
+    "--/rtx/reflections/enabled=false",
+    "--/rtx/indirectDiffuse/enabled=false",
+    "--/rtx/ambientOcclusion/enabled=false",
+    "--/rtx/directLighting/sampledLighting/enabled=false",
+    "--/rtx/raytracing/cached/enabled=false",
+    "--/rtx-transient/dlssg/enabled=false",
+    "--/rtx-transient/dldenoiser/enabled=false",
+    "--/rtx/post/dlss/execMode=0",
+]
+_kit_args = list(_a.kit_arg)
+if _a.render_preset == "performance":
+    _kit_args = _PERF_PRESET_ARGS + _kit_args
+
+app = SimulationApp({
+    "headless": _a.headless,
+    "extra_args": _kit_args,
+    # SimulationApp 은 headless 일 때만 이 플래그를 적용. GUI 는 main() 에서 처리.
+    "disable_viewport_updates": bool(_a.no_viewport and _a.headless),
+})
 
 from isaacsim.core.utils.extensions import enable_extension
 
@@ -403,10 +445,12 @@ def create_visual_sun(stage) -> None:
 DEFAULT_ROVER_PRIM = "/World/Rover"
 
 
-# ─── ScriptNode 소스 — rover root 를 hardcode 한 버전 ────────────────
+# ─── ScriptNode 소스 — 다중 rover 용 ─────────────────────────────────
 # build_vehicle_v3.py 의 GT_SCRIPT / GRASP_SCRIPT 와 동일 동작이지만 stage
 # 전역 traverse 대신 rover root prim 아래만 검색 → 두 rover 가 같은 stage
-# 에 있어도 서로 간섭하지 않음. {ROOT}, {JOINT} 는 rover 별로 다르게 박힘.
+# 에 있어도 서로 간섭하지 않음. rover root 는 스크립트에 박지 않고 노드
+# 자신의 prim path 에서 구한다 (ScriptNode 는 전역 이름공간을 공유하므로
+# rover 별로 다른 상수를 박으면 마지막 rover 값으로 덮어써짐).
 
 GT_SCRIPT_NSAWARE_TPL = '''
 from pxr import UsdGeom, Usd
@@ -476,37 +520,75 @@ import omni.usd
 import omni.graph.core as og
 import math
 
-_state = {"attached_joint_path": None, "attached_obj_path": None,
-          "gripper_link_path": None}
+# ── 중요: 이 스크립트는 모든 rover 에 "같은 내용" 으로 들어가야 한다 ──────────
+# omni.graph.scriptnode 는 스크립트의 전역 이름(상수·함수·dict)을 ScriptNode
+# 구현 모듈의 globals 하나에 주입한다 (OgnScriptNode.compute 의
+# compute_fn.__globals__.update). 즉 stage 안의 모든 ScriptNode 가 전역
+# 이름공간을 공유하고, 마지막에 초기화된 노드의 값이 전체를 덮어쓴다.
+# 예전처럼 rover 별로 ROVER_ROOT / GRASP_JOINT_PATH 상수를 다르게 박으면
+# 나중에 초기화된 rover 의 값으로 모든 rover 가 동작한다 → rover_2 의 pickup
+# 명령이 rover_1 의 그리퍼·주변 광물에 적용되는 cross-talk (2026-11-23 재현).
+# 그래서 rover root 는 매 compute 마다 자기 노드 prim path 에서 구하고,
+# 상태는 rover root 별 dict 에 둔다. 이름은 다른 ScriptNode 스크립트와
+# 겹치지 않게 전부 _grasp_ 접두어.
+_GRASP_JOINT_BY_ROOT = __GRASP_JOINT_TABLE__
+_GRASP_GRIPPER_LINK_NAME = "right_inner_finger"
+_GRASP_SEARCH_RADIUS = 2.5  # m  WRIST_T_LINK6 best-effort 누적 IK 오차 흡수용 cheat (2026-05-27)
 
-ROVER_ROOT = "__ROVER_ROOT__"
-GRASP_JOINT_PATH = "__GRASP_JOINT_PATH__"
-GRIPPER_LINK_NAME = "right_inner_finger"
-SEARCH_RADIUS = 2.5  # m  WRIST_T_LINK6 best-effort 누적 IK 오차 흡수용 cheat (2026-05-27)
+try:
+    _GRASP_STATES  # 다른 rover 노드가 먼저 만들었으면 재사용 (attach 상태 보존)
+except NameError:
+    _GRASP_STATES = {}
 
 
-def _component(v, i):
+def _grasp_component(v, i):
     try:
         return float(v[i])
     except Exception:
         return 0.0
 
 
-def _find_gripper_link(stage):
-    root = stage.GetPrimAtPath(ROVER_ROOT)
+def _grasp_rover_root(db):
+    # ScriptNode prim path 에서 rover root 추출.
+    # 예: /World/Rover_1/ActionGraph/GraspScript -> /World/Rover_1
+    node_path = ""
+    try:
+        node_path = db.node.get_prim_path()
+    except Exception:
+        try:
+            node_path = str(db.node.get_prim())
+        except Exception:
+            return None
+    parts = str(node_path).split("/")
+    if len(parts) < 3:
+        return None
+    return "/" + parts[1] + "/" + parts[2]
+
+
+def _grasp_state(rover_root):
+    st = _GRASP_STATES.get(rover_root)
+    if st is None:
+        st = {"attached_obj_path": None, "gripper_link_path": None,
+              "arm_base_path": None}
+        _GRASP_STATES[rover_root] = st
+    return st
+
+
+def _grasp_find_gripper_link(stage, rover_root):
+    root = stage.GetPrimAtPath(rover_root)
     if not root.IsValid():
         return None
     for prim in Usd.PrimRange(root):
-        if prim.GetName() == GRIPPER_LINK_NAME and "onrobot" in str(prim.GetPath()):
+        if (prim.GetName() == _GRASP_GRIPPER_LINK_NAME
+                and "onrobot" in str(prim.GetPath())):
             return str(prim.GetPath())
     return None
 
 
-def _find_arm_base(stage):
-    """로봇팔 articulation root (m0609 base_link) — snap distance 기준점.
-    IK 자세 폭주로 finger 가 텔레포트해도 base_link 는 안정.
-    """
-    root = stage.GetPrimAtPath(ROVER_ROOT)
+def _grasp_find_arm_base(stage, rover_root):
+    # 로봇팔 articulation root (m0609 base_link) — snap distance 기준점.
+    # IK 자세 폭주로 finger 가 텔레포트해도 base_link 는 안정.
+    root = stage.GetPrimAtPath(rover_root)
     if not root.IsValid():
         return None
     for prim in Usd.PrimRange(root):
@@ -518,15 +600,31 @@ def _find_arm_base(stage):
     return None
 
 
-def _find_nearest_mineral(stage, tx, ty):
+def _grasp_held_by_others(stage, joint_path):
+    # 다른 rover 의 grasp FixedJoint 가 잡고 있는 mineral path 집합.
+    held = set()
+    for other in _GRASP_JOINT_BY_ROOT.values():
+        if other == joint_path:
+            continue
+        jp = stage.GetPrimAtPath(other)
+        if not jp or not jp.IsValid():
+            continue
+        for t in UsdPhysics.FixedJoint(jp).GetBody1Rel().GetTargets():
+            held.add(str(t))
+    return held
+
+
+def _grasp_find_nearest_mineral(stage, tx, ty, exclude):
     cache = UsdGeom.XformCache()
     best_path = None
-    best_d2 = SEARCH_RADIUS * SEARCH_RADIUS
+    best_d2 = _GRASP_SEARCH_RADIUS * _GRASP_SEARCH_RADIUS
     for prim in stage.Traverse():
         parent = prim.GetParent()
         if not parent or parent.GetName() != "Minerals":
             continue
         if not prim.IsValid():
+            continue
+        if str(prim.GetPath()) in exclude:
             continue
         imageable = UsdGeom.Imageable(prim)
         try:
@@ -545,14 +643,14 @@ def _find_nearest_mineral(stage, tx, ty):
     return best_path, math.sqrt(best_d2) if best_path else float("inf")
 
 
-def _attach(stage, link_path, obj_path):
-    if stage.GetPrimAtPath(GRASP_JOINT_PATH).IsValid():
-        stage.RemovePrim(GRASP_JOINT_PATH)
+def _grasp_attach(stage, joint_path, link_path, obj_path):
+    if stage.GetPrimAtPath(joint_path).IsValid():
+        stage.RemovePrim(joint_path)
     link_prim = stage.GetPrimAtPath(link_path)
     obj_prim = stage.GetPrimAtPath(obj_path)
     if not link_prim.IsValid() or not obj_prim.IsValid():
         return False
-    joint = UsdPhysics.FixedJoint.Define(stage, GRASP_JOINT_PATH)
+    joint = UsdPhysics.FixedJoint.Define(stage, joint_path)
     joint.CreateBody0Rel().SetTargets([Sdf.Path(link_path)])
     joint.CreateBody1Rel().SetTargets([Sdf.Path(obj_path)])
     # Body0 = right_inner_finger frame origin (knuckle 회전축) 에 mineral attach.
@@ -569,13 +667,7 @@ def _attach(stage, link_path, obj_path):
     return True
 
 
-def _detach(stage):
-    if stage.GetPrimAtPath(GRASP_JOINT_PATH).IsValid():
-        stage.RemovePrim(GRASP_JOINT_PATH)
-    return True
-
-
-def _set_mineral_collision(stage, obj_path, enabled):
+def _grasp_set_mineral_collision(stage, obj_path, enabled):
     if not obj_path:
         return
     prim = stage.GetPrimAtPath(obj_path)
@@ -590,7 +682,7 @@ def _set_mineral_collision(stage, obj_path, enabled):
             enabled_attr.Set(bool(enabled))
 
 
-def _hide(stage, obj_path):
+def _grasp_hide(stage, obj_path):
     prim = stage.GetPrimAtPath(obj_path)
     if prim and prim.IsValid():
         imageable = UsdGeom.Imageable(prim)
@@ -604,24 +696,41 @@ def setup(db):
 def compute(db):
     lin = db.inputs.linearVelocity
     ang = db.inputs.angularVelocity
-    mode = _component(ang, 0)  # +1 pickup, -1 release
+    mode = _grasp_component(ang, 0)  # +1 pickup, -1 release
+    if abs(mode) <= 0.5:
+        return True
+    rover_root = _grasp_rover_root(db)
+    joint_path = _GRASP_JOINT_BY_ROOT.get(rover_root or "")
+    if not joint_path:
+        print(f"[grasp] rover root 판별 실패 — node 가 속한 root={rover_root!r} 가 "
+              f"joint 테이블에 없음: {sorted(_GRASP_JOINT_BY_ROOT)}")
+        return False
+    st = _grasp_state(rover_root)
+    stage = omni.usd.get_context().get_stage()
     if mode > 0.5:
-        stage = omni.usd.get_context().get_stage()
-        gripper_path = _state.get("gripper_link_path") or _find_gripper_link(stage)
+        gripper_path = (st.get("gripper_link_path")
+                        or _grasp_find_gripper_link(stage, rover_root))
         if not gripper_path:
-            print("[grasp] gripper link 못 찾음")
+            print(f"[grasp] {rover_root} gripper link 못 찾음")
             return False
-        _state["gripper_link_path"] = gripper_path
+        st["gripper_link_path"] = gripper_path
         # arm_base (articulation root) — snap 거리 측정 기준. finger 와 달리
         # IK 자세 폭주에 영향 안 받음 (rover body 와 함께 stable).
-        arm_base_path = _state.get("arm_base_path") or _find_arm_base(stage)
+        arm_base_path = (st.get("arm_base_path")
+                         or _grasp_find_arm_base(stage, rover_root))
         if not arm_base_path:
-            print("[grasp] arm_base 못 찾음 — m0609 articulation root 없음")
+            print(f"[grasp] {rover_root} arm_base 못 찾음 — m0609 articulation root 없음")
             return False
-        _state["arm_base_path"] = arm_base_path
+        st["arm_base_path"] = arm_base_path
         # supervisor 가 보낸 추정 mineral 좌표 (참고용 log).
-        req_x = _component(lin, 0)
-        req_y = _component(lin, 1)
+        req_x = _grasp_component(lin, 0)
+        req_y = _grasp_component(lin, 1)
+        # pickup 명령은 burst (6회) 로 온다. 이미 이 rover 가 광물을 잡고 있으면
+        # joint 를 지웠다 다시 만들지 않는다 (매번 재생성하면 그 사이 프레임에
+        # collision 꺼진 광물이 자유낙하).
+        held = st.get("attached_obj_path")
+        if held and stage.GetPrimAtPath(joint_path).IsValid():
+            return True
         # ── snap 판정: arm_base GT 기준 nearest mineral ──────────────────
         # finger world transform 은 PhysX articulation 폭주 시 텔레포트 가능
         # (2026-05-27 rover_1 시연에서 gripper GT (19.78,20.95) 폭주 관찰).
@@ -636,31 +745,29 @@ def compute(db):
             apos = M.ExtractTranslation()
             bx = float(apos[0])
             by = float(apos[1])
-        mineral_path, dist = _find_nearest_mineral(stage, bx, by)
+        mineral_path, dist = _grasp_find_nearest_mineral(
+            stage, bx, by, _grasp_held_by_others(stage, joint_path))
         if not mineral_path:
-            print(f"[grasp] pickup ignored — no mineral near arm_base "
-                  f"({bx:.2f},{by:.2f}) within {SEARCH_RADIUS}m "
+            print(f"[grasp] {rover_root} pickup ignored — no mineral near arm_base "
+                  f"({bx:.2f},{by:.2f}) within {_GRASP_SEARCH_RADIUS}m "
                   f"(requested=({req_x:.2f},{req_y:.2f}))")
             return True
-        if _attach(stage, gripper_path, mineral_path):
-            _state["attached_joint_path"] = GRASP_JOINT_PATH
-            _state["attached_obj_path"] = mineral_path
-            _set_mineral_collision(stage, mineral_path, False)
+        if _grasp_attach(stage, joint_path, gripper_path, mineral_path):
+            st["attached_obj_path"] = mineral_path
+            _grasp_set_mineral_collision(stage, mineral_path, False)
             print(f"[grasp] pickup OK — attached {mineral_path} to {gripper_path} "
                   f"(arm_base GT=({bx:.2f},{by:.2f}), "
                   f"requested=({req_x:.2f},{req_y:.2f}), "
                   f"target dist {dist:.2f}m, snapped, collision off)")
         return True
-    elif mode < -0.5:
-        stage = omni.usd.get_context().get_stage()
-        obj = _state.get("attached_obj_path")
-        _detach(stage)
-        if obj:
-            _hide(stage, obj)
-            print(f"[grasp] release + hide {obj}")
-        _state["attached_joint_path"] = None
-        _state["attached_obj_path"] = None
-        return True
+    # mode < -0.5 : release
+    obj = st.get("attached_obj_path")
+    if stage.GetPrimAtPath(joint_path).IsValid():
+        stage.RemovePrim(joint_path)
+    if obj:
+        _grasp_hide(stage, obj)
+        print(f"[grasp] {rover_root} release + hide {obj}")
+    st["attached_obj_path"] = None
     return True
 '''
 
@@ -724,6 +831,33 @@ def _force_release_for_ns(stage, ns: str) -> bool:
     return True
 
 
+def _debug_grasp_trace(stage, namespaces, step: int) -> None:
+    """grasp FixedJoint 가 존재하는 rover 마다 finger/mineral world 좌표 출력."""
+    cache = UsdGeom.XformCache()
+    for ns in namespaces:
+        ns_norm = (ns or "").strip("/").strip() or "rover"
+        jp = stage.GetPrimAtPath(f"/World/grip_fixed_joint_{ns_norm}")
+        if not jp or not jp.IsValid():
+            continue
+        fj = UsdPhysics.FixedJoint(jp)
+        b0 = fj.GetBody0Rel().GetTargets()
+        b1 = fj.GetBody1Rel().GetTargets()
+        if not b0 or not b1:
+            print(f"[grasp-dbg] step={step} {ns_norm} joint 에 body target 없음")
+            continue
+        f_prim = stage.GetPrimAtPath(b0[0])
+        m_prim = stage.GetPrimAtPath(b1[0])
+        fp = cache.GetLocalToWorldTransform(f_prim).ExtractTranslation()
+        mp = cache.GetLocalToWorldTransform(m_prim).ExtractTranslation()
+        gap = (Gf.Vec3d(fp) - Gf.Vec3d(mp)).GetLength()
+        vis = UsdGeom.Imageable(m_prim).ComputeVisibility()
+        en = jp.GetAttribute("physics:jointEnabled").Get()
+        print(f"[grasp-dbg] step={step} {ns_norm} "
+              f"finger=({fp[0]:.2f},{fp[1]:.2f},{fp[2]:.2f}) "
+              f"mineral=({mp[0]:.2f},{mp[1]:.2f},{mp[2]:.2f}) gap={gap:.3f}m "
+              f"vis={vis} jointEnabled={en} {m_prim.GetName()}")
+
+
 class GraspBridge:
     """별도 rclpy node — 모든 rover 의 /grasp/command 를 standard subscriber
     로 듣고 release 신호를 main thread 의 pending queue 에 push. main loop 가
@@ -738,8 +872,14 @@ class GraspBridge:
 
         if not rclpy.ok():
             rclpy.init()
+        from std_msgs.msg import String as _String
+        self._String = _String
         node = _RclpyNode("grasp_bridge_listener")
         self._pending = []
+        # ns → (status publisher, grasp FixedJoint path). arm_executor 가 pickup
+        # 직후 이 토픽으로 실제 부착 여부를 확인한다 (data = 잡은 mineral prim
+        # 이름, 안 잡았으면 빈 문자열).
+        self._status = {}
         for ns in namespaces:
             ns_norm = (ns or "").strip("/").strip()
             topic = (f"/{ns_norm}/grasp/command"
@@ -749,7 +889,26 @@ class GraspBridge:
                 _partial(self._on_grasp, ns_norm), 100)
             node.get_logger().info(
                 f"[grasp-bridge] subscribed: {topic} (depth=100)")
+            status_topic = (f"/{ns_norm}/grasp/status"
+                            if ns_norm else "/grasp/status")
+            # 단일 rover 모드는 USD 내장 GraspScript 의 joint 경로를 씀.
+            joint_path = (f"/World/grip_fixed_joint_{ns_norm}"
+                          if ns_norm else "/World/grip_fixed_joint")
+            self._status[ns_norm] = (
+                node.create_publisher(_String, status_topic, 10), joint_path)
         self._node = node
+
+    def publish_status(self, stage) -> None:
+        """각 rover 의 grasp FixedJoint 존재 여부를 /<ns>/grasp/status 로 발행."""
+        for pub, joint_path in self._status.values():
+            held = ""
+            jp = stage.GetPrimAtPath(joint_path)
+            if jp and jp.IsValid():
+                targets = UsdPhysics.FixedJoint(jp).GetBody1Rel().GetTargets()
+                held = targets[0].name if targets else "unknown"
+            msg = self._String()
+            msg.data = held
+            pub.publish(msg)
 
     def _on_grasp(self, ns, msg):
         if msg.angular.x < -0.5:
@@ -822,8 +981,46 @@ def _per_rover_usd_copies(namespaces) -> dict:
         dst = os.path.join(out_dir, f"vehicle_v3_{ns}.usd")
         shutil.copyfile(V3, dst)
         copies[ns] = dst
-        print(f"[run_v3] per-rover USD copy: {V3.split('/')[-1]} → {dst}")
+        fixed = _localize_asset_paths(dst)
+        print(f"[run_v3] per-rover USD copy: {V3.split('/')[-1]} → {dst}"
+              + (f"  (asset 경로 {fixed}개 현지화)" if fixed else ""))
     return copies
+
+
+def _localize_asset_paths(usd_path: str) -> int:
+    """다른 PC 의 절대경로로 저장된 asset 경로를 이 checkout 기준으로 치환.
+
+    vehicle_v3.usd 의 MDL 재질이 저장한 PC 의 절대경로
+    (.../a2_isaac/isaac_sim/assets/...) 를 들고 있어, checkout 위치가 다르면
+    재질 로드가 실패함. 존재하지 않는 절대경로 중 '/isaac_sim/assets/' 를
+    포함하고 이 checkout 에 같은 파일이 있는 것만 바꿈. 치환 개수 반환.
+    """
+    from pxr import UsdUtils
+
+    layer = Sdf.Layer.FindOrOpen(usd_path)
+    if layer is None:
+        return 0
+    marker = "/isaac_sim/assets/"
+    count = 0
+
+    def _fix(path: str) -> str:
+        nonlocal count
+        raw = path[5:] if path.startswith("file:") else path
+        if not raw.startswith("/") or os.path.exists(raw):
+            return path
+        i = raw.find(marker)
+        if i < 0:
+            return path
+        local = ISAAC_SIM + raw[i + len("/isaac_sim"):]
+        if not os.path.exists(local):
+            return path
+        count += 1
+        return local
+
+    UsdUtils.ModifyAssetPaths(layer, _fix)
+    if count:
+        layer.Save()
+    return count
 
 
 def _patch_topic_names(stage, rover_root: str, ns: str) -> int:
@@ -862,6 +1059,16 @@ def _patch_topic_names(stage, rover_root: str, ns: str) -> int:
     return patched
 
 
+def _grasp_joint_table() -> dict:
+    """{rover root prim path: grasp FixedJoint path} — 전 rover 공통 테이블.
+    joint 경로 규칙은 _force_release_for_ns 와 같아야 한다."""
+    table = {}
+    for ns in _a.rovers:
+        ns_norm = (ns.strip("/").strip() or "rover")
+        table[f"/World/{_ns_to_prim_name(ns)}"] = f"/World/grip_fixed_joint_{ns_norm}"
+    return table
+
+
 def _patch_script_nodes(stage, rover_root: str, ns: str) -> int:
     """rover_root 아래 GT/GRASP ScriptNode 의 inputs:script 를 rover-scoped 버전으로 교체.
 
@@ -890,13 +1097,14 @@ def _patch_script_nodes(stage, rover_root: str, ns: str) -> int:
             print(f"[run_v3]     {script_attr.GetPath()} ← ReadGtPose ({len(new_src)} chars, self-introspect={'OK' if ok else 'FAIL'})")
             patched += 1
         elif name == "GraspScript":
-            new_src = (GRASP_SCRIPT_NSAWARE_TPL
-                       .replace("__ROVER_ROOT__", rover_root)
-                       .replace("__GRASP_JOINT_PATH__", joint_path))
+            # 모든 rover 에 동일한 스크립트 (전 rover 의 root→joint 테이블 포함).
+            # rover 별로 내용이 다르면 ScriptNode 전역 공유 때문에 cross-talk.
+            new_src = GRASP_SCRIPT_NSAWARE_TPL.replace(
+                "__GRASP_JOINT_TABLE__", repr(_grasp_joint_table()))
             script_attr.Set(new_src)
             check = script_attr.Get()
             ok = (isinstance(check, str) and rover_root in check and joint_path in check)
-            print(f"[run_v3]     {script_attr.GetPath()} ← GraspScript ({len(new_src)} chars, ROVER_ROOT+JOINT={'OK' if ok else 'FAIL'})")
+            print(f"[run_v3]     {script_attr.GetPath()} ← GraspScript ({len(new_src)} chars, joint table={'OK' if ok else 'FAIL'})")
             patched += 1
     return patched
 
@@ -1011,6 +1219,21 @@ def main() -> None:
         app.update()
     world.reset()
     world.play()
+    render_every = max(1, int(_a.render_every))
+    if _a.no_viewport and not _a.headless:
+        try:
+            from omni.kit.viewport.utility import get_active_viewport
+            get_active_viewport().updates_enabled = False
+            print("[run_v3] 메인 뷰포트 렌더 중단 (--no-viewport)")
+        except Exception as exc:
+            print(f"[run_v3] ⚠ --no-viewport 적용 실패: {exc}")
+    max_rtf = _a.max_rtf
+    if max_rtf is None:
+        max_rtf = 1.0 if render_every > 1 else 0.0
+    physics_dt = float(world.get_physics_dt())
+    print(f"[run_v3] render 설정: every={render_every} preset={_a.render_preset} "
+          f"headless={_a.headless} no_viewport={_a.no_viewport} "
+          f"max_rtf={max_rtf:g} physics_dt={physics_dt:.5f}")
     if _a.rovers:
         nss = ", ".join(f"/{n}" for n in _a.rovers)
         print(f"[run_v3] ready — {len(_a.rovers)}대 vehicle namespaces: {nss}")
@@ -1022,8 +1245,8 @@ def main() -> None:
     # release msg drop race 대비 dual mechanism. init 실패해도 main 진행.
     grasp_bridge = None
     grasp_executor = None
+    bridge_namespaces = _a.rovers if _a.rovers else [""]
     try:
-        bridge_namespaces = _a.rovers if _a.rovers else [""]
         grasp_bridge = GraspBridge(bridge_namespaces)
         from rclpy.executors import SingleThreadedExecutor
         grasp_executor = SingleThreadedExecutor()
@@ -1041,9 +1264,19 @@ def main() -> None:
     # GPU/RTF 부담 측정용 — 600 step 사이 wall-clock 도 함께 출력.
     import time
     last_log_wall = time.time()
+    next_step_wall = time.perf_counter()
     try:
         while app.is_running():
-            world.step(render=True)
+            world.step(render=(step % render_every == 0))
+            if max_rtf > 0.0:
+                # 실시간 배율 상한 — 다음 step 예정 시각까지 대기. 밀렸으면
+                # 빚을 쌓지 않고 현재 시각 기준으로 다시 잡음.
+                next_step_wall += physics_dt / max_rtf
+                wait = next_step_wall - time.perf_counter()
+                if wait > 0.0:
+                    time.sleep(wait)
+                elif wait < -0.1:
+                    next_step_wall = time.perf_counter()
             # rclpy bridge poll + pending release 처리. main thread 에서
             # 직접 stage 조작 (안전).
             if grasp_executor is not None and grasp_bridge is not None:
@@ -1051,8 +1284,12 @@ def main() -> None:
                     grasp_executor.spin_once(timeout_sec=0.0)
                     for ns in grasp_bridge.drain_releases():
                         _force_release_for_ns(stage, ns)
+                    if step % 6 == 0:
+                        grasp_bridge.publish_status(stage)
                 except Exception as exc:
                     print(f"[run_v3] grasp bridge tick error: {exc}")
+            if _a.debug_grasp and step % 12 == 0:
+                _debug_grasp_trace(stage, bridge_namespaces, step)
             # 단일 모드 chase cam.
             if chase_xform_op is not None:
                 _update_chase_cam(stage, chase_xform_op, chase_state)
@@ -1067,7 +1304,8 @@ def main() -> None:
                 # = 600 step / 10s 가 정상. 그보다 길면 RTF<1 = lag.
                 rate = (600.0 / dt) if dt > 0 else 0.0
                 print(f"[run_v3] running... step {step}  "
-                      f"({rate:.1f} step/s, 600-step wall={dt:.2f}s)")
+                      f"({rate:.1f} step/s, 600-step wall={dt:.2f}s, "
+                      f"RTF={rate * physics_dt:.2f})")
             step += 1
     except KeyboardInterrupt:
         pass

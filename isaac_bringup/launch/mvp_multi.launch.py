@@ -177,6 +177,7 @@ def _rover_group(ns: str, terrain_dir: str, collection_goal: int,
                 "wrist_detections_topic": f"{nsp}/perception/wrist_detections",
                 "odom_topic":             f"{nsp}/ground_truth/odom",
                 "grasp_command_topic":    f"{nsp}/grasp/command",
+                "grasp_status_topic":     f"{nsp}/grasp/status",
             }],
         ),
     ]

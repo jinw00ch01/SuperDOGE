@@ -96,6 +96,9 @@ class MissionManagerNode(Node):
         self.declare_parameter("coverage_cmd_stale_sec", 1.0)
         self.declare_parameter("post_pick_cooldown_sec", 8.0)
         self.declare_parameter("post_pick_skip_radius_m", 1.0)
+        # pick 이 실패한 지점(오검출 등) 을 이 시간 동안 후보에서 제외 — 같은
+        # 허상 target 으로 무한 재시도하는 것 방지. 반경은 post_pick_skip_radius_m.
+        self.declare_parameter("failed_pick_ignore_sec", 60.0)
         self.declare_parameter("arm_action_name", "/execute_arm_task")
         self.declare_parameter("enable_arm_action", True)
         self.declare_parameter("approach_lin_speed", 0.6)
@@ -207,6 +210,8 @@ class MissionManagerNode(Node):
         self.arm_client: Optional[ActionClient] = None
         # Post-pick cooldown
         self.last_pick_world: Optional[Tuple[float, float]] = None
+        # (x, y, expire_ns) — pick 실패 지점 임시 제외 목록
+        self.failed_pick_points: list = []
         self.last_pick_done_ns: int = 0
         # Target lock-on (kept while APPROACH, even if detection briefly lost)
         self.lock_target: Optional[Detection] = None
@@ -339,6 +344,17 @@ class MissionManagerNode(Node):
             dy = d.world_position.y - self.last_pick_world[1]
             return (dx * dx + dy * dy) <= (skip_r * skip_r)
 
+        self.failed_pick_points = [
+            f for f in self.failed_pick_points if f[2] > now_ns]
+
+        def near_failed_pick(d: Detection) -> bool:
+            for fx, fy, _ in self.failed_pick_points:
+                dx = d.world_position.x - fx
+                dy = d.world_position.y - fy
+                if (dx * dx + dy * dy) <= (skip_r * skip_r):
+                    return True
+            return False
+
         candidates = [
             d for d in msg.detections
             if d.confidence >= min_conf
@@ -346,6 +362,7 @@ class MissionManagerNode(Node):
                      and d.world_position.y == 0.0
                      and d.world_position.z == 0.0)
             and not in_cooldown(d)
+            and not near_failed_pick(d)
             # Multi-rover: 다른 rover 가 claim 한 mineral 은 후보 제외
             and not self._is_claimed_by_other(
                 d.world_position.x, d.world_position.y)
@@ -901,6 +918,12 @@ class MissionManagerNode(Node):
             self.last_error = ""
         else:
             self.last_error = f"arm failed: {msg_text}"
+            if self.last_pick_world is not None:
+                ignore_ns = int(float(
+                    self.get_parameter("failed_pick_ignore_sec").value) * 1e9)
+                self.failed_pick_points.append(
+                    (self.last_pick_world[0], self.last_pick_world[1],
+                     self.last_pick_done_ns + ignore_ns))
         # Drop the current target so PICK_READY exits and EXPLORE resumes.
         self.target = None
         self.last_det_stamp_ns = 0

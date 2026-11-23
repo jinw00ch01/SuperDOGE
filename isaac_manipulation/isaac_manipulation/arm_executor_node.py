@@ -138,6 +138,13 @@ class ArmExecutorNode(Node):
         # Step delay between grasp publish and arm continuing — gives
         # vehicle_v3 ScriptNode time to attach the FixedJoint.
         self.declare_parameter("grasp_publish_delay_sec", 0.3)
+        # pickup 직후 시뮬레이터가 실제로 mineral 을 그리퍼에 붙였는지 확인.
+        # run_vehicle_v3 의 GraspBridge 가 std_msgs/String 으로 발행 (data =
+        # 잡은 mineral 이름, 없으면 ""). 이 시간 안에 부착 확인이 안 되면 pick 을
+        # 실패로 끝내 mission_manager 가 수집으로 세지 않게 한다. 0 = 확인 안 함.
+        # status 토픽이 한 번도 안 들어온 경우(구버전 sim)는 기존처럼 성공 처리.
+        self.declare_parameter("grasp_status_topic", "/grasp/status")
+        self.declare_parameter("grasp_confirm_timeout_sec", 3.0)
         # CARGO_SWING 완료 후 release 까지 대기 — Isaac articulation 이
         # ROS joint_command 를 따라가는 visual lag 흡수. ROS 입장 swing 끝나도
         # mineral 이 시각적으로 cargo (back basket) 에 도달하기 전이라면
@@ -171,6 +178,14 @@ class ArmExecutorNode(Node):
         self.create_subscription(
             Odometry, str(self.get_parameter("odom_topic").value),
             self._on_odom, SENSOR_QOS)
+
+        self._grasp_status_lock = threading.Lock()
+        self._grasp_status_held: str = ""
+        self._grasp_status_mono: float = 0.0   # 마지막 수신 시각 (monotonic)
+        self._grasp_status_count: int = 0
+        self.create_subscription(
+            String, str(self.get_parameter("grasp_status_topic").value),
+            self._on_grasp_status, 10)
 
         self._wrist_lock = threading.Lock()
         self._wrist_dets: List[Detection] = []
@@ -317,6 +332,44 @@ class ArmExecutorNode(Node):
             f"grasp/command -> {cmd} xyz=({x:.3f},{y:.3f},{z:.3f}) "
             f"target_id={target_id}")
 
+    def _on_grasp_status(self, msg: String) -> None:
+        with self._grasp_status_lock:
+            self._grasp_status_held = msg.data
+            self._grasp_status_mono = time.monotonic()
+            self._grasp_status_count += 1
+
+    def _confirm_grasp(self, since_mono: float) -> bool:
+        """pickup 발행(since_mono) 이후 시뮬레이터가 부착을 보고했는지 확인."""
+        timeout = float(self.get_parameter("grasp_confirm_timeout_sec").value)
+        if timeout <= 0.0:
+            return True
+        with self._grasp_status_lock:
+            seen_any = self._grasp_status_count > 0
+        if not seen_any:
+            self.get_logger().warn(
+                "grasp status 토픽 수신 없음 — 부착 확인 생략 (성공으로 간주)")
+            return True
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._grasp_status_lock:
+                held = self._grasp_status_held
+                fresh = self._grasp_status_mono >= since_mono
+            if fresh and held:
+                self.get_logger().info(f"grasp confirmed — holding {held}")
+                return True
+            time.sleep(0.05)
+        return False
+
+    def _abort_pick_not_attached(self, goal_handle, cur_deg: List[float]):
+        """부착 실패 — 팔을 HOME 으로 되돌리고 action 을 실패로 종료."""
+        self.get_logger().warn(
+            "grasp NOT attached — 팔이 닿는 범위에 mineral 없음. pick 실패 처리")
+        self._goto(cur_deg, HOME_DEG, goal_handle, "HOME_ABORT", 0.5, 1.0)
+        self._publish_joint_state(HOME_DEG)
+        goal_handle.abort()
+        return ExecuteArmTask.Result(
+            success=False, message="grasp not attached (no mineral in reach)")
+
     def _execute_pick_scripted(self, goal_handle):
         """Simple-ver pick — single forward dip + single cargo swing:
             HOME -> PICK_DOWN (forward, joint_1=0) -> GRASP publish -> HOME
@@ -339,7 +392,10 @@ class ArmExecutorNode(Node):
         cur_deg = list(PICK_DOWN_DEG)
 
         # 3) GRASP — vehicle_v3 attaches nearest mineral to gripper
+        t_pickup = time.monotonic()
         self._publish_grasp("pickup", x=tx, y=ty, z=tz, target_id=req.target_id)
+        if not self._confirm_grasp(t_pickup):
+            return self._abort_pick_not_attached(goal_handle, cur_deg)
         fb = ExecuteArmTask.Feedback()
         fb.state = "GRASP_CLOSE"
         fb.progress = 0.35
@@ -454,11 +510,14 @@ class ArmExecutorNode(Node):
         cur_deg = list(deg_descend)
 
         # 5) Grasp pickup — FixedJoint snap (mineral → gripper link origin)
+        t_pickup = time.monotonic()
         self._publish_grasp("pickup",
                             x=float(mineral_world[0]),
                             y=float(mineral_world[1]),
                             z=float(mineral_world[2]),
                             target_id=req.target_id)
+        if not self._confirm_grasp(t_pickup):
+            return self._abort_pick_not_attached(goal_handle, cur_deg)
         fb = ExecuteArmTask.Feedback()
         fb.state = "GRASP_PICKUP"
         fb.progress = 0.5

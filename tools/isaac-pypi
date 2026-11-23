@@ -22,37 +22,60 @@
 set -e
 
 ISAAC_PYPI_VENV="${ISAAC_PYPI_VENV:-$HOME/dev_ws/isaac_sim_pypi/venv}"
-ISAAC_ROS2_WS="${ISAAC_ROS2_WS:-$HOME/dev_ws/isaac_sim/IsaacSim-ros_workspaces/humble_ws}"
-
-SETUP="$ISAAC_ROS2_WS/install/local_setup.bash"
 PYPI_PY="$ISAAC_PYPI_VENV/bin/python"
-PYPI_HUMBLE_LIB="$ISAAC_PYPI_VENV/lib/python3.11/site-packages/isaacsim/exts/isaacsim.ros2.bridge/humble/lib"
+BRIDGE_DIR="$ISAAC_PYPI_VENV/lib/python3.11/site-packages/isaacsim/exts/isaacsim.ros2.bridge"
 
-if [ ! -f "$SETUP" ]; then
-    echo "[isaac-pypi] ✗ humble_ws setup.bash not found: $SETUP" >&2
-    echo "[isaac-pypi]   ISAAC_ROS2_WS 환경변수로 본인 경로를 가리키세요." >&2
-    echo "[isaac-pypi]   가이드: docs/SETUP_ISAAC_PYPI.md" >&2
-    exit 1
+# ROS 배포판 선택: ISAAC_ROS_DISTRO 로 강제 가능. 기본은 설치된 시스템 ROS 를 따름.
+#   humble (Ubuntu 22.04) — 기존 방식: humble_ws source + Isaac 내장 humble lib
+#   jazzy  (Ubuntu 24.04) — 시스템 ROS 는 Python 3.12 라 Isaac(Python 3.11)과 섞을 수 없음
+#                           → 시스템 ROS 환경을 걷어내고 Isaac 내장 jazzy lib 만 사용
+if [ -z "${ISAAC_ROS_DISTRO:-}" ]; then
+    if [ -d /opt/ros/humble ]; then ISAAC_ROS_DISTRO=humble
+    elif [ -d /opt/ros/jazzy ]; then ISAAC_ROS_DISTRO=jazzy
+    else ISAAC_ROS_DISTRO=humble; fi
 fi
+PYPI_ROS_LIB="$BRIDGE_DIR/$ISAAC_ROS_DISTRO/lib"
+
 if [ ! -x "$PYPI_PY" ]; then
     echo "[isaac-pypi] ✗ PyPI venv python not found: $PYPI_PY" >&2
     echo "[isaac-pypi]   ISAAC_PYPI_VENV 환경변수로 본인 venv 경로를 가리키세요." >&2
     echo "[isaac-pypi]   설치 가이드: docs/SETUP_ISAAC_PYPI.md" >&2
     exit 1
 fi
-if [ ! -d "$PYPI_HUMBLE_LIB" ]; then
-    echo "[isaac-pypi] ✗ PyPI humble lib not found: $PYPI_HUMBLE_LIB" >&2
+if [ ! -d "$PYPI_ROS_LIB" ]; then
+    echo "[isaac-pypi] ✗ PyPI $ISAAC_ROS_DISTRO lib not found: $PYPI_ROS_LIB" >&2
     echo "[isaac-pypi]   isaacsim 5.1.0 wheel 이 venv 에 잘 설치됐는지 확인:" >&2
     echo "[isaac-pypi]     source $ISAAC_PYPI_VENV/bin/activate && pip list | grep isaacsim" >&2
     exit 1
 fi
 
-source "$SETUP"
+if [ "$ISAAC_ROS_DISTRO" = "humble" ]; then
+    ISAAC_ROS2_WS="${ISAAC_ROS2_WS:-$HOME/dev_ws/isaac_sim/IsaacSim-ros_workspaces/humble_ws}"
+    SETUP="$ISAAC_ROS2_WS/install/local_setup.bash"
+    if [ ! -f "$SETUP" ]; then
+        echo "[isaac-pypi] ✗ humble_ws setup.bash not found: $SETUP" >&2
+        echo "[isaac-pypi]   ISAAC_ROS2_WS 환경변수로 본인 경로를 가리키세요." >&2
+        echo "[isaac-pypi]   가이드: docs/SETUP_ISAAC_PYPI.md" >&2
+        exit 1
+    fi
+    source "$SETUP"
+else
+    # .bashrc 가 source 한 시스템 ROS (Python 3.12) 흔적 제거 — 남아 있으면 rclpy import 가 깨짐.
+    strip_ros() { echo "${1:-}" | tr ':' '\n' | grep -vE '^/opt/ros/|/install/|^$' | paste -sd: -; }
+    export LD_LIBRARY_PATH="$(strip_ros "${LD_LIBRARY_PATH:-}")"
+    export PATH="$(strip_ros "$PATH")"
+    unset PYTHONPATH AMENT_PREFIX_PATH CMAKE_PREFIX_PATH COLCON_PREFIX_PATH ROS_VERSION ROS_PYTHON_VERSION
+fi
 
 # Isaac 내장 RMW (FastDDS) 구현체 .so 경로를 LD_LIBRARY_PATH 에 추가.
 # 안 하면 'failed to load any RMW implementations' 로 ROS2 bridge startup 실패.
-export ROS_DISTRO=humble
+export ROS_DISTRO="$ISAAC_ROS_DISTRO"
 export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"
-export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:$PYPI_HUMBLE_LIB"
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}$PYPI_ROS_LIB"
+
+# 하이브리드 그래픽(on-demand) 노트북: 렌더링을 NVIDIA dGPU 로 보냄.
+if command -v prime-select >/dev/null 2>&1 && [ "$(prime-select query 2>/dev/null)" = "on-demand" ]; then
+    export __NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia __VK_LAYER_NV_optimus=NVIDIA_only
+fi
 
 exec "$PYPI_PY" "$@"
