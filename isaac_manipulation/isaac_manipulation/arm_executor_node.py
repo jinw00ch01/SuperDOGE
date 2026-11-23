@@ -45,6 +45,16 @@ def _quat_to_yaw(qx: float, qy: float, qz: float, qw: float) -> float:
     return math.atan2(siny, cosy)
 
 
+def _quat_to_matrix(x: float, y: float, z: float, w: float) -> np.ndarray:
+    n = math.sqrt(x * x + y * y + z * z + w * w) or 1.0
+    x, y, z, w = x / n, y / n, z / n, w / n
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ], dtype=np.float64)
+
+
 def _yaw_rot_z(yaw: float) -> np.ndarray:
     c, s = math.cos(yaw), math.sin(yaw)
     return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
@@ -134,6 +144,19 @@ class ArmExecutorNode(Node):
         # IK phase 높이 (arm base local z offset, mineral world 좌표 기준 상대)
         self.declare_parameter("ik_approach_dz", 0.30)
         self.declare_parameter("ik_descend_dz", 0.05)
+        # 부착 방식 — 시뮬레이터의 --grasp 와 맞춰야 한다.
+        #   contact (기본): 손끝을 광물 위로 가져가 닿을 때까지 천천히 내린다.
+        #                   시뮬레이터는 손끝이 광물에 닿은 순간에만 부착한다.
+        #   snap          : 예전 방식 (광물 근처로 팔만 뻗고 순간이동 부착).
+        self.declare_parameter("grasp_mode", "contact")
+        # link_6 원점 → 손끝까지 거리 (vehicle_v3.usd 의 RG2-FT inner finger 끝).
+        self.declare_parameter("tool_tip_offset_m", 0.194)
+        # 손끝의 시작·최저 높이 (인식한 광물 중심 기준). 광물 높이는 약 0.26 m 라
+        # 윗면은 중심 +0.10~0.13 m 에 있다. 시작은 그보다 넉넉히 위, 최저는
+        # 윗면보다 한참 아래 — 인식 높이가 틀려도 그 사이 어딘가에서 닿는다.
+        self.declare_parameter("contact_start_above_m", 0.24)
+        self.declare_parameter("contact_end_above_m", 0.02)
+        self.declare_parameter("contact_descend_speed", 0.04)   # m/s
         self.declare_parameter("grasp_command_topic", "/grasp/command")
         # Step delay between grasp publish and arm continuing — gives
         # vehicle_v3 ScriptNode time to attach the FixedJoint.
@@ -198,6 +221,7 @@ class ArmExecutorNode(Node):
         self._odom_lock = threading.Lock()
         self._rover_xyz: Optional[np.ndarray] = None
         self._rover_yaw: Optional[float] = None
+        self._rover_R: Optional[np.ndarray] = None
 
         # 상대 토픽 "execute_arm_task" 사용 — 단일 시연에선 root namespace 라
         # "/execute_arm_task" 로 광고되고 (기존 동작 유지), multi 시연에선
@@ -260,6 +284,7 @@ class ArmExecutorNode(Node):
         with self._odom_lock:
             self._rover_xyz = np.array([p.x, p.y, p.z], dtype=np.float64)
             self._rover_yaw = _quat_to_yaw(o.x, o.y, o.z, o.w)
+            self._rover_R = _quat_to_matrix(o.x, o.y, o.z, o.w)
 
     def _best_wrist_detection(self,
                               wait_sec: float,
@@ -299,6 +324,8 @@ class ArmExecutorNode(Node):
         if command == "pick_mineral":
             if bool(self.get_parameter("enable_ik").value):
                 if bool(self.get_parameter("use_world_target_ik").value):
+                    if str(self.get_parameter("grasp_mode").value) == "contact":
+                        return self._execute_pick_contact(goal_handle)
                     return self._execute_pick_world_target(goal_handle)
                 return self._execute_pick_ik(goal_handle)
             return self._execute_pick_scripted(goal_handle)
@@ -553,6 +580,150 @@ class ArmExecutorNode(Node):
         self.get_logger().info("pick_mineral (T2 DLS-IK world target) done")
         return ExecuteArmTask.Result(
             success=True, message="pick_mineral completed (IK)")
+
+    def _held_now(self, since_mono: float) -> str:
+        """since_mono 이후에 받은 grasp status 가 알려준 광물 이름 (없으면 "")."""
+        with self._grasp_status_lock:
+            if self._grasp_status_mono >= since_mono:
+                return self._grasp_status_held
+        return ""
+
+    def _execute_pick_contact(self, goal_handle):
+        """손끝을 광물 위로 가져가 닿을 때까지 내리는 pick (접촉 조건부 부착).
+
+          HOME → ABOVE (손끝이 광물 중심 위, 공구 축 수직 아래)
+               → 천천히 하강하면서 pickup 을 계속 보냄
+               → 시뮬레이터가 "손끝이 광물에 닿음" 을 status 로 알리면 정지
+               → ABOVE → HOME → CARGO → release → HOME
+        최저 높이까지 내려가도 닿지 않으면 실패로 끝낸다 (수집으로 세지 않음).
+        """
+        req = goal_handle.request
+        mineral_world = np.array(
+            [req.target_x, req.target_y, req.target_z], dtype=np.float64)
+
+        deadline_ns = self.get_clock().now().nanoseconds + int(2e9)
+        while self.get_clock().now().nanoseconds < deadline_ns:
+            with self._odom_lock:
+                if self._rover_xyz is not None:
+                    break
+            time.sleep(0.05)
+        with self._odom_lock:
+            base_xyz = None if self._rover_xyz is None else self._rover_xyz.copy()
+            base_R = None if self._rover_R is None else self._rover_R.copy()
+        if base_xyz is None or base_R is None:
+            self.get_logger().error("contact pick: no odom — abort")
+            goal_handle.abort()
+            return ExecuteArmTask.Result(success=False, message="no odom")
+
+        # 광물 중심을 팔 받침대 좌표로 (roll/pitch 포함 — 경사에서 yaw 만 쓰면
+        # 팔 길이 0.5 m 에 기울기 10° 면 9 cm 가 어긋난다).
+        center = base_R.T @ (mineral_world - base_xyz)
+        tip = float(self.get_parameter("tool_tip_offset_m").value)
+        z_start = float(self.get_parameter("contact_start_above_m").value)
+        z_end = float(self.get_parameter("contact_end_above_m").value)
+        speed = max(0.005, float(self.get_parameter("contact_descend_speed").value))
+
+        # 공구 축(link_6 z)이 받침대 기준 수직 아래, 손가락 벌림 축은 광물 방향에
+        # 수직 — HOME 자세를 광물 방위각만큼 돌린 자세.
+        q_home = np.radians(HOME_DEG)
+        R_tool = _yaw_rot_z(math.atan2(center[1], center[0])) @ fk(q_home)[:3, :3]
+
+        def solve(above: float, seed: np.ndarray):
+            target = center + np.array([0.0, 0.0, above + tip])
+            return dls_ik(target, R_tool, seed, max_iters=200)
+
+        q_above, ok_a, err_a = solve(z_start, q_home)
+        q_low, ok_l, err_l = solve(z_end, q_above)
+        self.get_logger().info(
+            f"contact pick: mineral world=({mineral_world[0]:.2f},"
+            f"{mineral_world[1]:.2f},{mineral_world[2]:.2f}) → 받침대 기준 "
+            f"({center[0]:.3f},{center[1]:.3f},{center[2]:.3f}) "
+            f"IK above={ok_a}({err_a:.4f}) low={ok_l}({err_l:.4f})")
+        if not (ok_a and ok_l):
+            goal_handle.abort()
+            return ExecuteArmTask.Result(
+                success=False,
+                message=f"out of reach (above={ok_a} low={ok_l}, "
+                        f"x={center[0]:.2f} y={center[1]:.2f} z={center[2]:.2f})")
+
+        cur_deg = list(HOME_DEG)
+        self._goto(cur_deg, HOME_DEG, goal_handle, "HOME_PRE", 0.0, 0.05)
+        deg_above = list(np.degrees(q_above))
+        self._goto(cur_deg, deg_above, goal_handle, "ABOVE", 0.05, 0.25)
+        cur_deg = deg_above
+
+        # ── 하강: 직선(Cartesian)으로 조금씩, 매 스텝 pickup 발행 + status 확인 ──
+        publish_hz = max(5.0, float(self.get_parameter("publish_hz").value))
+        dt = 1.0 / publish_hz
+        n_steps = max(2, int(round((z_start - z_end) / speed * publish_hz)))
+        pickup = Twist()
+        pickup.linear.x, pickup.linear.y, pickup.linear.z = (
+            float(mineral_world[0]), float(mineral_world[1]), float(mineral_world[2]))
+        pickup.angular.x = 1.0
+        t_start = time.monotonic()
+        q = q_above
+        held = ""
+        reached = z_start
+        for k in range(1, n_steps + 1):
+            above = z_start + (z_end - z_start) * k / n_steps
+            q_next, ok, _ = solve(above, q)
+            if not ok:
+                self.get_logger().warn(f"contact pick: IK 실패 (손끝 +{above:.3f} m) — 하강 중단")
+                break
+            q = q_next
+            reached = above
+            cur_deg = list(np.degrees(q))
+            self._publish_joint_state(cur_deg)
+            self.grasp_pub.publish(pickup)
+            fb = ExecuteArmTask.Feedback()
+            fb.state = "DESCEND_CONTACT"
+            fb.progress = float(0.25 + 0.2 * k / n_steps)
+            fb.message = f"tip +{above:.3f} m"
+            goal_handle.publish_feedback(fb)
+            time.sleep(dt)
+            held = self._held_now(t_start)
+            if held:
+                break
+        if not held:
+            # 팔이 명령을 따라오는 지연만큼 조금 더 기다려 본다.
+            t_wait = time.monotonic() + 1.0
+            while time.monotonic() < t_wait and not held:
+                self.grasp_pub.publish(pickup)
+                time.sleep(dt)
+                held = self._held_now(t_start)
+        if not held:
+            self.get_logger().warn(
+                f"contact pick: 손끝을 +{reached:.3f} m 까지 내렸지만 접촉 없음 — 실패")
+            self._goto(cur_deg, deg_above, goal_handle, "RETREAT", 0.45, 0.6)
+            self._goto(deg_above, HOME_DEG, goal_handle, "HOME_ABORT", 0.6, 1.0)
+            self._publish_joint_state(HOME_DEG)
+            goal_handle.abort()
+            return ExecuteArmTask.Result(
+                success=False, message="no contact with mineral")
+        self.get_logger().info(
+            f"contact pick: 접촉 — {held} (손끝 높이 +{reached:.3f} m, "
+            f"인식 중심 기준)")
+
+        self._goto(cur_deg, deg_above, goal_handle, "LIFT", 0.45, 0.6)
+        self._goto(deg_above, HOME_DEG, goal_handle, "HOME_MID", 0.6, 0.7)
+        cur_deg = list(HOME_DEG)
+        self._goto(cur_deg, CARGO_DEG, goal_handle, "CARGO_SWING", 0.7, 0.85)
+        cur_deg = list(CARGO_DEG)
+        settle = float(self.get_parameter("cargo_settle_sec").value)
+        if settle > 0.0:
+            time.sleep(settle)
+        self._publish_grasp("release")
+        fb = ExecuteArmTask.Feedback()
+        fb.state = "RELEASE"
+        fb.progress = 0.9
+        fb.message = "release published"
+        goal_handle.publish_feedback(fb)
+        self._goto(cur_deg, HOME_DEG, goal_handle, "HOME_POST", 0.9, 1.0)
+        self._publish_joint_state(HOME_DEG)
+        goal_handle.succeed()
+        self.get_logger().info("pick_mineral (contact) done")
+        return ExecuteArmTask.Result(
+            success=True, message=f"pick_mineral completed (contact, {held})")
 
     def _execute_pick_ik(self, goal_handle):
         """pick_mineral with IK + wrist-cam servo (Phase 3b-3, off by default).

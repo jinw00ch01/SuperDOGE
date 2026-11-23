@@ -57,6 +57,10 @@ _p.add_argument("--physics", choices=["mars", "earth"], default="mars",
                 help="물리 환경. mars(기본): 중력 3.72 m/s² + 레골리스·바위·바퀴 "
                      "접촉 재질 + terrain meta 의 구역별 마찰. earth: 손대지 "
                      "않음 (9.81, PhysX 기본 마찰 — 예전 동작).")
+_p.add_argument("--grasp", choices=["contact", "magic"], default="contact",
+                help="광물 부착 방식. contact(기본): 그리퍼 손끝이 광물에 닿았을 "
+                     "때만 그 자리에서 부착. magic: 예전 방식 — 팔 받침대 2.5 m "
+                     "안의 가장 가까운 광물을 손가락으로 순간이동시켜 부착.")
 _p.add_argument("--drive-limits", default="auto",
                 help="구동부 속도·가속 제한. auto(기본): --physics 의 중력에 맞춘 값 "
                      "(earth 는 제한 없음 = 원래 동작). off: 제한 없음. "
@@ -105,6 +109,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 from planet_physics import apply_planet_physics  # noqa: E402
+from contact_grasp import ContactGrasp  # noqa: E402
 from drive_limits import apply_drive_limits, limits_for_gravity, parse_limits  # noqa: E402
 ISAAC_SIM = os.path.dirname(HERE)
 WORLD = f"{ISAAC_SIM}/worlds/{_a.terrain}.usd"
@@ -785,6 +790,19 @@ def compute(db):
 '''
 
 
+# --grasp contact 에서는 부착·해제를 전부 main loop (ContactGrasp + GraspBridge)
+# 가 한다. ScriptNode 가 같이 움직이면 joint 를 먼저 지워 버려 광물 숨김이
+# 빠지므로 아무것도 하지 않는 스크립트로 바꾼다.
+GRASP_SCRIPT_NOOP = '''
+def setup(db):
+    pass
+
+
+def compute(db):
+    return True
+'''
+
+
 # ─── helpers ─────────────────────────────────────────────────────────
 
 def _ns_to_prim_name(ns: str) -> str:
@@ -807,8 +825,11 @@ def _force_release_for_ns(stage, ns: str) -> bool:
     """ns 의 rover 의 grasp FixedJoint 와 attached mineral 강제 hide.
     ScriptNode 의 release 분기와 동일 효과. 이미 detach 됐으면 no-op.
     return: True = 실제 hide 수행, False = no-op."""
-    ns_norm = (ns or "").strip("/").strip() or "rover"
-    joint_path = f"/World/grip_fixed_joint_{ns_norm}"
+    ns_norm = (ns or "").strip("/").strip()
+    # 단일 rover 모드(ns 없음)는 GraspBridge.publish_status 와 같은 경로를 쓴다.
+    joint_path = (f"/World/grip_fixed_joint_{ns_norm}" if ns_norm
+                  else "/World/grip_fixed_joint")
+    ns_norm = ns_norm or "rover"
     joint_prim = stage.GetPrimAtPath(joint_path)
     if not joint_prim or not joint_prim.IsValid():
         return False
@@ -889,6 +910,7 @@ class GraspBridge:
         self._String = _String
         node = _RclpyNode("grasp_bridge_listener")
         self._pending = []
+        self._pickups = []
         # ns → (status publisher, grasp FixedJoint path). arm_executor 가 pickup
         # 직후 이 토픽으로 실제 부착 여부를 확인한다 (data = 잡은 mineral prim
         # 이름, 안 잡았으면 빈 문자열).
@@ -926,6 +948,13 @@ class GraspBridge:
     def _on_grasp(self, ns, msg):
         if msg.angular.x < -0.5:
             self._pending.append(ns)
+        elif msg.angular.x > 0.5:
+            self._pickups.append(ns)
+
+    def drain_pickups(self):
+        out = self._pickups[:]
+        self._pickups.clear()
+        return out
 
     @property
     def node(self):
@@ -1109,6 +1138,10 @@ def _patch_script_nodes(stage, rover_root: str, ns: str) -> int:
             ok = (isinstance(check, str) and "_find_rover_root" in check)
             print(f"[run_v3]     {script_attr.GetPath()} ← ReadGtPose ({len(new_src)} chars, self-introspect={'OK' if ok else 'FAIL'})")
             patched += 1
+        elif name == "GraspScript" and _a.grasp == "contact":
+            script_attr.Set(GRASP_SCRIPT_NOOP)
+            print(f"[run_v3]     {script_attr.GetPath()} ← 비움 (--grasp contact)")
+            patched += 1
         elif name == "GraspScript":
             # 모든 rover 에 동일한 스크립트 (전 rover 의 root→joint 테이블 포함).
             # rover 별로 내용이 다르면 ScriptNode 전역 공유 때문에 cross-talk.
@@ -1249,6 +1282,21 @@ def main() -> None:
         else:
             drive_limits = base
     apply_drive_limits(stage, rover_roots, drive_limits)
+    contact_grasp = None
+    if _a.grasp == "contact":
+        if _a.rovers:
+            table = _grasp_joint_table()
+            grasp_rovers = {ns.strip("/").strip(): (
+                f"/World/{_ns_to_prim_name(ns)}",
+                table[f"/World/{_ns_to_prim_name(ns)}"]) for ns in _a.rovers}
+        else:
+            # 단일 모드는 USD 내장 GraspScript 를 그대로 쓰므로 여기서 비운다.
+            grasp_rovers = {"": (ROVER_PRIM, "/World/grip_fixed_joint")}
+            for prim in Usd.PrimRange(stage.GetPrimAtPath(ROVER_PRIM)):
+                if (prim.GetTypeName() == "OmniGraphNode"
+                        and prim.GetName() == "GraspScript"):
+                    prim.GetAttribute("inputs:script").Set(GRASP_SCRIPT_NOOP)
+        contact_grasp = ContactGrasp(stage, grasp_rovers)
     world.reset()
     world.play()
     render_every = max(1, int(_a.render_every))
@@ -1313,9 +1361,19 @@ def main() -> None:
             # 직접 stage 조작 (안전).
             if grasp_executor is not None and grasp_bridge is not None:
                 try:
-                    grasp_executor.spin_once(timeout_sec=0.0)
+                    # 한 step 에 밀린 명령을 모두 처리 (pickup 은 팔이 내려오는
+                    # 동안 연속으로 온다).
+                    for _ in range(8):
+                        grasp_executor.spin_once(timeout_sec=0.0)
+                    sim_now = float(world.current_time)
                     for ns in grasp_bridge.drain_releases():
+                        if contact_grasp is not None:
+                            contact_grasp.disarm(ns)
                         _force_release_for_ns(stage, ns)
+                    if contact_grasp is not None:
+                        for ns in grasp_bridge.drain_pickups():
+                            contact_grasp.arm(ns, sim_now)
+                        contact_grasp.step(sim_now)
                     if step % 6 == 0:
                         grasp_bridge.publish_status(stage)
                 except Exception as exc:

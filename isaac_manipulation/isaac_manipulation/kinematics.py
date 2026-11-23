@@ -3,8 +3,7 @@
 System-humble (Python 3.10) compatible: numpy only, no isaacsim/orocos
 dependency.
 
-DH parameters are best-effort (Doosan M0609 datasheet + community URDFs).
-Cross-check against vehicle_v3 USD m0609 articulation in Phase 3b-3.
+DH parameters are checked against the m0609 articulation in vehicle_v3.usd.
 
 API:
     fk(theta_rad) -> 4x4 transform of link_6 in arm base frame
@@ -33,11 +32,13 @@ class DHRow:
     theta_offset: float
 
 
-# Doosan M0609 best-effort standard DH (meters / radians).
-# Reach ~900 mm, payload 6 kg. Cross-validate against USD joint geometry.
+# Doosan M0609 standard DH (meters / radians), base frame = m0609/base_link.
+# vehicle_v3.usd 의 관절 프레임(localPos0/localRot0)과 대조해 맞춘 값이다:
+# HOME·pick·cargo 자세에서 link_6 위치 차이 0.2 mm 이하, 자세 일치.
+# (예전 값 d1=0.1525, d2=0 은 USD 보다 link_6 를 1.8 cm 높게, 6 mm 옆으로 봤다.)
 M0609_DH: List[DHRow] = [
-    DHRow(a=0.0,    alpha=-math.pi / 2, d=0.1525, theta_offset=0.0),
-    DHRow(a=0.411,  alpha=0.0,          d=0.0,    theta_offset=-math.pi / 2),
+    DHRow(a=0.0,    alpha=-math.pi / 2, d=0.1345, theta_offset=0.0),
+    DHRow(a=0.411,  alpha=0.0,          d=0.0062, theta_offset=-math.pi / 2),
     DHRow(a=0.0,    alpha=math.pi / 2,  d=0.0,    theta_offset=math.pi / 2),
     DHRow(a=0.0,    alpha=-math.pi / 2, d=0.368,  theta_offset=0.0),
     DHRow(a=0.0,    alpha=math.pi / 2,  d=0.0,    theta_offset=0.0),

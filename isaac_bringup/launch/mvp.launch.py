@@ -89,6 +89,10 @@ def generate_launch_description() -> LaunchDescription:
         description=("web_video_server 가 노출할 HTTP 포트. 8080 은 시스템 nginx 가 "
                      "차지하는 일이 있어 충돌 회피용으로 8090 default. "
                      "mission_web_node 에 WEB_VIDEO_PORT 환경변수로 자동 전달."))
+    grasp_mode_arg = DeclareLaunchArgument(
+        "grasp_mode", default_value="contact",
+        description="arm_executor 의 부착 방식 (contact | snap). 시뮬레이터의 "
+                    "--grasp contact | magic 과 짝을 맞춘다.")
     reveal_radius_arg = DeclareLaunchArgument(
         "reveal_radius", default_value="5.0",
         description="coverage_node 의 fog reveal 반경 (m). 시연 가시성 위해 "
@@ -109,6 +113,7 @@ def generate_launch_description() -> LaunchDescription:
             enable_web_video_arg,
             web_video_port_arg,
             reveal_radius_arg,
+            grasp_mode_arg,
             # T5 cheat 어댑터 — /ground_truth/odom → /rover/estimated_pose.
             Node(
                 package="isaac_drive",
@@ -169,6 +174,7 @@ def generate_launch_description() -> LaunchDescription:
                 executable="arm_executor_node",
                 name="arm_executor_node",
                 output="screen",
+                parameters=[{"grasp_mode": LaunchConfiguration("grasp_mode")}],
             ),
             # Mock 배터리 드레인 publisher — mission_manager 가 subscribe.
             Node(

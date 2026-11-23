@@ -171,6 +171,7 @@ def _rover_group(ns: str, terrain_dir: str, collection_goal: int,
             namespace=ns,
             output="screen",
             parameters=[{
+                "grasp_mode": LaunchConfiguration("grasp_mode"),
                 "joint_command_topic":    f"{nsp}/arm/joint_command",
                 "joint_state_topic":      f"{nsp}/joint_states_raw",
                 "wrist_detections_topic": f"{nsp}/perception/wrist_detections",
@@ -267,5 +268,10 @@ def generate_launch_description() -> LaunchDescription:
             "reveal_radius", default_value="5.0",
             description="coverage_node 의 fog reveal 반경 (m). 멀티 rover 시연 "
                         "가시성 위해 default 5.0. 더 키우려면 reveal_radius:=7.0."),
+        DeclareLaunchArgument(
+            "grasp_mode", default_value="contact",
+            description="arm_executor 의 부착 방식. contact: 손끝이 닿을 때까지 "
+                        "내림 (시뮬레이터 --grasp contact 와 짝). snap: 예전 방식 "
+                        "(--grasp magic 과 짝)."),
         OpaqueFunction(function=_launch_setup),
     ])
