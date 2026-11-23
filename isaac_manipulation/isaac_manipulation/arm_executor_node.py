@@ -123,14 +123,16 @@ class ArmExecutorNode(Node):
         self.declare_parameter("wrist_detection_wait_sec", 6.0)
         self.declare_parameter("hover_above_mineral_m", 0.05)
         self.declare_parameter("min_confidence", 0.5)
-        # Best-effort wrist-cam -> link_6 mount calibration. Tune after USD dump.
-        self.declare_parameter("wrist_mount_xyz_link6", [0.10, 0.0, 0.0])
-        # Rotation: optical (z fwd, x right, y down) -> link_6 axes (best guess).
+        # 손목 카메라(D455 color)의 link_6 기준 장착 위치·자세. vehicle_v3.usd
+        # 실측: 원점 (0.0115, 0.045, 0.05), 광축 = link_6 +z (공구 방향),
+        # 영상 오른쪽 = link_6 +x, 영상 아래 = link_6 +y → optical→link_6 회전은 단위행렬.
+        self.declare_parameter("wrist_mount_xyz_link6", [0.0115, 0.045, 0.05])
+        # Rotation: optical (z fwd, x right, y down) -> link_6 axes.
         # Stored as 9 flat values, row-major 3x3.
         self.declare_parameter("wrist_R_optical_to_link6", [
-            0.0, 0.0, 1.0,
             1.0, 0.0, 0.0,
-            0.0, -1.0, 0.0,
+            0.0, 1.0, 0.0,
+            0.0, 0.0, 1.0,
         ])
         self.declare_parameter("ik_use_orientation", False)
         # 3-mode pick_mineral:
@@ -157,6 +159,13 @@ class ArmExecutorNode(Node):
         self.declare_parameter("contact_start_above_m", 0.24)
         self.declare_parameter("contact_end_above_m", 0.02)
         self.declare_parameter("contact_descend_speed", 0.04)   # m/s
+        # contact pick 에서 손끝을 광물 위로 가져간 뒤 손목 카메라로 광물 중심을
+        # 다시 재서 수평 위치를 고친다. 로버 카메라는 옆에서 보므로 깊이 방향
+        # (표면→중심) 이 불확실하지만, 손목 카메라는 위에서 내려다보므로 수평
+        # 중심이 bbox 중심으로 바로 나온다.
+        self.declare_parameter("use_wrist_correction", True)
+        self.declare_parameter("wrist_correction_gate_m", 0.15)   # 이보다 먼 검출은 다른 물체로 봄
+        self.declare_parameter("wrist_settle_sec", 1.0)
         self.declare_parameter("grasp_command_topic", "/grasp/command")
         # Step delay between grasp publish and arm continuing — gives
         # vehicle_v3 ScriptNode time to attach the FixedJoint.
@@ -222,6 +231,7 @@ class ArmExecutorNode(Node):
         self._rover_xyz: Optional[np.ndarray] = None
         self._rover_yaw: Optional[float] = None
         self._rover_R: Optional[np.ndarray] = None
+        self._odom_hist: List[Tuple[float, np.ndarray]] = []   # (monotonic, xyz)
 
         # 상대 토픽 "execute_arm_task" 사용 — 단일 시연에선 root namespace 라
         # "/execute_arm_task" 로 광고되고 (기존 동작 유지), multi 시연에선
@@ -241,9 +251,6 @@ class ArmExecutorNode(Node):
 
         self.get_logger().info(
             "arm_executor_node ready: /execute_arm_task (wrist-cam visual servo + DLS-IK)")
-        self.get_logger().warn(
-            "WRIST_T_LINK6 is best-effort estimate — tune wrist_mount_xyz_link6 / "
-            "wrist_R_optical_to_link6 parameters after USD cross-check.")
 
     def _send_initial_home_once(self) -> None:
         if self._initial_home_sent:
@@ -285,6 +292,10 @@ class ArmExecutorNode(Node):
             self._rover_xyz = np.array([p.x, p.y, p.z], dtype=np.float64)
             self._rover_yaw = _quat_to_yaw(o.x, o.y, o.z, o.w)
             self._rover_R = _quat_to_matrix(o.x, o.y, o.z, o.w)
+            now = time.monotonic()
+            self._odom_hist.append((now, self._rover_xyz))
+            while self._odom_hist and now - self._odom_hist[0][0] > 1.0:
+                self._odom_hist.pop(0)
 
     def _best_wrist_detection(self,
                               wait_sec: float,
@@ -588,6 +599,75 @@ class ArmExecutorNode(Node):
                 return self._grasp_status_held
         return ""
 
+    def _wait_base_still(self, timeout: float = 4.0) -> float:
+        """받침대가 멈출 때까지 기다린다 (최근 0.4 s 이동 < 3 mm). 기다린 시간 반환.
+
+        mission_manager 는 정지 명령과 동시에 팔 goal 을 보내는데, 로버는 감속
+        한계 때문에 그 뒤로도 4~7 cm 더 굴러간다 (실측). 그 전에 목표를 받침대
+        좌표로 바꾸면 그만큼 어긋난다.
+        """
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout:
+            with self._odom_lock:
+                hist = list(self._odom_hist)
+            if hist and hist[-1][0] - hist[0][0] >= 0.4:
+                recent = [p for t, p in hist if hist[-1][0] - t <= 0.4]
+                if float(np.linalg.norm(recent[-1] - recent[0])) < 0.003:
+                    break
+            time.sleep(0.05)
+        return time.monotonic() - t0
+
+    def _wrist_measure(self, expected: np.ndarray) -> Optional[np.ndarray]:
+        """손목 카메라 검출로 광물 중심을 팔 받침대 좌표로 잰다.
+
+        expected (받침대 좌표) 에서 수평으로 gate 안에 있는 검출만 쓰고, 서로
+        다른 영상 5 장의 중앙값을 돌려준다. 3 장도 못 모으면 None.
+        """
+        gate = float(self.get_parameter("wrist_correction_gate_m").value)
+        min_conf = float(self.get_parameter("min_confidence").value)
+        mount = np.array([float(v) for v in
+                          self.get_parameter("wrist_mount_xyz_link6").value])
+        R_oc = np.array(list(self.get_parameter("wrist_R_optical_to_link6").value),
+                        dtype=np.float64).reshape(3, 3)
+        time.sleep(max(0.0, float(self.get_parameter("wrist_settle_sec").value)))
+        samples: List[np.ndarray] = []
+        rejected: List[str] = []
+        last_stamp = 0
+        t_end = time.monotonic() + 2.5
+        while time.monotonic() < t_end and len(samples) < 5:
+            with self._wrist_lock:
+                dets = list(self._wrist_dets)
+                stamp = self._wrist_stamp_ns
+            q = self._current_arm_q_rad
+            fresh = self.get_clock().now().nanoseconds - stamp < int(0.5e9)
+            if stamp != last_stamp and fresh and q is not None:
+                last_stamp = stamp
+                T = fk(q)
+                best = None
+                for d in dets:
+                    xyz = np.array([d.world_position.x, d.world_position.y,
+                                    d.world_position.z])
+                    if d.confidence < min_conf or not xyz.any():
+                        rejected.append(f"{d.class_name} conf={d.confidence:.2f} "
+                                        f"{'깊이 없음' if not xyz.any() else '신뢰도 낮음'}")
+                        continue
+                    p_base = T[:3, :3] @ (R_oc @ xyz + mount) + T[:3, 3]
+                    off = float(np.linalg.norm((p_base - expected)[:2]))
+                    if off < gate and (best is None or off < best[0]):
+                        best = (off, p_base)
+                    elif off >= gate:
+                        rejected.append(f"{d.class_name} conf={d.confidence:.2f} "
+                                        f"예상 위치에서 {off * 100:.0f} cm")
+                if best is not None:
+                    samples.append(best[1])
+            time.sleep(0.05)
+        if len(samples) < 3:
+            self.get_logger().info(
+                f"wrist measure: 쓸 수 있는 검출 {len(samples)}장 — 버린 것: "
+                f"{rejected[-4:] if rejected else '검출 자체가 없음'}")
+            return None
+        return np.median(np.array(samples), axis=0)
+
     def _execute_pick_contact(self, goal_handle):
         """손끝을 광물 위로 가져가 닿을 때까지 내리는 pick (접촉 조건부 부착).
 
@@ -607,6 +687,7 @@ class ArmExecutorNode(Node):
                 if self._rover_xyz is not None:
                     break
             time.sleep(0.05)
+        waited = self._wait_base_still()
         with self._odom_lock:
             base_xyz = None if self._rover_xyz is None else self._rover_xyz.copy()
             base_R = None if self._rover_R is None else self._rover_R.copy()
@@ -638,7 +719,8 @@ class ArmExecutorNode(Node):
             f"contact pick: mineral world=({mineral_world[0]:.2f},"
             f"{mineral_world[1]:.2f},{mineral_world[2]:.2f}) → 받침대 기준 "
             f"({center[0]:.3f},{center[1]:.3f},{center[2]:.3f}) "
-            f"IK above={ok_a}({err_a:.4f}) low={ok_l}({err_l:.4f})")
+            f"IK above={ok_a}({err_a:.4f}) low={ok_l}({err_l:.4f}) "
+            f"[정지 대기 {waited:.1f} s]")
         if not (ok_a and ok_l):
             goal_handle.abort()
             return ExecuteArmTask.Result(
@@ -649,8 +731,66 @@ class ArmExecutorNode(Node):
         cur_deg = list(HOME_DEG)
         self._goto(cur_deg, HOME_DEG, goal_handle, "HOME_PRE", 0.0, 0.05)
         deg_above = list(np.degrees(q_above))
-        self._goto(cur_deg, deg_above, goal_handle, "ABOVE", 0.05, 0.25)
+        self._goto(cur_deg, deg_above, goal_handle, "ABOVE", 0.05, 0.2)
         cur_deg = deg_above
+
+        # ── 손목 카메라로 수평 위치 보정 (최대 2 회: 고친 뒤 한 번 더 본다) ──
+        def base_drift() -> str:
+            """goal 을 받은 뒤 받침대가 얼마나 움직였는지 (진단용)."""
+            with self._odom_lock:
+                p_now, R_now = self._rover_xyz.copy(), self._rover_R.copy()
+            d = base_R.T @ (p_now - base_xyz)
+            ang = math.degrees(math.acos(float(np.clip(
+                (np.trace(base_R.T @ R_now) - 1.0) * 0.5, -1.0, 1.0))))
+            moved = base_R.T @ (mineral_world - base_xyz) - R_now.T @ (mineral_world - p_now)
+            return (f"받침대 이동 ({d[0] * 100:+.1f},{d[1] * 100:+.1f},{d[2] * 100:+.1f}) cm "
+                    f"회전 {ang:.1f}° → 목표가 받침대 기준으로 "
+                    f"({-moved[0] * 100:+.1f},{-moved[1] * 100:+.1f},{-moved[2] * 100:+.1f}) cm 이동")
+
+        self.get_logger().info(f"contact pick: ABOVE 도착 — {base_drift()}")
+
+        def retarget(new_center: np.ndarray, tag: str) -> bool:
+            """목표 중심을 바꾸고 ABOVE 자세를 다시 풀어 옮긴다. 안 닿으면 취소."""
+            nonlocal center, q_above, q_low, deg_above, cur_deg
+            saved = center
+            center = new_center
+            q_try, ok1, _ = solve(z_start, q_above)
+            q_try_low, ok2, _ = solve(z_end, q_try)
+            if not (ok1 and ok2):
+                center = saved
+                self.get_logger().warn(f"contact pick: {tag} 위치는 팔이 닿지 않음 — 취소")
+                return False
+            q_above, q_low = q_try, q_try_low
+            deg_above = list(np.degrees(q_above))
+            self._goto(cur_deg, deg_above, goal_handle, "ALIGN", 0.2, 0.25, duration=1.0)
+            cur_deg = deg_above
+            return True
+
+        # 팔을 뻗는 동안 받침대가 밀린 만큼(실측 2~6 cm) 목표를 다시 계산한다.
+        with self._odom_lock:
+            base_xyz, base_R = self._rover_xyz.copy(), self._rover_R.copy()
+        fresh = base_R.T @ (mineral_world - base_xyz)
+        if float(np.linalg.norm(fresh - center)) > 0.005:
+            retarget(fresh, "odom 재계산")
+        if bool(self.get_parameter("use_wrist_correction").value):
+            for attempt in range(2):
+                seen = self._wrist_measure(center)
+                if seen is None:
+                    self.get_logger().warn(
+                        "contact pick: 손목 카메라에 광물이 안 잡힘 — 로버 카메라 "
+                        "추정값 그대로 진행")
+                    break
+                shift = seen[:2] - center[:2]
+                self.get_logger().info(
+                    f"contact pick: 손목 카메라 보정 #{attempt + 1} "
+                    f"dx={shift[0] * 100:+.1f} cm dy={shift[1] * 100:+.1f} cm "
+                    f"(높이 차 {(seen[2] - center[2]) * 100:+.1f} cm 는 참고만)")
+                if float(np.linalg.norm(shift)) < 0.005:
+                    break
+                trial = center.copy()
+                trial[:2] = seen[:2]
+                if not retarget(trial, "손목 카메라 보정"):
+                    break
 
         # ── 하강: 직선(Cartesian)으로 조금씩, 매 스텝 pickup 발행 + status 확인 ──
         publish_hz = max(5.0, float(self.get_parameter("publish_hz").value))
@@ -844,9 +984,11 @@ class ArmExecutorNode(Node):
         return ExecuteArmTask.Result(success=True, message=f"{tag} completed")
 
     def _goto(self, cur_deg: List[float], target_deg: List[float], goal_handle,
-              tag: str, progress_start: float, progress_end: float) -> None:
+              tag: str, progress_start: float, progress_end: float,
+              duration: Optional[float] = None) -> None:
         publish_hz = max(5.0, float(self.get_parameter("publish_hz").value))
-        step_dur = max(0.2, float(self.get_parameter("step_duration_sec").value))
+        step_dur = max(0.2, float(self.get_parameter("step_duration_sec").value)
+                       if duration is None else float(duration))
         n_interp = max(2, int(round(publish_hz * step_dur)))
         dt = 1.0 / publish_hz
         for k in range(1, n_interp + 1):

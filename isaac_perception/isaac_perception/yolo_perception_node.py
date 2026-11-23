@@ -133,7 +133,7 @@ class CamChannel:
                  camera_offset_xyz: Optional[Tuple[float, float, float]] = None,
                  image_latency_sec: float = 0.0,
                  max_yaw_rate: float = 0.0,
-                 object_radius_m: float = 0.13):
+                 object_radius_m: float = 0.10):
         assert mode in ("world", "optical")
         self.node = node
         self.name = name
@@ -465,8 +465,9 @@ class YoloPerceptionNode(Node):
         self.declare_parameter("nav_image_latency_sec", 0.067)
         # 이보다 빨리 도는 중의 검출은 world 좌표를 내지 않는다 (0 = 끔).
         self.declare_parameter("nav_max_yaw_rate", 0.25)
-        # bbox 가 화면 밖으로 잘렸을 때 쓰는 물체 반지름 (광물 폭 0.26~0.30 m).
-        self.declare_parameter("object_radius_m", 0.13)
+        # bbox 가 화면 밖으로 잘렸을 때 쓰는 물체 반지름 (광물 mesh 는 약
+        # 0.17 × 0.19 × 0.23 m).
+        self.declare_parameter("object_radius_m", 0.10)
         self.declare_parameter("nav_publish_annotated", True)
 
         # Wrist (gripper) cam — optical frame output for arm_executor
