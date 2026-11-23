@@ -6,6 +6,45 @@
 
 ---
 
+## 🐕 SuperDOGE — 원본(a-2_isaac)에서 달라진 점
+
+이 저장소는 팀 프로젝트 [`sungyu-sung/a-2_isaac`](https://github.com/sungyu-sung/a-2_isaac) 를
+Ubuntu 24.04 · ROS 2 Jazzy · Isaac Sim 5.1 로 옮긴 뒤, 시연용 임시방편을 하나씩 걷어내는 개선판입니다.
+아래 표 밖의 내용(시연 명령, 팀 구성 등)은 원본 README 그대로입니다.
+
+| 항목 | 원본 | SuperDOGE |
+|---|---|---|
+| 중력 | 지구 9.81 m/s² | **화성 3.72 m/s²** (`--physics mars`, 기본값) |
+| 접촉 마찰 | PhysX 기본값 0.5 (지형 meta 의 구역 마찰은 미사용) | 레골리스 0.58/0.52, 바위 0.70/0.60, 지형 meta 의 sand·rocky 구역별 값 적용 |
+| 구동 | `/cmd_vel` 을 그대로 바퀴 속도로 (3 m/s 계단 입력) | 중력에 맞춘 속도·가속 제한 (화성: 0.92 m/s, 0.72 m/s²) |
+| 광물 위치 추정 (2.5 m 이내 중앙값) | 수평 오차 18.7 cm, 높이 +46 cm | 수평 3.7 cm (90% 4.7 cm), 높이 −3.6 cm |
+| `ik_descend_dz=-0.40` | 인식 높이 편향을 상쇄하는 임시값 | 제거 (기본 0.05) |
+
+### 화성 물리 (`isaac_sim/scripts/planet_physics.py`, `drive_limits.py`)
+
+```bash
+tools/isaac-pypi isaac_sim/scripts/run_vehicle_v3.py --terrain terrain_00026 --rovers rover_1            # 화성 (기본)
+tools/isaac-pypi isaac_sim/scripts/run_vehicle_v3.py --terrain terrain_00026 --rovers rover_1 --physics earth   # 원본 동작
+tools/isaac-pypi isaac_sim/scripts/check_planet_physics.py --terrain terrain_00026 --physics mars       # 중력·마찰 실측
+```
+
+- 맞춘 것: 중력, 지면·바위·바퀴의 마찰 계수(구역별), 반발 계수 0.
+  실측(`check_planet_physics.py`): 중력 3.720 m/s², 미끄럼 마찰 레골리스 0.518 · rocky 0.482 · sand 0.226.
+- **맞추지 못한 것**: 바퀴 침하와 흙 밀림(terramechanics), 흙의 점착력, 대기. PhysX 는 강체 접촉만 풀기 때문입니다.
+  그래서 마찰 계수는 흙의 내부마찰각에서 `tan(각)` 으로 잡았습니다 (근거는 `planet_physics.py` 머리말).
+- 중력만 화성으로 바꾸면 로버는 출발 3 초 만에 뒤로 넘어갑니다. 복원 모멘트는 0.38 배가 됐는데 속도는 그대로이기 때문입니다.
+  `drive_limits.py` 가 지구에서 버틴 실측 한계(1.5 m/s, 1.9 m/s²)를 Froude 상사(속도 ∝ √g, 가속 ∝ g)로 줄여 적용합니다.
+  `--drive-limits off` 로 끄거나 `--drive-limits max_lin=0.6,acc_lin=0.5` 처럼 항목별로 바꿀 수 있습니다.
+
+### 광물 위치 추정 (`isaac_perception/yolo_perception_node.py`)
+
+오차의 원인은 bbox 가 아니라 좌표 변환이었습니다. 고친 것:
+카메라 위치(`/ground_truth/odom` 의 기준점은 팔 받침대 `m0609/base_link` — 거기서 카메라는 (0.147, 0, −0.312)),
+roll/pitch 반영, 영상이 찍힌 시각의 자세로 변환(odom 보간), bbox 가운데 영역의 깊이 중앙값,
+표면→중심 보정, 회전 중 검출 제외, bbox 가 화면 밖으로 잘린 근접 구간에서는 잘리기 전에 본 위치 사용.
+
+---
+
 ## 🎯 시연 명령어 세트 (D-day 기준)
 
 > **구성**: 멀티 rover 2대 · `terrain_00026` · 로버당 광물 2개 채집 → RTB → MISSION_COMPLETE.

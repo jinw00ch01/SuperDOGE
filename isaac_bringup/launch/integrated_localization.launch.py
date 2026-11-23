@@ -108,7 +108,6 @@ def _build_nodes(context, *args, **kwargs):
             parameters=[
                 {
                     "odom_topic": "/rover/estimated_odom",
-                    "ik_descend_dz": -0.40,
                 }
             ],
         ),

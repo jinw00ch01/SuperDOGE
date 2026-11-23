@@ -171,7 +171,6 @@ def _rover_group(ns: str, terrain_dir: str, collection_goal: int,
             namespace=ns,
             output="screen",
             parameters=[{
-                "ik_descend_dz": -0.40,
                 "joint_command_topic":    f"{nsp}/arm/joint_command",
                 "joint_state_topic":      f"{nsp}/joint_states_raw",
                 "wrist_detections_topic": f"{nsp}/perception/wrist_detections",

@@ -12,6 +12,7 @@ Contract: docs/interfaces/INTERFACE_CONTRACTS.md I2.
 """
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -71,6 +72,25 @@ def _image_to_bgr(msg: Image) -> np.ndarray:
     return np.ascontiguousarray(img)
 
 
+def _stamp_sec(header) -> float:
+    return header.stamp.sec + header.stamp.nanosec * 1e-9
+
+
+def _quat_to_matrix(q: np.ndarray) -> np.ndarray:
+    """xyzw quaternion → 3x3 회전 행렬."""
+    x, y, z, w = q / np.linalg.norm(q)
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ])
+
+
+def _quat_yaw(q: np.ndarray) -> float:
+    x, y, z, w = q
+    return float(np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)))
+
+
 def _depth_to_meters(msg: Image) -> Optional[np.ndarray]:
     if msg.encoding == "32FC1":
         arr = np.frombuffer(bytes(msg.data), dtype=np.float32)
@@ -87,11 +107,22 @@ class CamChannel:
     DetectionArray + (optional) annotated Image.
 
     mode="world":   compute world-frame XYZ for each detection using
-                    depth + intrinsics + camera_offset + odom (yaw only).
-                    Needs odom_topic.
+                    depth + intrinsics + camera_offset + odom (full
+                    orientation, sampled at the image time). Needs odom_topic.
     mode="optical": compute camera optical frame XYZ only (z forward,
                     x right, y down). Downstream node (e.g. arm IK) does
                     its own frame transform.
+
+    Both modes report the estimated *centre* of the object: depth gives the
+    visible surface, which is pushed back along the viewing ray by the
+    object's radius (from the bbox size).
+
+    world 모드 좌표 변환의 전제
+      · odom 의 기준점은 팔 받침대(m0609/base_link) 다 — run_vehicle_v3 의
+        GT odom 스크립트가 articulation root 의 자세를 낸다. camera_offset_xyz
+        는 그 기준점에서 본 카메라 위치 (x 전방, y 좌측, z 위).
+      · 카메라 광축은 기준점의 +x 와 나란하다 (vehicle_v3.usd 실측, 기울기 0).
+      · 영상의 stamp 는 실제 찍힌 시각보다 image_latency_sec 만큼 늦다.
     """
 
     def __init__(self, *, node: Node, name: str, detector,
@@ -99,7 +130,10 @@ class CamChannel:
                  det_topic: str, ann_topic: str, frame_id: str,
                  mode: str, publish_annotated: bool,
                  odom_topic: Optional[str] = None,
-                 camera_offset_xyz: Optional[Tuple[float, float, float]] = None):
+                 camera_offset_xyz: Optional[Tuple[float, float, float]] = None,
+                 image_latency_sec: float = 0.0,
+                 max_yaw_rate: float = 0.0,
+                 object_radius_m: float = 0.13):
         assert mode in ("world", "optical")
         self.node = node
         self.name = name
@@ -107,12 +141,29 @@ class CamChannel:
         self.frame_id = frame_id
         self.mode = mode
         self.publish_annotated_flag = publish_annotated
-        self.camera_offset_xyz = camera_offset_xyz or (0.0, 0.0, 0.0)
+        self.camera_offset = np.array(camera_offset_xyz or (0.0, 0.0, 0.0), dtype=float)
+        self.image_latency_sec = float(image_latency_sec)
+        self.max_yaw_rate = float(max_yaw_rate)
+        self.object_radius_m = float(object_radius_m)
 
         self.intr: Optional[CamIntrinsics] = None
         self.last_rgb: Optional[Image] = None
         self.last_depth_m: Optional[np.ndarray] = None
         self.last_odom: Optional[Odometry] = None
+        # (stamp, depth[m]) — RGB 와 같은 stamp 의 depth 를 고르기 위해 몇 장 보관.
+        self._depth_buf: deque = deque(maxlen=6)
+        # (stamp, position xyz, orientation xyzw) — 영상 시각의 자세 보간용.
+        self._odom_buf: deque = deque(maxlen=600)
+        self.skipped_turning = 0
+        self._warned_clock = False
+        # world 모드: 온전히 보인 검출로 쌓은 물체별 위치 기억. 가까이 가서 bbox 가
+        # 화면 밖으로 잘리면 bbox 중심이 물체 중심에서 벗어나므로 (실측 9~10 cm),
+        # 그때는 잘리기 전에 본 위치를 대신 낸다. 광물은 스스로 움직이지 않는다.
+        self._tracks: List[dict] = []
+        self.track_gate_m = 0.5
+        self.track_window = 9
+        self.track_ttl_sec = 120.0
+        self.used_memory = 0
 
         self.frames_seen = 0
         self.frames_published = 0
@@ -167,6 +218,8 @@ class CamChannel:
                 f"depth array: shape={d.shape} finite={n_finite}/{d.size} "
                 f"min={mn:.3f} max={mx:.3f} med={med:.3f}")
         self.last_depth_m = d
+        if d is not None:
+            self._depth_buf.append((_stamp_sec(msg.header), d))
 
     def _on_info(self, msg: CameraInfo) -> None:
         first = self.intr is None
@@ -184,9 +237,54 @@ class CamChannel:
     def _on_odom(self, msg: Odometry) -> None:
         first = self.last_odom is None
         self.last_odom = msg
+        p = msg.pose.pose.position
+        q = msg.pose.pose.orientation
+        self._odom_buf.append((_stamp_sec(msg.header),
+                               np.array([p.x, p.y, p.z]),
+                               np.array([q.x, q.y, q.z, q.w])))
         if first:
-            p = msg.pose.pose.position
             self._log(f"odom first: pos=({p.x:.2f},{p.y:.2f},{p.z:.2f})")
+
+    def _depth_for(self, t_img: float) -> Optional[np.ndarray]:
+        """RGB 와 stamp 가 가장 가까운 depth 프레임."""
+        if not self._depth_buf:
+            return None
+        return min(self._depth_buf, key=lambda e: abs(e[0] - t_img))[1]
+
+    def _pose_at(self, t: float):
+        """시각 t 의 (position, rotation matrix, yaw rate). 없으면 None.
+
+        odom 과 영상의 stamp 가 같은 시계(sim time)일 때만 보간한다. 1 초 넘게
+        어긋나면 시계가 다르다고 보고 가장 최근 odom 을 쓴다.
+        """
+        buf = self._odom_buf
+        if not buf:
+            return None
+        if len(buf) < 2 or abs(t - buf[-1][0]) > 1.0:
+            if len(buf) >= 2 and not self._warned_clock:
+                self._warned_clock = True
+                self._log(f"영상 stamp({t:.3f}) 와 odom stamp({buf[-1][0]:.3f}) 가 "
+                          f"1 s 넘게 다름 — 시각 보간 없이 최신 odom 사용", "warn")
+            _, p, q = buf[-1]
+            return p, _quat_to_matrix(q), 0.0
+        i = len(buf) - 1
+        while i > 1 and buf[i - 1][0] > t:
+            i -= 1
+        t0, p0, q0 = buf[i - 1]
+        t1, p1, q1 = buf[i]
+        a = 0.0 if t1 <= t0 else float(np.clip((t - t0) / (t1 - t0), 0.0, 1.0))
+        if float(np.dot(q0, q1)) < 0.0:
+            q1 = -q1
+        q = (1.0 - a) * q0 + a * q1
+        p = (1.0 - a) * p0 + a * p1
+        # yaw rate: 보간 구간 앞뒤로 조금 넓게 (잡음 완화).
+        j0, j1 = max(0, i - 3), min(len(buf) - 1, i + 2)
+        dt = buf[j1][0] - buf[j0][0]
+        yaw_rate = 0.0
+        if dt > 1e-6:
+            dy = _quat_yaw(buf[j1][2]) - _quat_yaw(buf[j0][2])
+            yaw_rate = abs(float(np.arctan2(np.sin(dy), np.cos(dy)))) / dt
+        return p, _quat_to_matrix(q), yaw_rate
 
     def tick(self) -> None:
         msg = self.last_rgb
@@ -199,6 +297,17 @@ class CamChannel:
             return
 
         dets = self.detector.detect(bgr)
+        t_img = _stamp_sec(msg.header)
+        depth = self._depth_for(t_img)
+        pose = None
+        if self.mode == "world":
+            pose = self._pose_at(t_img - self.image_latency_sec)
+            # 회전 중에는 시각 오차가 방위 오차로 크게 번진다 → 좌표 무효 처리.
+            # (0,0,0) 은 mission_manager 가 무시하는 기존 규약.
+            if (pose is not None and self.max_yaw_rate > 0.0
+                    and pose[2] > self.max_yaw_rate):
+                pose = None
+                self.skipped_turning += 1
         out = DetectionArray()
         out.header = Header()
         out.header.stamp = msg.header.stamp
@@ -206,8 +315,11 @@ class CamChannel:
 
         for d in dets:
             vscore = VALUE_SCORE_BY_NAME.get(d.cls_name, 0.0)
-            xyz = self._estimate_xyz(d.cx, d.cy)
             x1, y1, x2, y2 = [int(round(v)) for v in d.bbox]
+            xyz, size_m, truncated = self._estimate_xyz(
+                d.cx, d.cy, (x1, y1, x2, y2), depth, pose)
+            if self.mode == "world" and any(xyz):
+                xyz = self._remember(xyz, truncated, t_img)
             det_msg = Detection()
             det_msg.class_name = d.cls_name
             det_msg.world_position = Point(
@@ -215,7 +327,8 @@ class CamChannel:
             det_msg.confidence = float(d.conf)
             det_msg.value_score = float(vscore)
             det_msg.mineral_id = -1
-            det_msg.bbox_size_m = Vector3(x=0.0, y=0.0, z=0.0)
+            det_msg.bbox_size_m = Vector3(
+                x=float(size_m[0]), y=float(size_m[1]), z=float(size_m[2]))
             det_msg.bbox_xmin = x1
             det_msg.bbox_ymin = y1
             det_msg.bbox_xmax = x2
@@ -240,48 +353,82 @@ class CamChannel:
             img_msg.data = annotated.tobytes()
             self.pub_ann.publish(img_msg)
 
-    def _estimate_xyz(self, px: float, py: float) -> Tuple[float, float, float]:
-        if self.intr is None or self.last_depth_m is None:
-            return (0.0, 0.0, 0.0)
-        if self.mode == "world" and self.last_odom is None:
-            return (0.0, 0.0, 0.0)
+    def _estimate_xyz(self, px: float, py: float, bbox, depth, pose):
+        """bbox 중심 화소 → 물체 중심의 3D 좌표.
 
-        h, w = self.last_depth_m.shape
-        ix = int(np.clip(round(px), 0, w - 1))
-        iy = int(np.clip(round(py), 0, h - 1))
-        z = float(self.last_depth_m[iy, ix])
-        if not np.isfinite(z) or z <= 0.05 or z > 50.0:
-            self._log(
-                f"depth invalid at px=({ix},{iy}) value={z:.4f}",
-                "warn")
-            return (0.0, 0.0, 0.0)
+        Returns (xyz, size_m, truncated).
+        size_m = (bbox 폭[m], bbox 높이[m], 추정 지름[m]). 좌표를 못 구하면
+        xyz = (0, 0, 0). truncated = bbox 가 화면 가장자리에 닿음.
+        """
+        zero = ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0), False)
+        if self.intr is None or depth is None:
+            return zero
+        if self.mode == "world" and pose is None:
+            return zero
 
-        # Camera optical frame (z forward, x right, y down)
-        x_c = (px - self.intr.cx) * z / self.intr.fx
-        y_c = (py - self.intr.cy) * z / self.intr.fy
-        z_c = z
+        h, w = depth.shape
+        x1, y1, x2, y2 = bbox
+        bw, bh = max(1, x2 - x1), max(1, y2 - y1)
+        # 표면 깊이: bbox 가운데 40% 영역의 유효 화소 중앙값 (한 화소는 구멍·
+        # 경계에 약하다).
+        u0 = int(np.clip(round(px - 0.2 * bw), 0, w - 1))
+        u1 = int(np.clip(round(px + 0.2 * bw), u0, w - 1))
+        v0 = int(np.clip(round(py - 0.2 * bh), 0, h - 1))
+        v1 = int(np.clip(round(py + 0.2 * bh), v0, h - 1))
+        patch = depth[v0:v1 + 1, u0:u1 + 1]
+        valid = patch[np.isfinite(patch) & (patch > 0.05) & (patch < 50.0)]
+        if valid.size == 0:
+            self._log(f"depth invalid in bbox centre px=({px:.0f},{py:.0f})", "warn")
+            return zero
+        z = float(np.median(valid))
+
+        # Camera optical frame (z forward, x right, y down). depth 는 광축 방향 거리.
+        pt = np.array([(px - self.intr.cx) * z / self.intr.fx,
+                       (py - self.intr.cy) * z / self.intr.fy,
+                       z])
+        # 표면 → 중심: 시선 방향으로 물체 반지름만큼 민다. 반지름은 bbox 크기에서.
+        w_m, h_m = bw * z / self.intr.fx, bh * z / self.intr.fy
+        radius = float(np.clip(0.25 * (w_m + h_m), 0.02, 0.25))
+        truncated = x1 <= 2 or y1 <= 2 or x2 >= w - 3 or y2 >= h - 3
+        if truncated:
+            radius = max(radius, self.object_radius_m)   # 잘린 bbox 는 작게 나옴
+        pt = pt * (1.0 + radius / float(np.linalg.norm(pt)))
+        size_m = (w_m, h_m, 2.0 * radius)
 
         if self.mode == "optical":
-            return (x_c, y_c, z_c)
+            return (float(pt[0]), float(pt[1]), float(pt[2])), size_m, truncated
 
-        # Optical -> ROS camera body (x forward, y left, z up)
-        x_cam, y_cam, z_cam = z_c, -x_c, -y_c
+        # Optical -> 기준점 축 (x forward, y left, z up) + 카메라 위치
+        p_ref = np.array([pt[2], -pt[0], -pt[1]]) + self.camera_offset
+        position, rot, _ = pose
+        world = position + rot @ p_ref
+        return (float(world[0]), float(world[1]), float(world[2])), size_m, truncated
 
-        # Camera body -> rover body (static offset)
-        ox, oy, oz = self.camera_offset_xyz
-        x_r, y_r, z_r = x_cam + ox, y_cam + oy, z_cam + oz
-
-        # Rover -> world (yaw from odom)
-        p = self.last_odom.pose.pose.position
-        q = self.last_odom.pose.pose.orientation
-        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
-        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-        yaw = float(np.arctan2(siny_cosp, cosy_cosp))
-        c, s = float(np.cos(yaw)), float(np.sin(yaw))
-        x_w = p.x + c * x_r - s * y_r
-        y_w = p.y + s * x_r + c * y_r
-        z_w = p.z + z_r
-        return (x_w, y_w, z_w)
+    def _remember(self, xyz, truncated: bool, t_img: float):
+        """온전한 검출은 기억에 쌓고, 잘린 검출은 기억된 위치로 바꿔 돌려준다."""
+        p = np.array(xyz)
+        self._tracks = [t for t in self._tracks
+                        if abs(t_img - t["seen"]) < self.track_ttl_sec]
+        track, best = None, self.track_gate_m
+        for t in self._tracks:
+            d = float(np.linalg.norm(t["pos"] - p))
+            if d < best:
+                track, best = t, d
+        if truncated:
+            if track is None or len(track["samples"]) < 3:
+                return xyz
+            track["seen"] = t_img
+            self.used_memory += 1
+            q = track["pos"]
+            return (float(q[0]), float(q[1]), float(q[2]))
+        if track is None:
+            track = {"samples": deque(maxlen=self.track_window), "pos": p, "seen": t_img}
+            self._tracks.append(track)
+        track["samples"].append(p)
+        track["pos"] = np.median(np.array(track["samples"]), axis=0)
+        track["seen"] = t_img
+        q = track["pos"]
+        return (float(q[0]), float(q[1]), float(q[2]))
 
     def have_str(self) -> str:
         flags: List[str] = []
@@ -311,7 +458,15 @@ class YoloPerceptionNode(Node):
         self.declare_parameter("nav_det_topic",   "/perception/detections")
         self.declare_parameter("nav_ann_topic",   "/perception/image_annotated")
         self.declare_parameter("nav_frame_id",    "world")
-        self.declare_parameter("nav_camera_offset_xyz", [0.37, 0.0, 0.27])
+        # odom 기준점(m0609/base_link)에서 본 로버 카메라 위치. vehicle_v3.usd 실측.
+        self.declare_parameter("nav_camera_offset_xyz", [0.147, 0.0, -0.312])
+        # 영상 stamp 가 실제 장면보다 늦는 시간. `--render-every 2` 에서 주행
+        # 데이터로 맞춘 값 (렌더 2 프레임). 0 이면 stamp 그대로.
+        self.declare_parameter("nav_image_latency_sec", 0.067)
+        # 이보다 빨리 도는 중의 검출은 world 좌표를 내지 않는다 (0 = 끔).
+        self.declare_parameter("nav_max_yaw_rate", 0.25)
+        # bbox 가 화면 밖으로 잘렸을 때 쓰는 물체 반지름 (광물 폭 0.26~0.30 m).
+        self.declare_parameter("object_radius_m", 0.13)
         self.declare_parameter("nav_publish_annotated", True)
 
         # Wrist (gripper) cam — optical frame output for arm_executor
@@ -351,6 +506,9 @@ class YoloPerceptionNode(Node):
             publish_annotated=bool(self.get_parameter("nav_publish_annotated").value),
             camera_offset_xyz=tuple(
                 float(v) for v in self.get_parameter("nav_camera_offset_xyz").value),
+            image_latency_sec=float(self.get_parameter("nav_image_latency_sec").value),
+            max_yaw_rate=float(self.get_parameter("nav_max_yaw_rate").value),
+            object_radius_m=float(self.get_parameter("object_radius_m").value),
         )
 
         self.wrist: Optional[CamChannel] = None
@@ -366,6 +524,7 @@ class YoloPerceptionNode(Node):
                 frame_id=str(self.get_parameter("wrist_frame_id").value),
                 mode="optical",
                 publish_annotated=bool(self.get_parameter("wrist_publish_annotated").value),
+                object_radius_m=float(self.get_parameter("object_radius_m").value),
             )
 
         rate_hz = max(0.5, float(self.get_parameter("publish_rate_hz").value))
@@ -383,7 +542,9 @@ class YoloPerceptionNode(Node):
 
     def _log_status(self) -> None:
         line = (f"nav: seen={self.nav.frames_seen} pub={self.nav.frames_published} "
-                f"dets={self.nav.detections_total} have=[{self.nav.have_str()}]")
+                f"dets={self.nav.detections_total} turn_skip={self.nav.skipped_turning} "
+                f"mem={self.nav.used_memory} "
+                f"have=[{self.nav.have_str()}]")
         if self.wrist is not None:
             line += (f" | wrist: seen={self.wrist.frames_seen} "
                      f"pub={self.wrist.frames_published} "

@@ -27,7 +27,7 @@ GT_SCRIPT 가 발행하는 /ground_truth/odom 을 odom_to_estimated_pose 가
   - yolo_perception_node    (mineral world XYZ + 이미지 detection)
   - coverage_node           (robot_radius=0.8 — terrain v4 spacing 으로 안전 확보)
   - mission_manager_node    (supervisor: EXPLORE/APPROACH/PICK/RTB/COMPLETE + AUTO/MANUAL mux)
-  - arm_executor_node       (T2 IK + ik_descend_dz=-0.40 perception bias 보정)
+  - arm_executor_node       (T2 IK)
   - battery_monitor_node    (mock drain → /battery_state, critical 시 RTB 트리거)
   - mission_web_node        (Flask+SocketIO, SC2 풍 HUD — http://localhost:8088)
   - web_video_server        (MJPEG: /camera/* + /perception/*_image_annotated)
@@ -163,14 +163,12 @@ def generate_launch_description() -> LaunchDescription:
                 ],
             ),
             # T2 manipulation — DLS-IK 상태머신 + /grasp/command FixedJoint snap.
-            # ik_descend_dz=-0.40 = perception 의 z bias (+47cm 평균) 보정.
             # odom_topic default=/ground_truth/odom (GT cheat 모드).
             Node(
                 package="isaac_manipulation",
                 executable="arm_executor_node",
                 name="arm_executor_node",
                 output="screen",
-                parameters=[{"ik_descend_dz": -0.40}],
             ),
             # Mock 배터리 드레인 publisher — mission_manager 가 subscribe.
             Node(
