@@ -53,6 +53,15 @@ _p.add_argument("--render-preset", choices=["default", "performance"],
 _p.add_argument("--debug-grasp", action="store_true",
                 help="grasp FixedJoint 가 있는 동안 finger / mineral world 좌표와 "
                      "간격을 주기적으로 출력 (magic grasp 진단용).")
+_p.add_argument("--physics", choices=["mars", "earth"], default="mars",
+                help="물리 환경. mars(기본): 중력 3.72 m/s² + 레골리스·바위·바퀴 "
+                     "접촉 재질 + terrain meta 의 구역별 마찰. earth: 손대지 "
+                     "않음 (9.81, PhysX 기본 마찰 — 예전 동작).")
+_p.add_argument("--drive-limits", default="auto",
+                help="구동부 속도·가속 제한. auto(기본): --physics 의 중력에 맞춘 값 "
+                     "(earth 는 제한 없음 = 원래 동작). off: 제한 없음. "
+                     "또는 'max_lin=0.8,acc_lin=0.5' 처럼 항목별 override "
+                     "(항목: max_lin, max_ang, acc_lin, acc_ang).")
 _p.add_argument("--kit-arg", action="append", default=[],
                 help="Kit 에 그대로 넘길 인자 (반복 가능). 예: "
                      "--kit-arg=--/rtx/reflections/enabled=false")
@@ -93,6 +102,10 @@ from isaacsim.core.utils.stage import add_reference_to_stage
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux, UsdPhysics, UsdShade
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+from planet_physics import apply_planet_physics  # noqa: E402
+from drive_limits import apply_drive_limits, limits_for_gravity, parse_limits  # noqa: E402
 ISAAC_SIM = os.path.dirname(HERE)
 WORLD = f"{ISAAC_SIM}/worlds/{_a.terrain}.usd"
 V3 = f"{ISAAC_SIM}/assets/vehicle/vehicle_v3.usd"
@@ -1122,10 +1135,12 @@ def main() -> None:
 
     # spawn 좌표 (terrain meta.json) — 단일/다중 모드 공통
     spots = []
+    terrain_meta: dict = {}
     meta = os.path.join(TERRAIN_DIR, "meta.json")
     if os.path.isfile(meta):
         with open(meta) as f:
-            spots = json.load(f).get("spawn_locations") or []
+            terrain_meta = json.load(f)
+        spots = terrain_meta.get("spawn_locations") or []
 
     stage = omni.usd.get_context().get_stage()
     chase_xform_op = None
@@ -1217,6 +1232,23 @@ def main() -> None:
 
     for _ in range(20):
         app.update()
+    # 중력·접촉 재질 — 로버가 stage 에 올라온 뒤, physics 파싱(reset) 전에.
+    rover_roots = ([f"/World/{_ns_to_prim_name(ns)}" for ns in _a.rovers]
+                   if _a.rovers else [ROVER_PRIM])
+    physics_info = apply_planet_physics(
+        stage, world, _a.physics, meta=terrain_meta,
+        scene_root="/World/MarsScene", rover_roots=rover_roots)
+    drive_limits = None
+    if _a.drive_limits != "off":
+        base = (limits_for_gravity(physics_info["gravity"])
+                if _a.physics != "earth" else None)
+        if _a.drive_limits != "auto":
+            # 항목별 override — earth 에서는 지구 기준값 위에 덮는다.
+            drive_limits = parse_limits(_a.drive_limits,
+                                        base or limits_for_gravity(9.81))
+        else:
+            drive_limits = base
+    apply_drive_limits(stage, rover_roots, drive_limits)
     world.reset()
     world.play()
     render_every = max(1, int(_a.render_every))
