@@ -224,10 +224,10 @@ ros2 launch isaac_bringup mvp_multi.launch.py rovers:=rover_1 ... \
 | 같은 공유기 안의 기기 | `http://<이 PC 의 IP>:8088` | 방화벽(ufw)이 켜져 있으면 그 포트를 열어야 함 — 기본값이 "들어오는 연결 차단" 이라 안 열면 접속이 그냥 멈춥니다. `sudo ufw allow from 192.168.0.0/24 to any port 8088 proto tcp` (대역은 자기 공유기에 맞게) |
 | 인터넷 어디서나 | `https://<임시 이름>.trycloudflare.com` | `hud_public:=true` + `cloudflared` 실행 파일 (아래) |
 
-- **인터넷 주소** 는 HUD 노드가 `cloudflared` 터널을 직접 열어서 만듭니다 (`mission_web_node.PublicTunnel`). 밖에서 들어오는 연결을 여는 것이 아니라 이 PC 가 Cloudflare 로 나가는 연결을 만드는 방식이라 공유기·방화벽 설정이 필요 없습니다. 계정 없이 쓰는 임시 주소라 **띄울 때마다 바뀌고**, HUD 를 내리면 사라집니다. **영상과 상태가 Cloudflare 의 서버를 거쳐 나간다**는 점은 알고 쓰십시오.
+- **인터넷 주소** 는 HUD 노드가 `cloudflared` 터널을 직접 열어서 만듭니다 (`mission_web_node.PublicTunnel`). 밖에서 들어오는 연결을 여는 것이 아니라 이 PC 가 Cloudflare 로 나가는 연결을 만드는 방식이라 공유기·방화벽 설정이 필요 없습니다. **영상과 상태가 Cloudflare 의 서버를 거쳐 나간다**는 점은 알고 쓰십시오.
+  계정 없이 쓰는 임시 주소는 `cloudflared` 프로세스가 새로 뜰 때마다 바뀝니다. 스택을 다시 띄울 때마다 주소가 바뀌면 이미 넘겨준 주소가 죽으므로 (`Error 1033 Cloudflare Tunnel error`), **터널 프로세스는 스택과 따로 살려 둡니다**: 스택을 내려도 터널은 남고 (그동안 주소는 502), 다시 띄우면 HUD 가 떠 있던 터널을 그대로 씁니다. 접속 키도 `~/.ros/hud_key` 에 두고 계속 씁니다. 그래서 **주소와 키가 바뀌는 때는 PC 를 재부팅했거나 `tools/hud_tunnel.sh stop` 으로 닫았을 때뿐**입니다. 지금 주소는 `tools/hud_tunnel.sh` 로 봅니다.
   `cloudflared` 설치: [공식 릴리스](https://github.com/cloudflare/cloudflared/releases)의 `cloudflared-linux-amd64` (약 40 MB) 를 `~/.local/bin/cloudflared` 로 두고 `chmod +x` (root 불필요). 없으면 HUD 는 그대로 뜨고 로그에 안내만 남깁니다.
-- **접속 키**: 키가 걸려 있으면 `…/?key=<키>` 로 한 번 들어온 브라우저만 쿠키로 통과하고, 나머지는 화면·영상·상태·버튼 전부 403 입니다. 인터넷 주소는 누구나 접속을 시도할 수 있으므로 키 없이는 내보내지 않습니다 — `hud_public:=true` 인데 `hud_key` 를 안 줬으면 HUD 가 키를 만들어 로그와 알약 주소에 붙입니다. 터널을 거쳐 온 요청은 127.0.0.1 에서 오지만 전달 헤더(`X-Forwarded-For`, `Cf-*`)와 Host 로 구분해서 키를 요구합니다. 버튼이 로버를 움직이므로, 보기만 시킬 거면 `hud_actions:=false` 를 같이 주십시오.
-- 이미 떠 있는 HUD(`hud_key` 를 준 것)를 내리지 않고 인터넷 주소만 만들려면 `tools/hud_tunnel.sh [포트]`.
+- **접속 키**: 키가 걸려 있으면 `…/?key=<키>` 로 한 번 들어온 브라우저만 쿠키로 통과하고, 나머지는 화면·영상·상태·버튼 전부 403 입니다. 인터넷 주소는 누구나 접속을 시도할 수 있으므로 키 없이는 내보내지 않습니다 — `hud_public:=true` 인데 `hud_key` 를 안 줬으면 HUD 가 키를 만들어 (`~/.ros/hud_key`, 지우면 새로 만듦) 로그와 알약 주소에 붙입니다. 키 없이 띄운 HUD(`hud_public`·`hud_key` 둘 다 없음)는 터널로 들어온 요청을 전부 거절하므로, 터널이 남아 있는 채로 평소처럼 띄워도 밖에서는 열리지 않습니다. 터널을 거쳐 온 요청은 127.0.0.1 에서 오지만 전달 헤더(`X-Forwarded-For`, `Cf-*`)와 Host 로 구분해서 키를 요구합니다. 버튼이 로버를 움직이므로, 보기만 시킬 거면 `hud_actions:=false` 를 같이 주십시오.
 - 화면의 Socket.IO 스크립트는 CDN(`cdn.socket.io`)에서 받습니다. HUD 를 여는 기기가 인터넷에 닿지 않으면 화면은 뜨지만 상태가 갱신되지 않습니다.
 
 확인한 것 (2026-11-24, terrain_00026 로버 1 대, `hud_public:=true`):
@@ -239,6 +239,7 @@ ros2 launch isaac_bringup mvp_multi.launch.py rovers:=rover_1 ... \
 | 키 없이 / 틀린 키로 (인터넷 주소, 같은 네트워크 주소) | 403 |
 | 터널을 거쳐 `Host: localhost` 로 속여서 | 403 |
 | 이 PC 에서 `localhost` 로 | 키 없이 열림 |
+| 스택을 내렸다가 다시 띄움 | 같은 주소·같은 키로 다시 열림 (내려가 있는 동안은 502) |
 
 같은 공유기 안의 다른 기기에서 실제로 여는 것은 방화벽 규칙을 넣은 것까지만 했고, 다른 기기로 접속해 보지는 않았습니다. 참고로 ssh 만으로 되는 `localhost.run` 익명 터널도 시험했는데 속도가 20 → 2 kB/s 로 묶이고 (화면이 뜨는 데 8 초, 영상은 사실상 정지) 주소가 40 초 만에 바뀌어 쓰지 않습니다.
 

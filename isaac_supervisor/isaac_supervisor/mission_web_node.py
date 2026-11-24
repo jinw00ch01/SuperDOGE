@@ -43,8 +43,6 @@ Run:
 """
 from __future__ import annotations
 
-import atexit
-import ctypes
 import hmac
 import json
 import math
@@ -52,7 +50,6 @@ import os
 import re
 import secrets
 import shutil
-import signal
 import socket
 import subprocess
 import threading
@@ -137,7 +134,14 @@ class PublicTunnel:
     WEB_PUBLIC=1 일 때만. 밖에서 들어오는 연결을 여는 것이 아니라 이 PC 가 Cloudflare
     로 나가는 연결을 만들고, 그쪽이 받은 요청을 이 연결로 돌려보낸다. 그래서 공유기
     설정이나 방화벽 변경 없이 어디서든 열린다 — 대신 영상과 상태가 Cloudflare 의
-    서버를 거친다. 계정 없이 쓰는 임시 주소라 띄울 때마다 바뀐다.
+    서버를 거친다.
+
+    계정 없이 쓰는 임시 주소는 cloudflared 프로세스가 새로 뜰 때마다 바뀐다. 스택을
+    다시 띄울 때마다 주소가 바뀌면 이미 넘겨준 주소가 죽으므로, **터널 프로세스는
+    HUD 노드와 따로 살려 둔다**: 떠 있는 터널이 있으면(STATE 파일의 pid) 그대로 다시
+    쓰고, 없을 때만 새로 띄운다. HUD 가 내려가 있는 동안 그 주소는 502 를 내다가
+    HUD 가 다시 뜨면 이어진다. 주소가 바뀌는 때는 재부팅했거나 터널을 직접 닫았을 때
+    (tools/hud_tunnel.sh stop)뿐이다.
 
     cloudflared 실행 파일이 필요하다 (PATH 또는 ~/.local/bin). ssh 만으로 되는
     localhost.run 도 시험했지만 익명 터널이 2~20 kB/s 로 묶이고 주소가 도중에 바뀌어
@@ -148,6 +152,8 @@ class PublicTunnel:
     INSTALL_HINT = ("cloudflared 가 없어 인터넷 주소를 만들지 못함 — "
                     "https://github.com/cloudflare/cloudflared/releases 의 "
                     "cloudflared-linux-amd64 를 ~/.local/bin/cloudflared 로 두면 된다")
+    STATE = os.path.expanduser("~/.ros/hud_tunnel.json")      # {pid, url, port}
+    LOG = os.path.expanduser("~/.ros/hud_tunnel.log")         # cloudflared 가 찍는 것
 
     def __init__(self, port: int, on_url, log) -> None:
         self.port = port
@@ -155,8 +161,7 @@ class PublicTunnel:
         self.log = log
         self.url = ""
         self.provider = "cloudflared"
-        self._proc = None
-        self._stop = False
+        self.pid = 0
         self.exe = shutil.which("cloudflared") or ""
         local = os.path.expanduser("~/.local/bin/cloudflared")
         if not self.exe and os.access(local, os.X_OK):
@@ -165,50 +170,90 @@ class PublicTunnel:
             log(self.INSTALL_HINT)
             return
         threading.Thread(target=self._run, daemon=True).start()
-        atexit.register(self.close)
 
-    def _command(self) -> List[str]:
-        return [self.exe, "tunnel", "--no-autoupdate",
-                "--url", f"http://127.0.0.1:{self.port}"]
-
-    @staticmethod
-    def _die_with_parent() -> None:
-        # HUD 노드가 죽으면(강제 종료 포함) 터널도 같이 닫힌다.
+    def _alive(self, pid: int) -> bool:
+        """그 pid 가 이 포트를 내보내는 cloudflared 인가."""
         try:
-            ctypes.CDLL("libc.so.6").prctl(1, signal.SIGTERM)     # PR_SET_PDEATHSIG
-        except Exception:
-            pass
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmd = f.read().replace(b"\0", b" ").decode(errors="replace")
+        except OSError:
+            return False
+        return "cloudflared" in cmd and f"127.0.0.1:{self.port}" in cmd
+
+    def _reuse(self) -> bool:
+        try:
+            with open(self.STATE) as f:
+                st = json.load(f)
+        except (OSError, ValueError):
+            return False
+        if int(st.get("port", 0)) != self.port or not st.get("url") \
+                or not self._alive(int(st.get("pid", 0))):
+            return False
+        self.pid, self.url = int(st["pid"]), str(st["url"])
+        return True
+
+    def _spawn(self) -> bool:
+        """터널을 새로 띄우고 주소가 찍힐 때까지 기다린다. HUD 노드가 죽어도 남는다."""
+        os.makedirs(os.path.dirname(self.LOG), exist_ok=True)
+        with open(self.LOG, "w") as out:
+            proc = subprocess.Popen(
+                [self.exe, "tunnel", "--no-autoupdate", "--url", f"http://127.0.0.1:{self.port}"],
+                stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+                start_new_session=True)
+        for _ in range(120):                       # 최대 60 s
+            time.sleep(0.5)
+            if proc.poll() is not None:
+                return False
+            try:
+                with open(self.LOG, errors="replace") as f:
+                    m = self.URL_RE.search(f.read())
+            except OSError:
+                m = None
+            if m:
+                self.pid, self.url = proc.pid, m.group(0)
+                tmp = self.STATE + ".tmp"
+                with open(tmp, "w") as f:
+                    json.dump({"pid": self.pid, "url": self.url, "port": self.port,
+                               "started": time.strftime("%Y-%m-%dT%H:%M:%S")}, f)
+                os.replace(tmp, self.STATE)
+                return True
+        proc.terminate()
+        return False
 
     def _run(self) -> None:
         wait = 5.0
-        while not self._stop:
-            try:
-                self._proc = subprocess.Popen(
-                    self._command(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT, text=True, preexec_fn=self._die_with_parent)
-            except Exception as exc:
-                self.log(f"터널을 열지 못함: {exc}")
-                return
-            started = time.time()
-            for line in self._proc.stdout:
-                m = self.URL_RE.search(line)
-                if m and m.group(0) != self.url:
-                    self.url = m.group(0)
-                    self.on_url(self.url, self.provider)
-            self._proc.wait()
-            if self._stop:
-                return
-            if self.url:
+        while True:
+            reused = self._reuse()
+            if reused or self._spawn():
+                wait = 5.0
+                self.on_url(self.url, self.provider + (" · 떠 있던 터널을 다시 씀" if reused else ""))
+                while self._alive(self.pid):
+                    time.sleep(5.0)
                 self.url = ""
                 self.on_url("", self.provider)
-            wait = 5.0 if time.time() - started > 60.0 else min(wait * 2.0, 120.0)
-            self.log(f"터널({self.provider})이 닫힘 — {wait:.0f} s 뒤 다시 연다")
+            else:
+                wait = min(wait * 2.0, 120.0)
+            self.log(f"터널({self.provider})이 없음 — {wait:.0f} s 뒤 새로 연다 (주소가 바뀐다)")
             time.sleep(wait)
 
-    def close(self) -> None:
-        self._stop = True
-        if self._proc is not None and self._proc.poll() is None:
-            self._proc.terminate()
+
+def persistent_key(path: str = "~/.ros/hud_key") -> str:
+    """hud_public 인데 hud_key 를 안 줬을 때 쓰는 접속 키. 한 번 만들어 파일에 두고 계속 쓴다
+    (스택을 다시 띄워도 넘겨준 주소가 그대로 열리게). 바꾸려면 파일을 지우면 된다."""
+    path = os.path.expanduser(path)
+    try:
+        with open(path) as f:
+            key = f.read().strip()
+        if len(key) >= 8:
+            return key
+    except OSError:
+        pass
+    key = secrets.token_urlsafe(9)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(key + "\n")
+    return key
 
 
 # 운영자 명령: HUD 버튼 이름 → mission/command 에 보낼 문자열 (토글은 상태를 보고 고른다)
@@ -675,7 +720,7 @@ def main(args: list[str] | None = None) -> None:
     # 인터넷 주소는 누구나 접속을 시도할 수 있다 — 접속 키 없이는 내보내지 않는다.
     token_made = public_on and not token
     if token_made:
-        token = secrets.token_urlsafe(9)
+        token = persistent_key()
     key_q = f"/?key={token}" if token else ""
     tunnel_box: Dict[str, Any] = {"t": None}
 
@@ -691,14 +736,21 @@ def main(args: list[str] | None = None) -> None:
         """
         if request.remote_addr not in ("127.0.0.1", "::1"):
             return False
-        if any(h in request.headers for h in TUNNEL_HEADERS):
+        if via_tunnel():
             return False
         host = (request.host or "").rsplit(":", 1)[0] if not (request.host or "").startswith("[") \
             else (request.host or "").split("]")[0] + "]"
         return host in ("localhost", "127.0.0.1", "[::1]")
 
+    def via_tunnel() -> bool:
+        return any(h in request.headers for h in TUNNEL_HEADERS)
+
     def authorized() -> bool:
-        if not token or from_this_pc():      # 이 PC 에서는 키 없이 (키가 없을 때와 같은 조건)
+        if not token:
+            # 키 없이 띄운 HUD 는 터널로 들어온 요청을 받지 않는다. 터널 프로세스는 HUD 와
+            # 따로 살아 있으므로, hud_public 없이 다시 띄웠을 때 예전 주소로 열리면 안 된다.
+            return not via_tunnel()
+        if from_this_pc():                   # 이 PC 에서는 키 없이
             return True
         got = request.cookies.get("hud_key", "")
         return hmac.compare_digest(got.encode(), token.encode())
@@ -859,7 +911,8 @@ def main(args: list[str] | None = None) -> None:
         if url:
             ros_node.get_logger().info(
                 f"HUD 주소 — 인터넷: {url}{suffix}   ({provider} 터널. 영상·상태가 Cloudflare "
-                "서버를 거쳐 나간다. HUD 를 내리면 주소도 사라진다)")
+                "서버를 거쳐 나간다. 스택을 다시 띄워도 이 주소는 그대로다. 닫기: "
+                "tools/hud_tunnel.sh stop)")
             ros_node.push_event("", "info", f"인터넷 주소 열림: {url}")
         else:
             ros_node.push_event("", "info", "인터넷 주소 닫힘 (터널이 끊김)")
