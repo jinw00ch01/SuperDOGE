@@ -10,14 +10,14 @@
 
 이 저장소는 팀 프로젝트 [`sungyu-sung/a-2_isaac`](https://github.com/sungyu-sung/a-2_isaac) 를
 Ubuntu 24.04 · ROS 2 Jazzy · Isaac Sim 5.1 로 옮긴 뒤, 시연용 임시방편을 하나씩 걷어내는 개선판입니다.
-아래 표 밖의 내용(시연 명령, 팀 구성 등)은 원본 README 그대로입니다.
+원본과는 별개의 저장소로 혼자 이어 가고 있으며, 팀 프로젝트 시절의 안내(팀원용 셋업, 담당자 표, 발표 직전 상태)는 걷어냈습니다.
 
 | 항목 | 원본 | SuperDOGE |
 |---|---|---|
 | 중력 | 지구 9.81 m/s² | **화성 3.72 m/s²** (`--physics mars`, 기본값) |
 | 접촉 마찰 | PhysX 기본값 0.5 (지형 meta 의 구역 마찰은 미사용) | 레골리스 0.58/0.52, 바위 0.70/0.60, 지형 meta 의 sand·rocky 구역별 값 적용 |
 | 구동 | `/cmd_vel` 을 그대로 바퀴 속도로 (3 m/s 계단 입력) | 중력에 맞춘 속도·가속 제한 (화성: 0.92 m/s, 0.72 m/s²) |
-| 바퀴 충돌 형상 | 바퀴 mesh 의 convex hull (다각형 + 축에서 1.7~4.8 mm 편심) — 구동 접지력이 설정 마찰의 60~65 % | **축에 중심을 맞춘 캡슐** (`--wheel-collider round`, 기본값) — 설정 마찰 그대로. 짧은 급경사 띠를 넘는 한계가 20° → 23~25° |
+| 바퀴 충돌 형상 | 바퀴 mesh 의 convex hull (다각형 + 축에서 1.7\~4.8 mm 편심) — 구동 접지력이 설정 마찰의 60\~65 % | **축에 중심을 맞춘 캡슐** (`--wheel-collider round`, 기본값) — 설정 마찰 그대로. 짧은 급경사 띠를 넘는 한계가 20° → 23\~25° |
 | link 속도 상한 | 로버 모델이 차체·바퀴 link 의 선속도를 1.5 m/s 에서 잘라 냄 (주행도, 넘어질 때 떨어지는 속도도) | **해제** (`--link-speed-cap off`, 기본값). 모델 파일은 그대로 두고 시뮬레이터가 뜰 때 덮어씀 |
 | 광물 위치 추정 (2.5 m 이내 중앙값) | 수평 오차 18.7 cm, 높이 +46 cm | 수평 3.7 cm (90% 4.7 cm), 높이 −3.6 cm |
 | `ik_descend_dz=-0.40` | 인식 높이 편향을 상쇄하는 임시값 | 제거 (기본 0.05) |
@@ -54,14 +54,14 @@ tools/isaac-pypi isaac_sim/scripts/check_planet_physics.py --terrain terrain_000
   USD 원기둥으로 바꿔도 PhysX 가 다시 다각형 convex 로 근사해서 같습니다. 굴러가는 방향으로 완전히 둥근 형상(캡슐·구)이어야 합니다.
 - **평지에서 잰 접지력** (`probe_traction.py`: 바퀴를 "차체 속도 + 일정 값" 으로 헛돌리며 차체 가속도 / 중력. 로버 13 대, 설정 동마찰 0.52):
 
-  | 바퀴 충돌 형상 | 구동 (헛돎 0.15~2 m/s) | 제동 (바퀴 잠김) |
+  | 바퀴 충돌 형상 | 구동 (헛돎 0.15\~2 m/s) | 제동 (바퀴 잠김) |
   |---|---|---|
-  | mesh convex hull (원본) | 0.31 ~ 0.35 | 0.50 ~ 0.54 |
-  | 원기둥 (다각형 근사) | 0.31 ~ 0.39 | 0.48 ~ 0.54 |
-  | **캡슐** (적용) | **0.50 ~ 0.52** | 0.48 ~ 0.49 |
-  | 구 | 0.50 ~ 0.52 | 0.48 ~ 0.49 |
+  | mesh convex hull (원본) | 0.31 \~ 0.35 | 0.50 \~ 0.54 |
+  | 원기둥 (다각형 근사) | 0.31 \~ 0.39 | 0.48 \~ 0.54 |
+  | **캡슐** (적용) | **0.50 \~ 0.52** | 0.48 \~ 0.49 |
+  | 구 | 0.50 \~ 0.52 | 0.48 \~ 0.49 |
 
-  물리 주기를 60 → 240 Hz 로 올려도, mesh 의 편심(1.7~4.8 mm)만 없애도 달라지지 않았습니다. 형상이 둥근지가 전부였습니다.
+  물리 주기를 60 → 240 Hz 로 올려도, mesh 의 편심(1.7\~4.8 mm)만 없애도 달라지지 않았습니다. 형상이 둥근지가 전부였습니다.
 - **비탈에서** (`probe_slope.py`, terrain_00015. 이 지형의 23° 넘는 급경사는 길이 중앙 1.0 m · 최대 2 m 의 짧은 띠라서 "띠를 넘어 1 m 더 가는가" 를 봅니다. 같은 자리끼리 비교, 명령 0.92 m/s = 기본 제한):
 
   | 띠의 경사 | 띠 아래 끝에서 정지 출발 (원본 → 캡슐) | 2.5 m 앞에서 달려서 진입 (원본 → 캡슐) |
@@ -72,8 +72,8 @@ tools/isaac-pypi isaac_sim/scripts/check_planet_physics.py --terrain terrain_000
   | 25° | 0/3 → 1/3 | 0/1 → 1/1 |
   | 27° · 29° | 0/3 → 0/3 | 자리 없음 |
 
-  27° 부터는 진짜 마찰 한계입니다 (`tan θ ≤ μ`). 가파른 구간은 자리가 1~6 곳뿐이라 경향만 믿을 수 있습니다. 전복은 같은 시험 전체(149 회 시도, 명령 0.3~2.0 m/s)에서 원본 20 회 → 캡슐 6 회였는데, 줄어든 것은 전부 1.2 m/s 이상의 빠른 명령에서입니다. 기본 제한(0.92 m/s) 이하에서는 양쪽 다 81 회 중 1 회였습니다.
-- **HUD 에서 0.02 m/s 로 멈춰 있던 바로 그 자리** (terrain_00015 의 (−11.1, 11.5), 길이 1.5 m · 경사 23.6~26.5° 의 띠. 로버 16 대를 0.3~3 m 앞에 놓고 기본 제한 0.92 m/s 로 출발): 원본 바퀴는 **1/16** 만 넘었고(전복 2), 캡슐은 **16/16** 이 4~7 초에 넘었습니다(전복 0, 최대 기울기 28~47°).
+  27° 부터는 진짜 마찰 한계입니다 (`tan θ ≤ μ`). 가파른 구간은 자리가 1\~6 곳뿐이라 경향만 믿을 수 있습니다. 전복은 같은 시험 전체(149 회 시도, 명령 0.3\~2.0 m/s)에서 원본 20 회 → 캡슐 6 회였는데, 줄어든 것은 전부 1.2 m/s 이상의 빠른 명령에서입니다. 기본 제한(0.92 m/s) 이하에서는 양쪽 다 81 회 중 1 회였습니다.
+- **HUD 에서 0.02 m/s 로 멈춰 있던 바로 그 자리** (terrain_00015 의 (−11.1, 11.5), 길이 1.5 m · 경사 23.6\~26.5° 의 띠. 로버 16 대를 0.3\~3 m 앞에 놓고 기본 제한 0.92 m/s 로 출발): 원본 바퀴는 **1/16** 만 넘었고(전복 2), 캡슐은 **16/16** 이 4\~7 초에 넘었습니다(전복 0, 최대 기울기 28\~47°).
 - **임무 스택** (terrain_00015, 기본 모드 + `self_right:=true`, 1 회): 3/3 수집, 551 s 동안 272 m, 최대 기울기 25°, 전복 없음, 막힘 감지 2 회(23° 띠 앞과 모래 구역 — 둘 다 그 뒤 임무가 이어짐). 같은 지형의 직전 네 번(원본 바퀴, 420 s 제한)은 2/3 · 0/3 · 1/3 · 0/3 이었고 그중 두 번은 넘어졌습니다 — 다만 시간 제한(600 s vs 420 s)과 광물을 찾는 운이 달라서 이 차이를 전부 바퀴 덕으로 볼 수는 없습니다.
   완만한 지형 회귀 시험도 1 회씩 통과: terrain_00026 은 60 초에 강제로 뒤집은 것을 3.8 초에 세우고 3/3 수집 + 기지 복귀(225 s), terrain_00028 은 3/3 + 복귀(245 s, 전복 없음).
 - 캡슐은 반지름 0.105 m (mesh 의 바깥 반지름 평균), 몸통 길이는 접지 폭의 절반입니다. 양 끝이 반구라 축 높이에서 mesh 보다 양옆으로 7 cm 씩 넓습니다 (땅에 닿는 폭은 mesh 의 절반). 보이는 모양은 그대로입니다. `--wheel-collider mesh` 로 원본 동작이 됩니다.
@@ -112,10 +112,10 @@ roll/pitch 반영, 영상이 찍힌 시각의 자세로 변환(odom 보간), bbo
 - 팔: 공구 축을 수직 아래로 두고 손끝을 인식한 광물 중심 위 24 cm 로 가져간 뒤, 4 cm/s 로 내리면서 pickup 을 계속 보냅니다.
 - 시뮬레이터: 손끝 주변 반지름 2.5 cm 구가 광물 collider 와 겹친 순간에만, 그때의 상대 자세 그대로 FixedJoint 를 겁니다.
 - 닿지 않으면 pick 은 실패로 끝나고 수집으로 세지 않습니다. 인식 높이가 몇 cm 틀려도 하강 중에 닿으므로 흡수됩니다.
-- 팔은 로버가 완전히 멈춘 뒤에 목표를 계산합니다 (정지 명령 뒤에도 4~7 cm 더 굴러갑니다). 팔을 뻗는 동안 차체가 밀린 만큼도 다시 계산합니다.
+- 팔은 로버가 완전히 멈춘 뒤에 목표를 계산합니다 (정지 명령 뒤에도 4\~7 cm 더 굴러갑니다). 팔을 뻗는 동안 차체가 밀린 만큼도 다시 계산합니다.
 - 손목 카메라 보정: 손끝을 광물 위로 가져간 뒤 위에서 내려다본 검출로 수평 위치를 고칩니다 (최대 2 회).
   로버 카메라는 옆에서 보므로 표면→중심 방향이 불확실하지만, 위에서는 bbox 중심이 곧 수평 중심입니다.
-  손끝 중심과 광물 중심의 수평 거리: 보정 없음 0.6~8.1 cm (평균 4.0), 보정 있음 0.7~2.3 cm (평균 1.4).
+  손끝 중심과 광물 중심의 수평 거리: 보정 없음 0.6\~8.1 cm (평균 4.0), 보정 있음 0.7\~2.3 cm (평균 1.4).
   `use_wrist_correction:=false` (arm_executor 파라미터) 로 끌 수 있습니다.
 - 이 방식은 RG2-FT 를 그대로 둘 때 쓰는 중간 단계입니다 (`--grasp contact --gripper rg2` + 런치 `grasp_mode:=contact`).
   손가락이 조여서 드는 것이 아니라 닿은 뒤 FixedJoint 로 고정합니다. RG2-FT 는 10 cm 까지만 벌어지고 광물은 17×19×23 cm 라 쥘 수 없기 때문입니다.
@@ -130,14 +130,14 @@ roll/pitch 반영, 영상이 찍힌 시각의 자세로 변환(odom 보간), bbo
 | `--grasp magic --gripper rg2` | `snap` | 순간이동 + FixedJoint (원본) |
 
 - 집게: RG2-FT 의 본체·손가락을 비활성화하고 같은 자리에 평행 집게를 만듭니다 (손목 카메라와 브래킷은 그대로).
-  벌림 3~27 cm, 손가락 길이 17 cm, 손가락 하나가 미는 힘 40 N, 패드 마찰 1.5/1.2.
+  벌림 3\~27 cm, 손가락 길이 17 cm, 손가락 하나가 미는 힘 40 N, 패드 마찰 1.5/1.2.
   들 수 있는 한계는 2·μ·F = 96 N 이고 광물(4 kg)의 화성 무게는 14.9 N 입니다.
 - 팔: 광물 위에서 손목 카메라로 수평 위치와 **윗면 높이**를 잰 뒤, 손가락을 벌린 채 집게 몸통이 윗면 3 cm 위에 올 때까지 내리고 닫습니다.
 - "쥠" 판정은 물리 상태를 읽기만 합니다: 닫기 명령 뒤 손가락이 완전히 닫히지 않은 간격에서 멈춰 있고, 그 사이에 광물 collider 가 있을 때.
   들어올린 뒤와 적재함 위에서 한 번씩 다시 확인해서, 놓쳤으면 수집으로 세지 않습니다.
 - 들고 있는 동안 광물 collider 는 켜져 있고 광물과 집게 사이에 joint 는 없습니다.
 - 실측 (terrain_00026, 로버 1 대): 광물 0.3 kg 에서 3/3, 4 kg 에서 3/3 — 여섯 번 모두 첫 시도에 쥐었고 적재할 때까지 손가락 간격 변화는 0.1 cm 이내였습니다.
-  쥔 간격 16.6~19.5 cm 는 광물 폭(17~19 cm)과 같습니다. 옆으로 누운 광물(3번)도 집었습니다.
+  쥔 간격 16.6\~19.5 cm 는 광물 폭(17\~19 cm)과 같습니다. 옆으로 누운 광물(3번)도 집었습니다.
 - 남은 비현실: 집게는 치수만 정한 가상의 것이고 실제 제품이 아닙니다. 로버에 적재함 collider 가 없어서, 적재함 위에서 집게를 열면
   그 순간 손가락 사이에 있던 광물을 숨기는 것으로 "적재" 를 대신합니다 (원본과 같은 추상화). 로버 2 대 동시 실행은 아직 확인하지 않았습니다.
 
@@ -174,12 +174,12 @@ Web HUD 로 지켜보다 드러난 네 가지를 기록으로 원인을 확인�
 
 | 증상 | 원인 (기록으로 확인) | 수정 |
 |---|---|---|
-| 광물 근처에서 좌우로만 돌다 포기 | 지도 없는 주행에서는 광물도 "위험 칸" 이라, 접근 경로가 광물 1 m 앞에서 끝남. 로버가 발밑의 마지막 경유점을 향해 조향하며 제자리에서 맴돎 (접근 9 회 중 6 회가 0.9~1.2 m 남기고 탈락) | 집으러 가는 광물 주변 0.5 m 의 위험 칸은 빼고 계획 (`grid_excluding`). 그래도 막혀 있으면 그 광물을 60 초 제외 |
+| 광물 근처에서 좌우로만 돌다 포기 | 지도 없는 주행에서는 광물도 "위험 칸" 이라, 접근 경로가 광물 1 m 앞에서 끝남. 로버가 발밑의 마지막 경유점을 향해 조향하며 제자리에서 맴돎 (접근 9 회 중 6 회가 0.9\~1.2 m 남기고 탈락) | 집으러 가는 광물 주변 0.5 m 의 위험 칸은 빼고 계획 (`grid_excluding`). 그래도 막혀 있으면 그 광물을 60 초 제외 |
 | 탐색 중 한 자리에서 4 분간 좌우로 회전 | 제자리 회전을 "오차 × 이득" 으로만 명령. 시뮬레이터는 각가속도를 제한(0.99 rad/s²)하고 명령의 1.9 배로 돌아서 목표 방향을 지나쳤다 돌아오기를 무한 반복 (주기 약 4.5 s) | 남은 각도 안에서 멈출 수 있는 속도까지만 명령: `√(2·0.4·|오차|)/1.9`. 탐색·접근·복귀 모두 적용 |
-| 노란 광물로 가다 말고 못 집음 | 먼 광물은 비스듬히 보여서 깊이 화소가 뒤쪽 배경이나 앞쪽 땅을 읽음 → 거리 추정이 2~7 m 틀림 → 엉뚱한 곳으로 접근하고, 목표 고정(lock)이 진짜 위치의 검출을 "다른 광물" 로 버림 | 깊이가 가장 촘촘히 모인 구간의 값 사용, 같은 자리에서 3 번 본 검출만 목표로, 같은 방향의 더 가까운 검출이 오면 고정 위치 수정 |
+| 노란 광물로 가다 말고 못 집음 | 먼 광물은 비스듬히 보여서 깊이 화소가 뒤쪽 배경이나 앞쪽 땅을 읽음 → 거리 추정이 2\~7 m 틀림 → 엉뚱한 곳으로 접근하고, 목표 고정(lock)이 진짜 위치의 검출을 "다른 광물" 로 버림 | 깊이가 가장 촘촘히 모인 구간의 값 사용, 같은 자리에서 3 번 본 검출만 목표로, 같은 방향의 더 가까운 검출이 오면 고정 위치 수정 |
 | 건물(배럭)을 타고 올라 뒤집힘, 골리앗 앞에서 5 분간 밀기만 함 | 원본 자산은 구조물마다 바닥 면적 전체를 덮는 **투명한 충돌 상자**를 씀. 골리앗은 다리 사이가 뚫려 있고 배럭은 밑동이 상자보다 좁아서, 깊이 카메라는 빈 땅을 보는데(그 자리가 지도에 100 % "안전") 로버는 벽에 막힘 | 시뮬레이터가 투명 상자를 끄고 **보이는 모델 그대로** 충돌 (`--structure-collision mesh`, 기본. 원본은 `box`). 위험 칸 옆 0.8 m 안의 못 본 칸도 막힌 것으로 침 |
 | 막혀도 계속 밀기만 함, 비탈에서 바퀴만 헛돎 | 장애물은 깊이 카메라 + 위치로만 알고, 접촉이나 헛돎을 느끼는 수단이 없음 | **막힘 감지** (`hazard_map_node`): 4 초 구간마다 명령한 거리와 실제로 간 거리를 비교해, 15 % 도 못 갔으면(방향을 40° 넘게 트는 중은 제외) 진행 방향 0.9 m 앞에 반경 0.45 m 위험 원을 찍음 → 두 계획기가 돌아감 |
-| 광물이 없는 허공을 집음 | 12 m 밖 노란 광물의 거리가 3 프레임 동안 2.7 m 로 잡혔고(깊이 화소가 가까운 땅에 걸림), "같은 방향의 더 가까운 검출로 목표 수정" 이 그것을 받아들여 로버 바로 앞을 집으러 감. 팔은 손목 카메라에 광물이 안 보여도 그대로 진행했음 | 인식: 추정 거리에서 계산한 크기가 8 cm 미만이면 좌표를 버림 (실제 광물은 0.17~0.33 m, 문제의 검출은 5 cm). 팔: 손목 카메라가 목표 0.5 m 안에서 광물을 하나도 못 보면 **집지 않고 취소** (`abort_if_wrist_sees_nothing`). 파랑·노랑 광물에만 적용 — 초록 가스는 실제로 있어도 손목 카메라에 안 잡히거나 19 cm 어긋나게 잡혀서(3 번 중 3 번) 처음 넣은 규칙이 있는 가스를 거절했음. 가스는 예전처럼 로버 카메라 추정값으로 진행 |
+| 광물이 없는 허공을 집음 | 12 m 밖 노란 광물의 거리가 3 프레임 동안 2.7 m 로 잡혔고(깊이 화소가 가까운 땅에 걸림), "같은 방향의 더 가까운 검출로 목표 수정" 이 그것을 받아들여 로버 바로 앞을 집으러 감. 팔은 손목 카메라에 광물이 안 보여도 그대로 진행했음 | 인식: 추정 거리에서 계산한 크기가 8 cm 미만이면 좌표를 버림 (실제 광물은 0.17\~0.33 m, 문제의 검출은 5 cm). 팔: 손목 카메라가 목표 0.5 m 안에서 광물을 하나도 못 보면 **집지 않고 취소** (`abort_if_wrist_sees_nothing`). 파랑·노랑 광물에만 적용 — 초록 가스는 실제로 있어도 손목 카메라에 안 잡히거나 19 cm 어긋나게 잡혀서(3 번 중 3 번) 처음 넣은 규칙이 있는 가스를 거절했음. 가스는 예전처럼 로버 카메라 추정값으로 진행 |
 
 - 측정:
   - 제자리 회전 수정 — 학습 환경 평가(terrain_00026, 로버 16 대 × 6 분, 전복 0 회 유지): 목표점 도달이 고정 제한 1.58 → **1.96 개/분**, 구동 조절기 2.20 → **2.28 개/분**.
@@ -187,7 +187,7 @@ Web HUD 로 지켜보다 드러난 네 가지를 기록으로 원인을 확인�
   - 구조물 — terrain_00028, 구동 조절기 모드, 같은 설정으로 세 번: 투명 상자 그대로일 때 한 번은 배럭에서 전복, 한 번은 골리앗 앞에서 정지(1/3 수집).
     보이는 모델로 충돌을 바꾼 뒤 **3/3 수집 후 완주**, 장애물까지 최소 0.71 m, 전복 없음, 지도 재현율 96.3 %.
   - 임무(terrain_00026, 기본 설정): 3/3 수집(파랑·노랑·파랑), 접근 3 회 모두 한 번에 도착, 장애물까지 최소 1.00 m, 전복 없음.
-- 한계: 임무 검증은 지형당 1~2 회입니다. 광물이 바위에 0.8 m 안으로 붙어 있으면 여전히 접근하지 못하고 제외합니다.
+- 한계: 임무 검증은 지형당 1\~2 회입니다. 광물이 바위에 0.8 m 안으로 붙어 있으면 여전히 접근하지 못하고 제외합니다.
 - 광물이 여럿 보일 때의 우선순위는 원본 그대로입니다: 종류별 가치(노랑 50 > 초록 25 > 파랑 10)가 먼저, 신뢰도는 동점 처리용(×0.1), 거리는 보지 않음. 한 번 접근을 시작하면 그 광물에 고정됩니다.
 
 ### Web HUD — 주소로 열기 · 버튼 · 기록 (2026-11-24, `mission_web_node.py`, `isaac_supervisor/web/`, `mission_manager_node.py`)
@@ -288,12 +288,12 @@ supervisor ──▶ /<ns>/cmd_vel_raw ──▶ [drive_governor_node] ──▶
                                          ▲ 자세(기울기) · 차체 속도 · 바퀴 6 개 속도
 ```
 
-- **무엇을 정하나**: 선속도·각속도를 명령의 몇 배(0~1)로 낼지 + 전진 중 조향 보정(±0.3 rad/s). 명령보다 빠르게 가거나 반대로 돌 수 없습니다.
+- **무엇을 정하나**: 선속도·각속도를 명령의 몇 배(0\~1)로 낼지 + 전진 중 조향 보정(±0.3 rad/s). 명령보다 빠르게 가거나 반대로 돌 수 없습니다.
   카메라·지도는 안 보고 차체가 느끼는 것만 씁니다 (입력 20 개: 명령, 중력 방향, 각속도, 선속도, 바퀴 속도, 직전 출력).
 - **학습**: 로버 16 대를 카메라·ROS 없이 한 장면에 올려 물리만 돌립니다 (초당 약 500 샘플, PhysX→USD 갱신을 끄면 4.5 배 빨라짐).
   PPO 는 torch 만으로 직접 썼습니다 (`isaac_sim/rl/ppo.py`, 새 패키지 설치 없음). 정책은 20 → 64 → 64 → 3, 추론은 numpy 행렬 곱 세 번.
   보상 = 명령 방향으로 실제 나아간 속도 − 기울기 12° 초과분 − 흔들림 − 헛돎(시킨 속도와 실제 속도의 차) − 옆 미끄러짐 − 전복(−30, 종료).
-  지면 마찰은 학습 중 0.6~1.1 배로 계속 바꿉니다. 포함된 정책(`isaac_drive/policies/drive_governor.npz`)은 terrain_00026 에서 150 만 샘플(55 분) 학습한 것입니다.
+  지면 마찰은 학습 중 0.6\~1.1 배로 계속 바꿉니다. 포함된 정책(`isaac_drive/policies/drive_governor.npz`)은 terrain_00026 에서 150 만 샘플(55 분) 학습한 것입니다.
 - **평가** (`isaac_sim/rl/eval_drive.py`): 로버 16 대 × 6 분, 같은 출발점·같은 목표점 목록. 실제 스택의 Navigator 와 같은 식으로 지형을 모른 채 목표점을 향합니다.
   "조정한 고정 제한" 은 고정 제한을 손으로 푼 것 중 전복이 없던 가장 빠른 조합입니다 (최고 2.0 m/s, 1.5 m/s², 1.5 rad/s, 2.0 rad/s²).
 
@@ -314,10 +314,10 @@ supervisor ──▶ /<ns>/cmd_vel_raw ──▶ [drive_governor_node] ──▶
 
   헛돎 = 전진 명령 중 |바퀴에 시킨 속도 − 차체의 실제 전진 속도| 의 평균.
 - **읽는 법 (과장 없이)**:
-  - 완만한 지형(00026·00028, 평균 경사 5~6°)에서는 **전복은 고정 제한만으로도 0 회**입니다. 조절기의 이득은 "전복 없이 10 % (조정한 제한 대비) ~ 40 % (기본 제한 대비) 빠르고, 조정한 제한보다 헛돎이 1/3" 입니다.
-  - 가파른 지형(00015)에서는 **어느 방식도 전복을 못 없앱니다.** 전복 직전을 기록해 보면 대부분 이미 30~45° 기울어진 채로 바퀴를 계속 굴리다 넘어갑니다.
+  - 완만한 지형(00026·00028, 평균 경사 5\~6°)에서는 **전복은 고정 제한만으로도 0 회**입니다. 조절기의 이득은 "전복 없이 10 % (조정한 제한 대비) \~ 40 % (기본 제한 대비) 빠르고, 조정한 제한보다 헛돎이 1/3" 입니다.
+  - 가파른 지형(00015)에서는 **어느 방식도 전복을 못 없앱니다.** 전복 직전을 기록해 보면 대부분 이미 30\~45° 기울어진 채로 바퀴를 계속 굴리다 넘어갑니다.
     포함된 정책은 완만한 지형만 겪어서 이 상황에서 물러서지 않습니다 (오르막 35° 에서도 1.4 m/s 를 냄).
-  - **가파른 지형에서 이어서 학습해 봤지만 채택하지 않았습니다.** 두 번(100 만 샘플씩) 모두 비탈에서 거의 멈추는 쪽으로 배웠고(10° 이상에서 0.06~0.17 m/s),
+  - **가파른 지형에서 이어서 학습해 봤지만 채택하지 않았습니다.** 두 번(100 만 샘플씩) 모두 비탈에서 거의 멈추는 쪽으로 배웠고(10° 이상에서 0.06\~0.17 m/s),
     terrain_00015 에서 목표 도달이 0.81 → 0.32 · 0.41 개/분으로 절반이 됐는데 전복은 7 → 3 · 10 회로 줄지 않았습니다. 속도를 깎기만 하는 조절기로는 이미 기운 차체를 되돌릴 수 없습니다.
   - 실제 임무 스택 주행 (`drive_governor:=true`, 1 회씩): terrain_00026 은 완료 — 3/3 수집, 장애물까지 최소 0.66 m, 최대 기울기 16.6°, 최고 1.46 m/s (고정 제한은 1.08 m/s), 조절기는 전진 명령의 평균 79 % 를 통과시켰습니다.
     terrain_00028 은 **건물을 들이받고 뒤집혔습니다** (위 "접근·탐색 주행 수정" 의 넷째 항목 — 지도 쪽 문제였지만, 조절기 모드는 더 빨라서 같은 실수가 더 크게 나옵니다). 그래서 기본값은 계속 꺼짐입니다.
@@ -344,479 +344,148 @@ supervisor ──▶ /<ns>/cmd_vel_raw ──▶ [drive_governor_node] ──▶
 - 평가 (200 회, `train_right.py --eval`): 넘어진 채 출발한 191 회 중 **98 %** 가 일어섰습니다 (옆으로 누운 124 회 중 98 %, 등으로 누운 67 회 중 99 %). 걸린 시간 중앙값 3.7 초, 90 % 가 4.7 초 안. 일어선 뒤 팔을 접어도 모두 서 있었습니다. 무작위 동작만으로는 23 %.
   바퀴 충돌 형상을 캡슐로 바꾼 뒤 같은 정책을 다시 평가하면 190 회 중 **96 %** (옆 118 회 중 97 %, 등 72 회 중 96 %), 중앙값 3.3 초입니다. 정책은 원본 바퀴로 학습한 그대로이고 다시 학습하지 않았습니다 (`--wheels mesh` 로 예전 조건 재현).
 - `self_right_node` 는 기울기 60° 초과로 2 초 멈춰 있으면 이 정책으로 팔을 움직이고, 그동안 supervisor 는 바퀴를 세우고 단계를 **RECOVERY** 로 바꿉니다 (웹 UI 의 PHASE 는 RECOVERY, TASK 는 `self-righting with arm (1/3)` → `folding arm after righting`; 일어서면 하던 단계로 복귀, 채취 중이었으면 EXPLORE 부터). 런치 `self_right:=true`.
-- 임무 스택 시험 (시뮬레이터 `--flip-at <초>` 로 강제로 뒤집음): 네 번 모두 일어섰고(2.9~6.5 초) 이후 3/3 수집과 귀환을 마쳤습니다 (terrain_00026 세 번은 학습 도중의 정책, terrain_00028 한 번은 최종 정책).
+- 임무 스택 시험 (시뮬레이터 `--flip-at <초>` 로 강제로 뒤집음): 네 번 모두 일어섰고(2.9\~6.5 초) 이후 3/3 수집과 귀환을 마쳤습니다 (terrain_00026 세 번은 학습 도중의 정책, terrain_00028 한 번은 최종 정책).
   강제가 아닌 실제 전복도 두 번 있었습니다 (terrain_00015, 구조물 둘레의 파인 턱 — 아래 "남은 문제"): 두 번 모두 약 5 초 만에 일어나 임무를 이어 갔습니다.
-- **남은 문제 — 위에서 안 보이는 턱**: terrain_00015 의 구조물은 땅을 0.55 m 파낸 자리에 놓여 있고 그 둘레가 26~35° 의 턱입니다. 위쪽에서 다가가면 깊이 카메라에 턱 아래가 보이지 않아 지도에 "못 본 칸" 으로 남고(위험으로 치지 않음), 로버가 그대로 내려가다 넘어집니다. 같은 자리에서 두 번 재현됐습니다. 지도의 경사 한계를 20° 로 낮춰도(`hazard_slope_deg:=20`) 막지 못했습니다 — 보이지 않는 것이 문제이기 때문입니다.
+- **남은 문제 — 위에서 안 보이는 턱**: terrain_00015 의 구조물은 땅을 0.55 m 파낸 자리에 놓여 있고 그 둘레가 26\~35° 의 턱입니다. 위쪽에서 다가가면 깊이 카메라에 턱 아래가 보이지 않아 지도에 "못 본 칸" 으로 남고(위험으로 치지 않음), 로버가 그대로 내려가다 넘어집니다. 같은 자리에서 두 번 재현됐습니다. 지도의 경사 한계를 20° 로 낮춰도(`hazard_slope_deg:=20`) 막지 못했습니다 — 보이지 않는 것이 문제이기 때문입니다.
 - 한계: 평지와 완만한 곳에서 뒤집힌 경우만 학습했습니다. 가파른 비탈이나 바위 틈에 낀 경우는 시험하지 않았습니다.
 - 추적 카메라(chase)는 차체 기울기를 따라가지 않게 바꿔서, 넘어지고 일어서는 모습이 웹 UI 에서 보입니다.
 
 ### 비탈 균형 정책 (`isaac_sim/rl/balance_env.py`, `isaac_drive/balance_node.py`) — 실험, **채택 안 함**
 
-구동 조절기에 "뒤로 빼기"(전진 배율 −0.25~1)와 "팔 균형추"(팔 13.5 kg / 전체 62.6 kg 을 뻗어 무게중심을 앞 5 cm · 뒤 13 cm · 좌우 8 cm 옮김)를 더해, 같은 중력·마찰의 가파른 지형(terrain_00015, 목표의 절반을 15° 이상 비탈에 둠)에서 150 만 샘플 학습했습니다. 결과는 쓰지 않는 쪽입니다.
+구동 조절기에 "뒤로 빼기"(전진 배율 −0.25\~1)와 "팔 균형추"(팔 13.5 kg / 전체 62.6 kg 을 뻗어 무게중심을 앞 5 cm · 뒤 13 cm · 좌우 8 cm 옮김)를 더해, 같은 중력·마찰의 가파른 지형(terrain_00015, 목표의 절반을 15° 이상 비탈에 둠)에서 150 만 샘플 학습했습니다. 결과는 쓰지 않는 쪽입니다.
 
 | terrain_00015, 로버 16 대 × 6 분 | 고정 제한 | 구동 조절기 | 균형 정책 |
 |---|---|---|---|
 | 목표 도달 (개/분) | 0.44 | 0.73 | 0.20 |
 | 전복 | 7 | 9 | **0** |
 | 기울기 30° 넘는 시간 | 1.5 % | 1.1 % | 9.7 % |
-| 25~28° 비탈에서의 속도 (m/s) | 0.12 | 0.09 | 0.05 |
-| 25~28° 비탈에서 헛도는 비율 | 87 % | 90 % | 79 % |
+| 25\~28° 비탈에서의 속도 (m/s) | 0.12 | 0.09 | 0.05 |
+| 25\~28° 비탈에서 헛도는 비율 | 87 % | 90 % | 79 % |
 
 - 전복 0 은 "거의 안 움직여서" 얻은 것입니다. 임무 스택 시험에서는 20° 비탈에서 앞이 45° 들린 채 70 초 동안 버티는 동작도 나왔습니다.
-- 이 표에서는 25° 이상의 비탈을 어떤 제어기로도 못 올랐습니다 (바퀴가 80~90 % 헛돎). 등판 한계는 `tan θ ≤ μ` 로 정해지고(중력은 양쪽에서 상쇄), 레골리스 마찰 0.58/0.52 면 헛돌기 시작한 뒤의 한계가 27.5° 입니다. 6 륜을 모두 구동하므로 팔로 무게를 옮겨도 접지력의 합은 같습니다.
-  **다만 이 표는 원본 바퀴 형상으로 잰 것입니다.** 그때는 구동 접지력이 설정의 60~65 % 만 나와서 실제 한계가 20° 근처였습니다 (위 "바퀴 접지력 교정"). 제어기를 학습시켜서가 아니라 바퀴 충돌 형상을 고쳐서 한계가 올라갔습니다.
+- 이 표에서는 25° 이상의 비탈을 어떤 제어기로도 못 올랐습니다 (바퀴가 80\~90 % 헛돎). 등판 한계는 `tan θ ≤ μ` 로 정해지고(중력은 양쪽에서 상쇄), 레골리스 마찰 0.58/0.52 면 헛돌기 시작한 뒤의 한계가 27.5° 입니다. 6 륜을 모두 구동하므로 팔로 무게를 옮겨도 접지력의 합은 같습니다.
+  **다만 이 표는 원본 바퀴 형상으로 잰 것입니다.** 그때는 구동 접지력이 설정의 60\~65 % 만 나와서 실제 한계가 20° 근처였습니다 (위 "바퀴 접지력 교정"). 제어기를 학습시켜서가 아니라 바퀴 충돌 형상을 고쳐서 한계가 올라갔습니다.
   같은 평가를 캡슐 바퀴로 다시 하면 (균형 정책은 다시 재지 않음): 고정 제한은 목표 도달 0.44 → **0.68** 개/분 · 주행 1586 → 2111 m · 전복 7 → 7, 구동 조절기는 0.73 → 0.81 개/분 · 전복 9 → 8 입니다. 더 멀리 가지만 **전복 수는 줄지 않았습니다.**
-  고정 제한 기준으로 10~20° 비탈에서의 속도는 0.18 → 0.37 m/s 로 올랐고, 20~25° 비탈에 머문 시간은 4 % → 19 % 로 늘었습니다 (더 위까지 올라가서 거기서 막힘 — 그 구간 속도는 0.11 m/s).
-- 전복은 지형 경사 19~23° 인 곳에서 차체가 30~50° 까지 들린 직후에 났습니다.
+  고정 제한 기준으로 10\~20° 비탈에서의 속도는 0.18 → 0.37 m/s 로 올랐고, 20\~25° 비탈에 머문 시간은 4 % → 19 % 로 늘었습니다 (더 위까지 올라가서 거기서 막힘 — 그 구간 속도는 0.11 m/s).
+- 전복은 지형 경사 19\~23° 인 곳에서 차체가 30\~50° 까지 들린 직후에 났습니다.
 - 그래서 넣은 것: 헛돎 감지(아래 "막힘 감지" — 명령한 거리의 15 % 도 못 가면 앞쪽을 위험으로 표시), 지도의 경사 한계를 바꾸는 런치 인자 `hazard_slope_deg`, 그리고 넘어졌을 때의 복구(위).
 - 실행하려면 `drive_governor:=balance` + 시뮬레이터 `--drive-limits off`. 비교 표는 `eval_drive.py --balance` 로 다시 만들 수 있습니다 (고정 제한 열은 같은 환경에서 팔을 home 에 둔 것, 구동 조절기 열은 팔 제어가 없는 원래 환경).
 
 ---
 
-## 🎯 시연 명령어 세트 (D-day 기준)
+## 실행 (터미널 3 개)
 
-> **구성**: 멀티 rover 2대 · `terrain_00026` · 로버당 광물 2개 채집 → RTB → MISSION_COMPLETE.
-> 터미널 제로 상태 (env 변수 없음) 에서 그대로 복붙. launch default 가 이 값들 그대로라 args 생략 가능.
+> 기본 구성: 로버 2 대 · `terrain_00026` · 로버당 광물 2 개 채집 → 기지 복귀 → MISSION_COMPLETE.
+> launch 기본값이 이 구성이라 인자를 생략해도 됩니다. 옵션은 위 각 절에 있습니다
+> (시뮬레이터: `--physics` `--grasp` `--gripper` `--wheel-collider` `--link-speed-cap` `--flip-at` …,
+> launch: `map_source` `self_right` `drive_governor` `hud_public` `hud_key` `hud_actions` …).
 
-### T1 — Isaac Sim (멀티 rover spawn)
+### T1 — Isaac Sim
 ```bash
 cd ~/dev_ws/rover_ws/src/a2_isaac
 tools/isaac-pypi isaac_sim/scripts/run_vehicle_v3.py \
     --terrain terrain_00026 --rovers rover_1 rover_2
 ```
-콘솔에서 다음 확인 후 T2:
+콘솔에 다음이 나오면 T2:
 ```
 [run_v3] ready — 2대 vehicle namespaces: /rover_1, /rover_2
 ```
+로버 1 대만, 화면 없이 가볍게: `--rovers rover_1 --no-viewport --render-every 2`.
 
-### T2 — Mission stack (협조 + Web HUD 자동)
+### T2 — 임무 스택 (+ Web HUD)
 ```bash
-source /opt/ros/humble/setup.bash
+source /opt/ros/jazzy/setup.bash
 source ~/dev_ws/rover_ws/install/setup.bash
 cd ~/dev_ws/rover_ws
-ros2 launch isaac_bringup mvp_multi.launch.py
+ros2 launch isaac_bringup mvp_multi.launch.py          # rovers:="rover_1 rover_2" collection_goal:=2
 ```
-default 그대로: `terrain_id=terrain_00026`, `collection_goal=2`, `rovers="rover_1 rover_2"`.
+빌드는 `/opt/ros/jazzy/setup.bash` 만 source 한 셸에서 `colcon build --symlink-install` (Python venv 를 켠 셸에서는 실패합니다).
 
 ### T3 — 브라우저
 ```bash
 xdg-open http://localhost:8088
 ```
-상단 `rover_1` / `rover_2` chip 토글로 STATUS · 카메라 전환. Coverage Map 은 두 rover 동시 표시.
+위쪽 `rover_1` / `rover_2` 탭으로 상태·카메라를 바꿉니다. 다른 기기나 인터넷 주소로 여는 방법은 "Web HUD — 주소로 열기 · 버튼 · 기록" 절.
 
-**종료**: T2 `Ctrl+C` → 전체 mission stack + Web HUD 정리.
-
----
-
-## 🚀 팀원이 main pull 후 해야 할 것 (Quick Start)
-
-### 1. 환경 셋업 (1회만)
-
-**Isaac Sim 5.1 PyPI binary** — [docs/SETUP_ISAAC_PYPI.md](docs/SETUP_ISAAC_PYPI.md) 참조:
-- 권장 venv 경로: `~/dev_ws/isaac_sim_pypi/venv`
-- ROS2 humble 워크스페이스: `~/dev_ws/isaac_sim/IsaacSim-ros_workspaces/humble_ws`
-- 다른 경로 사용 시 env var override: `ISAAC_PYPI_VENV`, `ISAAC_ROS2_WS`
-
-**.bashrc** — [docs/SETUP_BASHRC.md](docs/SETUP_BASHRC.md) 참조 (ROS humble + 워크스페이스 source + ROS_DOMAIN_ID).
-
-**ROS_DOMAIN_ID** (팀 합의 — 같은 LAN 충돌 방지):
-
-| 트랙 | 담당자 | ID |
-|:---:|:---:|:---:|
-| T1 | 김현중 | **111** |
-| T2 | 최진우 | **114** |
-| T3 | 이찬휘 | **112** |
-| T4 | 성선규 | **113** |
-| T5 | 이지민 | **115** |
-
-```bash
-export ROS_DOMAIN_ID=<본인 값>   # ~/.bashrc 에 추가
-```
-
-### 2. 빌드 (main pull 후 또는 코드 변경 시)
-
-```bash
-cd ~/dev_ws/rover_ws
-colcon build --symlink-install
-source install/setup.bash
-```
-
-> ✅ **별도 build 불필요한 자산** (모두 main 에 baked):
-> - `vehicle_v3.usd` (액션그래프 내장 로버) — `build_vehicle_v3.py` 재실행 불필요
-> - `terrain_00001~00023` (heightmap + obstacle + meta + epic obstacle 4종) — `mars_terrain_generator_v3.py` 재실행 불필요
-> - YOLO 모델 `mineral_yolo_best.pt` (5.3MB) — git tracked
-> - Doosan M0609 + RG2 gripper USDs
-> 빌드 스크립트는 USD/terrain 자체를 수정·재생성할 때만 실행.
-
-### 3. 시연 실행 (3 터미널)
-
-```bash
-# T1 — Isaac Sim (source 없이! tools/isaac-pypi wrapper 가 자체 처리)
-cd ~/dev_ws/rover_ws/src/a2_isaac
-tools/isaac-pypi isaac_sim/scripts/run_vehicle_v3.py --terrain terrain_00004
-
-# T2 — ROS2 노드 묶음 (perception + coverage + supervisor + arm + GT cheat)
-source /opt/ros/humble/setup.bash && source ~/dev_ws/rover_ws/install/setup.bash
-ros2 launch isaac_bringup mvp.launch.py
-
-# T3 — 카메라 view 2개 (body + wrist)
-source /opt/ros/humble/setup.bash && source ~/dev_ws/rover_ws/install/setup.bash
-ros2 launch isaac_bringup rqt_views.launch.py
-```
-
-→ rover 가 자율적으로 EXPLORE → APPROACH → PICK 반복 후, `collection_goal` (기본 5개) 도달
-또는 배터리 critical 시 **RETURN_TO_BASE** → 베이스캠프 (0,0) 도착 → **MISSION_COMPLETE**.
-
-#### 3-bis. 화성 환경 실험 (시연 X, 거동 검증·튜닝용)
-
-`run_vehicle_v4_test.py` — `run_vehicle_v3.py` 사본 + 화성 중력 3.72 m/s² 적용판.
-시연 main path 와 격리되어 있으니 자유롭게 실험 가능. `vehicle_v3.usd` 자체는 안 건드림.
-
-**Set A — gravity 만 override (Tier 0):**
-```bash
-# T1 — 9.81 → 3.72 만 변경, 다른 파라미터는 v3 그대로
-cd ~/dev_ws/rover_ws/src/a2_isaac
-tools/isaac-pypi isaac_sim/scripts/run_vehicle_v4_test.py \
-    --terrain terrain_00026 --rovers rover_1 rover_2 --no-tier1
-
-# T2 / T3 는 §3 의 mvp_multi / 브라우저 그대로
-```
-결과: WHEEL_VELOCITY_GAIN 2.0 이 지구 기준 튜닝값이라 중력 1/3 환경에서
-**rover 가 통통 튀다 전복**. "화성 = 단순히 중력만 바꾸면 안 됨" 검증.
-
-**Set B — gravity + Tier 1 파라미터 (안정 거동):**
-```bash
-# T1 — gravity + ACK_SCRIPT 화성용 교체 (WHEEL_VELOCITY_GAIN 0.7, STEERING_GAIN 0.8, cmd_vel LPF α=0.2)
-cd ~/dev_ws/rover_ws/src/a2_isaac
-tools/isaac-pypi isaac_sim/scripts/run_vehicle_v4_test.py \
-    --terrain terrain_00026 --rovers rover_1 rover_2
-
-# T2 — coverage max_lin / max_ang 도 화성 스케일로 다운
-source /opt/ros/humble/setup.bash && source ~/dev_ws/rover_ws/install/setup.bash
-cd ~/dev_ws/rover_ws
-ros2 launch isaac_bringup mvp_multi.launch.py max_lin:=1.0 max_ang:=0.6
-
-# T3 — 브라우저 그대로
-xdg-open http://localhost:8088
-```
-결과: 통통 튐 사라지고 안정 주행. 단 속도가 1 m/s 라 시연 시간 ↑.
-참고로 실제 NASA Curiosity 평균 ~1.5 cm/s — 우리 v4_test 도 여전히 ~30 배 빠름.
-
-> **시연 D-day 는 §3 의 지구용 (`run_vehicle_v3.py`) 만 사용**. v4_test 는 발표
-> talking point + 향후 "Mars-ready rover" 작업의 baseline.
-
-### 4. Mission Control UI (Web HUD)
-
-> SuperDOGE: `mvp_multi.launch.py` 의 HUD 는 화면 구성·버튼·접속 방법이 달라졌습니다 — 위 "Web HUD — 주소로 열기 · 버튼 · 기록" 을 보십시오. 아래는 원본 설명입니다.
-
-`mvp.launch.py` 가 띄우는 **mission_web_node** (Flask+SocketIO) + **web_video_server** 가
-SC2 풍 HUD 를 제공합니다.
-
-```bash
-# 1회만: 의존성 설치
-pip3 install --user flask-socketio eventlet
-sudo apt install -y ros-humble-web-video-server
-
-# 브라우저 접속
-xdg-open http://localhost:8088     # 또는 LAN 내 다른 PC: http://<host-ip>:8088
-```
-
-- **좌하단**: coverage minimap (canvas, rover 위치/베이스캠프 표시)
-- **중앙하단**: portrait + phase 배지 + battery/collected 바 + POS/YAW/SPEED/CMD/TASK/ERR
-- **우상단**: 광물 종류별 카운터 + collected/goal
-- **우하단**: 3×3 액션 그리드 (디자인 단계 — placeholder, 버튼 비활성)
-- **중앙 메인**: Isaac Sim overview (현재 sun cam placeholder) / Body YOLO / Wrist YOLO
-
-원격조종 (teleop_twist_keyboard) 과 AUTO/MANUAL/ESTOP 버튼 연동은 다음 단계.
-
-### 5. T5 정공법 졸업 (선택, 정확도 검증 완료 시점에)
-
-`mvp.launch.py` 의 `odom_to_estimated_pose` 노드를 빼고 별도 터미널에서:
-```bash
-ros2 launch isaac_bringup localization.launch.py
-```
-+ `arm_executor` / `mission_manager_node` 의 `odom_topic` 파라미터를 `/rover/estimated_odom` 으로 swap.
+**종료**: T2 에서 `Ctrl+C` → 임무 스택과 Web HUD 가 내려갑니다.
 
 ---
 
-> ℹ️ 명칭 명료성·책임 분리를 위한 **8개 패키지 구조**가 `main`에 정착 (2026-05-26 cleanup 으로 isaac_rl stub 정리). 설계 의도: [docs/STUDY_AND_PLAN.md](docs/STUDY_AND_PLAN.md) Part XI.
-
-## 트랙 ↔ 담당자
-
-| 트랙 | 담당자 | 영역 | GPU |
-|:---:|:----:|------|:---:|
-| **T1** | **김현중** | Environment (절차생성 지형, basecamp, Mars physics) | 5060 |
-| **T2** | **최진우** | Perception + M0609 (vision, manipulation) | 5080 |
-| **T3** | **이찬휘** | Driving (mission FSM, A*, coverage, PPO wrapper) — **Critical Path** | 5080 |
-| **T4** | **성선규** | Integration + PM (ROS2 wiring, UI, demo) — 사용자 본인 | 5070 Ti |
-| **T5** | **이지민** | Localization + Infra (TRN, EKF, sensor fusion) | 5080 |
-
-각 트랙의 onboarding: [docs/tracks/T*_BRIEF.md](docs/tracks/)
-
-## 현재 상태 (2026-05-26 발표 직전)
-
-🎉 **MVP 시연 모델 완성** — 화성 rover 자율 mineral 수집 mission 의 end-to-end loop:
-`EXPLORE → 발견 → APPROACH → PICK (FixedJoint snap) → CARGO swing → RELEASE → EXPLORE` 반복 동작 검증 완료.
-
-✅ **구현 완료 (시연 PASS)**:
-- **I1 지형 자산** — v2 생성기로 `terrain_00001`~`terrain_00022` 생성 (장애물·22 mineral·basecamp baked)
-- **vehicle_v3.usd** — 액션그래프 내장 자립 로버 (T1+T2+T3+T5 통합): ROS2 sensor 발행 + `/cmd_vel→Ackermann→휠` 구동 + `/arm/joint_command→m0609+finger` 제어 + `/grasp/command` FixedJoint snap + GT odom (dev cheat)
-- **isaac_drive** — `coverage_node` (BCD anchor sweep + A* obstacle 회피 + replan), `odom_to_estimated_pose` (GT cheat 어댑터), `minimap_publisher`
-- **isaac_perception** — `yolo_perception_node` (nav + wrist YOLO + depth backproject → mineral world XYZ)
-- **isaac_supervisor** — `mission_manager_node` (EXPLORE/APPROACH/PICK phase + cmd_vel mux + arm action client + lock-on)
-- **isaac_manipulation** — `arm_executor_node` (T2 DLS-IK 상태머신: HOME→APPROACH→DESCEND→pickup→HOME_MID→CARGO→release→HOME)
-- **isaac_localization (T5 이지민)** — `ekf_fusion` (wheel+imu+sun+TRN EKF), 8개 sensor/fusion 노드 구현. **정확도 추가 튠 필요** (졸업 작업)
-- **isaac_bringup** — `mvp.launch.py` (시연용 GT cheat 모드), `rqt_views.launch.py` (카메라 view 2개), `localization.launch.py` (T5 stack + EDL pose prior)
-- **isaac_interfaces** — msg + action 계약 정착
-
-⚠️ **시연용 cheat (졸업 시 청산)**:
-- `/ground_truth/odom` — `odom_to_estimated_pose` 가 `/rover/estimated_pose` 로 forwarding. T5 EKF stack 정확도 검증 완료되면 `localization.launch.py` 가 대체.
-- `ik_descend_dz=-0.40` — perception z bias (+47cm 평균) 보정. T2 depth 정확도 올리면 default 복귀.
-- FixedJoint snap grip — 30cm 광물 vs 4cm finger gap 비대칭 (hardware 한계). 시연용 hack 박제.
-
-⏳ **추가 작업 (시연 후)**:
-- T5 EKF: sun_yaw + TRN 정확도 튠
-- T2 perception: depth z bias 해결
-- T3 RL inference: PPO 정책 통합 (`driving_policy_node`)
-- 정리 대기 목록: [list_to_fix.md](list_to_fix.md)
-
-## 빠른 시작 (Day 1 셋업, ~5분)
-
-### 1. 워크스페이스 생성 + clone
-
-```bash
-# ROS2 워크스페이스 (~/dev_ws/rover_ws/) 만들고 src/ 안에 우리 repo clone
-mkdir -p ~/dev_ws/rover_ws/src
-cd ~/dev_ws/rover_ws/src
-
-# 폴더명을 a2_isaac으로 명시 (repo는 a-2_isaac이지만 우리 환경은 a2_isaac로 통일)
-git clone https://github.com/sungyu-sung/a-2_isaac.git a2_isaac
-
-cd a2_isaac
-```
-
-> ℹ️ 위치는 `~/dev_ws/rover_ws/` 권장 (문서 명령어 그대로 copy-paste 가능). 다른 위치도 기능적으로 무관 — [docs/SETUP_BASHRC.md](docs/SETUP_BASHRC.md) §위치 무관성 참조.
-
-### 2. 의존성 (한 번만)
-
-```bash
-# Python 의존성 (지형 생성기 + meta.json schema 검증 + PNG 오버뷰)
-pip install --user usd-core jsonschema numpy matplotlib
-
-# 트랙 owner별 추가 (필요한 사람만)
-# T3 이찬휘 — A* 빠른 구현
-pip install --user pyastar2d
-```
-
-### 3. ROS2 빌드 + source
-
-```bash
-cd ~/dev_ws/rover_ws
-
-# 첫 빌드 (~30초)
-colcon build --symlink-install
-
-# source (매 터미널 또는 .bashrc에 등록)
-source install/setup.bash
-
-# 검증 — 8개 패키지 등록 확인
-ros2 pkg list | grep isaac_
-# 예상 출력: isaac_bringup, isaac_drive, isaac_interfaces, isaac_localization,
-#           isaac_manipulation, isaac_perception, isaac_sim, isaac_supervisor
-```
-
-### 4. (선택) bashrc 설정
-
-매 터미널마다 source / cd / build 명령 안 치려면 **`~/.bashrc`에 한 번 등록**해두면 편함. 권장 alias + 환경 변수 + ROS_DOMAIN_ID 충돌 방지:
-
-→ **[docs/SETUP_BASHRC.md](docs/SETUP_BASHRC.md)** — 필수/권장/선택 단계별 + 트랙별 추가 alias
-
-### 5. Isaac Sim 시각 확인
-
-```bash
-# I1 지형은 이미 생성되어 있음 (terrain_00001~00003)
-# Isaac Sim에서 master scene 열기:
-isaac ~/dev_ws/rover_ws/src/a2_isaac/isaac_sim/worlds/mars_exploration_world.usd
-
-# 또는 다른 seed로 새 terrain 생성 (v3 = epic obstacle 4종 포함):
-cd ~/dev_ws/rover_ws/src/a2_isaac
-python3 isaac_sim/scripts/mars_terrain_generator_v3.py --seed 777 --terrain-id terrain_00004
-```
-
-→ I1 풀 가이드: [docs/interfaces/I1_TERRAIN_ASSETS.md](docs/interfaces/I1_TERRAIN_ASSETS.md)
-
-### 6. 시연 실행 (3 터미널, MVP 통합)
-
-> 📌 **사전 셋업 필수** — Isaac Sim 5.1 PyPI binary 환경: [docs/SETUP_ISAAC_PYPI.md](docs/SETUP_ISAAC_PYPI.md)
-> .bashrc / ROS_DOMAIN_ID: [docs/SETUP_BASHRC.md](docs/SETUP_BASHRC.md)
-
-```bash
-# ───── T1: Isaac Sim vehicle_v3 (source 없이, tools/isaac-pypi wrapper) ─────
-cd ~/dev_ws/rover_ws/src/a2_isaac
-tools/isaac-pypi isaac_sim/scripts/run_vehicle_v3.py --terrain terrain_00004
-
-# ───── T2: ROS2 노드 묶음 (perception + coverage + supervisor + arm + GT cheat) ─────
-# 새 터미널, source 필요
-source /opt/ros/humble/setup.bash && source ~/dev_ws/rover_ws/install/setup.bash
-ros2 launch isaac_bringup mvp.launch.py
-
-# ───── T3: 카메라 view 2개 (body + wrist) ─────
-# 새 터미널, source 필요
-source /opt/ros/humble/setup.bash && source ~/dev_ws/rover_ws/install/setup.bash
-ros2 launch isaac_bringup rqt_views.launch.py
-```
-
-→ rover 가 자율적으로 EXPLORE → mineral 발견 → APPROACH → PICK → CARGO RELEASE 반복.
-
-### 시연 시나리오별 launch — 자세히는 [docs/DEMO_COMMANDS.md](docs/DEMO_COMMANDS.md)
-
-```bash
-# 단일 rover GT cheat baseline
-ros2 launch isaac_bringup mvp.launch.py collection_goal:=5
-
-# 단일 rover T5 정공법 (GT 없이 EKF stack)
-ros2 launch isaac_bringup integrated_localization.launch.py collection_goal:=1
-
-# 멀티 rover (2대 동시 운용 + 협조 + Web HUD 멀티 추적)
-ros2 launch isaac_bringup mvp_multi.launch.py collection_goal:=1
-
-# T5 EKF stack 단독 (open-loop 검증)
-ros2 launch isaac_bringup localization.launch.py
-```
-
-### 시연용 → 정공법 졸업 경로
-
-| Cheat | mvp.launch.py | 졸업 launch |
-|---|---|---|
-| GT odom (`odom_to_estimated_pose`) | ✓ default | `localization.launch.py` 실행 (T5 EKF) |
-| `ik_descend_dz=-0.40` (perception z bias 보정) | ✓ default | T2 depth 정확도 향상 시 launch param 제거 |
-| FixedJoint snap grip | ✓ default | (hardware 한계 — 영구) |
-
-## Workspace 구조 (2026-05-26 시연 시점)
-
-⭐ = 시연용 (mvp.launch.py / T1~T3 명령) 핵심 파일.
+## Workspace 구조
 
 ```text
 a2_isaac/
-├─ README.md                              # ⭐ 이 문서 (Quick Start 포함)
-├─ list_to_fix.md                         # 시연 후 작업 목록 + 졸업 경로
-├─ .gitignore                             # build/cache/temp + .pt 예외 등록
+├─ README.md                              # 이 문서
+├─ list_to_fix.md                         # 원본 프로젝트의 작업 목록 (기록용)
 │
-├─ docs/                                  # 설계 문서 + 가이드 + 트랙 onboarding
-│  ├─ STUDY_AND_PLAN.md                   # 전체 설계 의도
-│  ├─ SETUP_BASHRC.md                     # ⭐ ~/.bashrc + ROS_DOMAIN_ID 가이드
-│  ├─ SETUP_ISAAC_PYPI.md                 # ⭐ Isaac Sim PyPI venv 셋업
-│  ├─ TREE_CLEANUP_PLAN.md                # 정리 작업 기록 (참조용 archive)
-│  ├─ interfaces/                         # I1~I5 인터페이스 계약 (msg/action 규격)
-│  ├─ tracks/                             # 트랙별 onboarding (T1~T5_BRIEF.md)
-│  ├─ pm_tools/                           # PM 운영 (KICKOFF/DAILY/DECISIONS)
-│  ├─ system_design/                      # 아키텍처 평가 (ARCHITECTURE_EVAL_*)
-│  └─ troubleshooting/                    # 진단 기록 (camera regression 등)
+├─ docs/                                  # 원본 프로젝트의 설계 문서·발표 자료 (기록용)
+│  ├─ STUDY_AND_PLAN.md, DEMO_COMMANDS.md
+│  ├─ SETUP_ISAAC_PYPI.md, SETUP_BASHRC.md # Isaac Sim PyPI venv · bashrc 셋업
+│  ├─ interfaces/                         # msg/action 규격
+│  ├─ system_design/, troubleshooting/, tracks/, pm_tools/, slides/, final/, legacy/
+│  └─ *.svg                               # 시스템 구조도 · 임무 흐름도
 │
 ├─ tools/
-│  ├─ isaac-pypi                          # ⭐ Isaac Sim PyPI 환경 wrapper (T1 entry)
-│  └─ README.md                           # tools/ 가이드
+│  ├─ isaac-pypi                          # Isaac Sim PyPI 환경으로 스크립트를 돌리는 wrapper
+│  └─ hud_tunnel.sh                       # 이미 떠 있는 HUD 를 Cloudflare 터널로 내보내기
 │
-├─ isaac_bringup/                         # ① 진입점 — launch 파일 모음 (T4)
-│  ├─ launch/
-│  │  ├─ mvp.launch.py                    # ⭐ 단일 rover GT cheat MVP (Web HUD 자동)
-│  │  ├─ mvp_multi.launch.py              # ⭐ 멀티 rover 통합 (협조 + Web HUD 멀티 추적)
-│  │  ├─ integrated_localization.launch.py # 단일 rover T5 정공법 (GT 없이 EKF)
-│  │  ├─ localization.launch.py           # T5 EKF stack 단독 (open-loop 검증)
-│  │  ├─ rqt_views.launch.py              # body+wrist 카메라 (단일)
-│  │  └─ rqt_views_multi.launch.py        # 4창 카메라 (멀티 rover_1/2 × body/wrist)
-│  └─ rviz/localization_map.rviz
+├─ isaac_bringup/                         # ① launch 모음
+│  └─ launch/
+│     ├─ mvp_multi.launch.py              # ★ 임무 스택 전체 (로버 1~N 대 + Web HUD)
+│     ├─ mvp.launch.py                    # 단일 로버 (namespace 없음, 원본 구성)
+│     ├─ integrated_localization.launch.py, localization.launch.py   # EKF 위치 추정 (원본)
+│     └─ rqt_views.launch.py, rqt_views_multi.launch.py
 │
-├─ isaac_sim/                             # ② Isaac Sim 환경 + 자산 (T1)
+├─ isaac_sim/                             # ② 시뮬레이터 · 자산 · 학습
 │  ├─ assets/
-│  │  ├─ vehicle/
-│  │  │  └─ vehicle_v3.usd                # ⭐ 액션그래프 내장 자립 로버 (시연 사용)
-│  │  ├─ markers/tier2_mineral/           # ⭐ 광물 mesh + texture (T2 YOLO 학습 대상)
-│  │  ├─ epic_obstacles/                  # SC2 풍 landmark obstacle 4종 (sun_yaw/TRN 특징점)
-│  │  ├─ generated_terrains/
-│  │  │  └─ terrain_00001~00023/          # 23개 v3 terrain (epic obstacle 통일)
-│  │  ├─ doosan-robot2/, onrobot_rg2/, rover/  # arm + gripper + rover 자산
-│  ├─ worlds/                             # terrain_NNNNN.usd + mars_exploration_world.usd
-│  └─ scripts/
-│     ├─ run_vehicle_v3.py                # ⭐ 단일/멀티 (--rovers) 런처
-│     ├─ build_vehicle_v3.py              # vehicle_v3.usd 빌더 (USD 수정 시만)
-│     ├─ mars_terrain_generator_v3.py     # ⭐ terrain 생성기 (epic obstacle 포함)
-│     ├─ bake_m0609_home.py               # M0609 home pose 베이크 도구
-│     └─ test_grip_unit.py                # grip 단위 테스트
+│  │  ├─ vehicle/vehicle_v3.usd           # ★ 로버 모델 (액션 그래프 내장)
+│  │  ├─ generated_terrains/terrain_NNNNN/ # 지형 (heightmap · meta · 정답 장애물 지도)
+│  │  ├─ markers/, rocks/, epic_obstacles/, textures/   # 광물 · 바위 · 구조물
+│  │  └─ doosan-robot2/, onrobot_rg2/, d455/, rover/    # 팔 · 원본 그리퍼 · 카메라
+│  ├─ worlds/                             # terrain_NNNNN.usd
+│  ├─ scripts/
+│  │  ├─ run_vehicle_v3.py                # ★ 시뮬레이터 실행 (단일/멀티 --rovers)
+│  │  ├─ planet_physics.py, drive_limits.py   # 화성 중력·마찰, 중력에 맞춘 구동 제한
+│  │  ├─ wheel_colliders.py               # 캡슐 바퀴, link 속도 상한 해제
+│  │  ├─ wide_gripper.py, contact_grasp.py    # 넓은 집게, 접촉 조건부 부착
+│  │  ├─ asset_paths.py                   # 다른 PC 절대경로로 저장된 재질 경로 고치기
+│  │  ├─ render_portrait.py               # HUD 초상화 찍기
+│  │  ├─ check_planet_physics.py, test_grip_unit.py
+│  │  ├─ mars_terrain_generator_v3.py (v4, v5), build_vehicle_v3.py, bake_m0609_home.py
+│  │  └─ legacy/
+│  └─ rl/                                 # 강화학습 (PPO)
+│     ├─ drive_env.py, righting_env.py, balance_env.py   # 구동 조절 · 넘어짐 복구 · 비탈 균형 환경
+│     ├─ ppo.py, train_drive.py, train_right.py, eval_drive.py
+│     ├─ probe_traction.py, probe_slope.py                 # 접지력 · 등판 한계 측정
+│     └─ checkpoints/                     # 학습한 가중치 (.pt) 와 학습 기록
 │
-├─ isaac_drive/                           # ③ 주행 (T3 — Critical Path)
+├─ isaac_drive/                           # ③ 주행
 │  ├─ isaac_drive/
-│  │  ├─ coverage_node.py                 # ⭐ BCD anchor sweep + A* obstacle 회피
-│  │  ├─ odom_to_estimated_pose.py        # GT cheat 어댑터 (T5 졸업 시 폐기)
-│  │  ├─ minimap_publisher.py             # /mission/minimap 시각화
-│  │  └─ navigation/                      # A*, BCD, fog_map, terrain_loader 모듈
-│  └─ scripts/                            # state_writer + viewer (matplotlib 보조)
+│  │  ├─ coverage_node.py                 # 탐색 경로 (BCD sweep + A*)
+│  │  ├─ hazard_map_node.py               # ★ 깊이 카메라로 주행 중에 위험 지도 만들기 + 막힘 감지
+│  │  ├─ drive_governor_node.py, balance_node.py, self_right_node.py   # 학습한 정책을 쓰는 노드
+│  │  ├─ minimap_publisher.py, odom_to_estimated_pose.py
+│  │  └─ navigation/                      # hazard_map · online_map · path_planner(A*) · navigator ·
+│  │                                      # bcd_planner · fog_map · *_policy (numpy 추론) 등
+│  └─ policies/                           # drive_governor.npz · self_right.npz · balance.npz
 │
-├─ isaac_perception/                      # ④ 인지 (T2)
-│  ├─ isaac_perception/
-│  │  ├─ yolo_perception_node.py          # ⭐ YOLO + depth backproject → mineral world XYZ
-│  │  └─ yolo_mineral_detector.py         # YOLO wrapper class
-│  └─ models/mineral_yolo_best.pt         # ⭐ 학습된 YOLO 모델 (5.3MB)
+├─ isaac_perception/                      # ④ 인지
+│  ├─ isaac_perception/yolo_perception_node.py   # ★ YOLO + 깊이 → 광물 world 좌표
+│  └─ models/mineral_yolo_best.pt
 │
-├─ isaac_supervisor/                      # ⑤ mission FSM + Web HUD (T4)
+├─ isaac_supervisor/                      # ⑤ 임무 관리 + Web HUD
 │  ├─ isaac_supervisor/
-│  │  ├─ mission_manager_node.py          # ⭐ EXPLORE/APPROACH/PICK/RTB FSM + 멀티 rover 협조
-│  │  ├─ mission_web_node.py              # ⭐ SC2 풍 Web HUD (Flask + SocketIO, 멀티 추적)
+│  │  ├─ mission_manager_node.py          # ★ EXPLORE/APPROACH/PICK/RTB/RECOVERY/ESTOP, 운영자 명령
+│  │  ├─ mission_web_node.py              # ★ Web HUD 서버 (영상 중계 · 버튼 · 접속 키 · 터널)
 │  │  └─ battery_monitor_node.py
-│  └─ web/                                # HTML/CSS/JS (rover selector + minimap canvas)
+│  └─ web/                                # templates/index.html · static/{css,js,img}
 │
-├─ isaac_manipulation/                    # ⑥ M0609 arm (T2)
+├─ isaac_manipulation/                    # ⑥ 팔 (Doosan M0609)
 │  └─ isaac_manipulation/
-│     ├─ arm_executor_node.py             # ⭐ DLS-IK 상태머신 + /grasp/command FixedJoint
-│     └─ kinematics.py                    # M0609 DH 파라미터 + DLS-IK
+│     ├─ arm_executor_node.py             # ★ 집기 동작 (IK · 손목 카메라 보정 · 마찰 파지 · 취소/HOME)
+│     └─ kinematics.py                    # DH 파라미터 + DLS-IK
 │
-├─ isaac_localization/                    # ⑦ localization (T5, 정확도 졸업 대기)
-│  └─ isaac_localization/
-│     ├─ ekf_fusion.py                    # ⭐ EKF (wheel+imu+sun+TRN) + EDL prior
-│     ├─ trn.py                           # Terrain Relative Navigation
-│     ├─ localization_node.py
-│     ├─ terrain_map_publisher.py
-│     └─ sensors/                         # wheel_odom + imu_integrator + sun_yaw + splitter
+├─ isaac_localization/                    # ⑦ 위치 추정 (원본의 EKF·TRN. 지금 임무 스택은 정답 odom 을 씀)
 │
-├─ isaac_interfaces/                      # ⑧ msg/action 계약 (T4)
-│  ├─ msg/                                # MissionState, Detection, BatteryState 등
-│  └─ action/ExecuteArmTask.action
-│
-└─ temp/                                  # (gitignored) 개인 임시 작업
+└─ isaac_interfaces/                      # ⑧ msg/action (MissionState, Detection, ExecuteArmTask …)
 ```
-
-> ✅ = 동작, ⏳ = stub (트랙 owner가 채울 자리), 📦 = binary asset
-
-## 패키지 매핑 (2026-05-26 cleanup 기준 — 8개)
-
-| 패키지 | 트랙 | 담당자 | 주요 노드 | 상태 |
-|--------|:----:|:-----:|----------|:----:|
-| `isaac_bringup` | T4 | 성선규 | mvp / mvp_multi / integrated_localization / localization / rqt_views(_multi) | ✅ |
-| `isaac_sim` | T1 | 김현중 | terrain v3 generator + vehicle_v3 빌더 + 23 terrain | ✅ |
-| `isaac_perception` | T2 | 최진우 | `yolo_perception_node` (YOLO + depth backproject) | ✅ |
-| `isaac_drive` | T3 | 이찬휘 | `coverage_node` (BCD + A*) + navigation 모듈 + `odom_to_estimated_pose` | ✅ |
-| `isaac_supervisor` | T4 | 성선규 | `mission_manager_node` (FSM + 협조), `mission_web_node`, `battery_monitor_node` | ✅ |
-| `isaac_manipulation` | T2 | 최진우 | `arm_executor_node` (DLS-IK + grasp snap) | ✅ |
-| `isaac_localization` | T5 | 이지민 | `ekf_fusion_node`, `trn_node`, `sun_yaw_node`, `wheel_odom_node` 등 9 노드 | ⏳ 정확도 졸업 |
-| `isaac_interfaces` | T4 | 성선규 | MissionState, Detection, BatteryState, ExecuteArmTask | ✅ |
-
-> 2026-05-26 cleanup: `isaac_rl` 패키지 (PPO stub) + 6 outdated launch + `sim_bridge_node` (mock) + 옛 v2 빌더 도구 모두 정리.
-
-## 핵심 문서 인덱스
-
-| 누가 보나 | 무엇 | 위치 |
-|----------|------|------|
-| 신규 합류자 (5명) | 본인 트랙 onboarding | `docs/tracks/T{1-5}_BRIEF.md` |
-| 모든 개발자 (Day 1) | **bashrc 셋업 가이드** | [docs/SETUP_BASHRC.md](docs/SETUP_BASHRC.md) |
-| Claude Code 사용 시 | 자동 로드 context | `docs/tracks/T{1-5}_CLAUDE.md` |
-| 모든 개발자 | 5개 인터페이스 계약 | [docs/interfaces/INTERFACE_CONTRACTS.md](docs/interfaces/INTERFACE_CONTRACTS.md) |
-| 김현중, 이지민 (좌표계 합의) | I1 풀 가이드 | [docs/interfaces/I1_TERRAIN_ASSETS.md](docs/interfaces/I1_TERRAIN_ASSETS.md) |
-| meta.json 필드 참고 | 라인별 주석 | [docs/interfaces/META_JSON_FIELDS.md](docs/interfaces/META_JSON_FIELDS.md) |
-| 성선규 (PM) | 매일/주간 운영 | `docs/pm_tools/` |
-| 모든 개발자 | 전체 설계 의도 | [docs/STUDY_AND_PLAN.md](docs/STUDY_AND_PLAN.md) |
-
-## Architecture
-
-- 전체 시스템 아키텍처: [system_architecture_full.svg](docs/flowcharts/system_architecture_full.svg)
-- 미션 시나리오: [project_overview_flowchart.svg](docs/flowcharts/project_overview_flowchart.svg) · [PNG](docs/flowcharts/project_overview_flowchart_landscape.png)
-- 개발 일정 timeline: [development_timeline.svg](docs/flowcharts/development_timeline.svg) · [PNG](docs/flowcharts/development_timeline.png)
