@@ -44,7 +44,8 @@ def _default_terrain_root() -> str:
 
 def _rover_group(ns: str, terrain_dir: str, collection_goal: int,
                  arrive_r: float, fringe_r: float, reveal_radius: float,
-                 map_source: str = "online", governor: bool = False):
+                 map_source: str = "online", governor: bool = False,
+                 self_right: bool = False):
     """단일 rover 의 5 노드 묶음 — 토픽 모두 /<ns>/... prefix.
 
     terrain_dir 는 T1 Isaac Sim 의 --terrain 인자와 동일한 terrain 폴더 경로.
@@ -68,6 +69,21 @@ def _rover_group(ns: str, terrain_dir: str, collection_goal: int,
                 "joint_topic":   f"{nsp}/joint_states_raw",
             }],
         ))
+    if self_right:
+        # 넘어지면 팔로 다시 세운다 (학습한 정책). 세우는 동안 supervisor 는 바퀴 정지.
+        mapping.append(Node(
+            package="isaac_drive",
+            executable="self_right_node",
+            name="self_right_node",
+            namespace=ns,
+            output="screen",
+            parameters=[{
+                "odom_topic":          f"{nsp}/ground_truth/odom",
+                "joint_topic":         f"{nsp}/joint_states_raw",
+                "joint_command_topic": f"{nsp}/arm/joint_command",
+                "active_topic":        f"{nsp}/righting/active",
+            }],
+        ))
     if map_source == "online":
         # 깊이 카메라 → 위험 지도 (미리 만든 obstacle_grid 대신).
         mapping.append(Node(
@@ -84,6 +100,7 @@ def _rover_group(ns: str, terrain_dir: str, collection_goal: int,
                 "joint_topic":      f"{nsp}/joint_states_raw",
                 "detections_topic": f"{nsp}/perception/detections",
                 "map_topic":        f"{nsp}/hazard_map",
+                "cmd_topic":        f"{nsp}/cmd_vel",
             }],
         ))
     return mapping + [
@@ -171,6 +188,7 @@ def _rover_group(ns: str, terrain_dir: str, collection_goal: int,
                 "approach_engage_dist_m": 30.0,
                 "approach_lin_speed": 1.2,
                 "coverage_cmd_topic": f"{nsp}/coverage/cmd_vel_raw",
+                "righting_active_topic": f"{nsp}/righting/active",
                 "cmd_vel_topic":      f"{nsp}/cmd_vel_raw" if governor else f"{nsp}/cmd_vel",
                 "detections_topic":   f"{nsp}/perception/detections",
                 "odom_topic":         f"{nsp}/ground_truth/odom",
@@ -240,6 +258,8 @@ def _launch_setup(context, *args, **kwargs):
     map_source = LaunchConfiguration("map_source").perform(context).strip().lower()
     governor = LaunchConfiguration("drive_governor").perform(context).strip().lower() in (
         "true", "1", "yes")
+    self_right = LaunchConfiguration("self_right").perform(context).strip().lower() in (
+        "true", "1", "yes")
     print(f"[mvp_multi] terrain_dir={terrain_dir}  rovers={rovers}  "
           f"collection_goal={collection_goal} (per rover)  map_source={map_source}  "
           f"drive_governor={governor}")
@@ -247,7 +267,7 @@ def _launch_setup(context, *args, **kwargs):
     for ns in rovers:
         nodes.extend(_rover_group(ns, terrain_dir, collection_goal,
                                   arrive_r, fringe_r, reveal_radius, map_source,
-                                  governor))
+                                  governor, self_right))
 
     # Web HUD — 단일 인스턴스가 모든 rover namespace 추적 (옵션 X 단계 2).
     # mission_web_node 의 rover_namespaces param 으로 ns 리스트 전달.
@@ -329,5 +349,9 @@ def generate_launch_description() -> LaunchDescription:
                         "차체 상태에 맞춰 깎는다. 시뮬레이터를 --drive-limits off 로 "
                         "띄워야 한다 (안 그러면 고정 제한이 먼저 깎는다). "
                         "false: 시뮬레이터의 고정 제한만 사용."),
+        DeclareLaunchArgument(
+            "self_right", default_value="false",
+            description="true: 로버가 넘어지면 팔로 다시 세운다 (self_right_node, "
+                        "학습한 정책 policies/self_right.npz 필요)."),
         OpaqueFunction(function=_launch_setup),
     ])

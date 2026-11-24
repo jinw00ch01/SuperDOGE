@@ -143,6 +143,7 @@ class SlewLimiter:
 
 
 class RoverDriveEnv:
+    SELF_COLLISION = False
     def __init__(self, app, terrain: str = "terrain_00026", num_envs: int = 16,
                  control_hz: float = 15.0, episode_sec: float = 20.0, seed: int = 0,
                  friction_range=(0.6, 1.1), planet: str = "mars",
@@ -215,6 +216,11 @@ class RoverDriveEnv:
                 art_root = str(prim.GetPath())
                 break
         rel = art_root[len(roots[0]):]
+        if self.SELF_COLLISION:               # 팔이 차체를 뚫고 지나가지 못하게 (세우기 학습)
+            from pxr import PhysxSchema
+            for r in roots:
+                PhysxSchema.PhysxArticulationAPI.Apply(
+                    stage.GetPrimAtPath(r + rel)).CreateEnabledSelfCollisionsAttr(True)
         self.art = Articulation(prim_paths_expr=f"/World/Rover_.*{rel}", name="rovers")
         self.world.scene.add(self.art)
         self.world.reset()
@@ -286,6 +292,7 @@ class RoverDriveEnv:
     #           아니면 최대 속도 × cos) 으로 지형을 모른 채 목표점을 향한다.
     NAV_MAX_LIN, NAV_MAX_ANG, NAV_KP, NAV_POINT_TURN = 3.0, 1.5, 2.0, math.radians(25.0)
     GOAL_TOL = 0.6
+    NAV_TURN_DECEL = 0.4          # 0 이면 예전 식 (오차 비례만)
 
     def _sample_commands(self, idx) -> None:
         k = len(idx)
@@ -356,6 +363,10 @@ class RoverDriveEnv:
         err = np.arctan2(d[:, 1], d[:, 0]) - yaw
         err = (err + math.pi) % (2.0 * math.pi) - math.pi
         self.w_des[gi] = np.clip(self.NAV_KP * err, -self.NAV_MAX_ANG, self.NAV_MAX_ANG)
+        if self.NAV_TURN_DECEL > 0.0:          # Navigator 와 같은 제자리 회전 감속 (지나침 방지)
+            cap = np.sqrt(2.0 * self.NAV_TURN_DECEL * np.abs(err)) / 1.9
+            spin = np.abs(err) > self.NAV_POINT_TURN
+            self.w_des[gi] = np.where(spin, np.clip(self.w_des[gi], -cap, cap), self.w_des[gi])
         self.v_des[gi] = np.where(np.abs(err) > self.NAV_POINT_TURN, 0.0,
                                   self.NAV_MAX_LIN * np.cos(err))
 

@@ -381,6 +381,21 @@ class CamChannel:
             self._log(f"depth invalid in bbox centre px=({px:.0f},{py:.0f})", "warn")
             return zero
         z = float(np.median(valid))
+        # 먼 광물은 비스듬히 내려다보여서, 화소 몇 개 아래는 앞쪽 땅(더 가까움)이고
+        # 몇 개 위·옆은 뒤쪽 배경(더 멂)이다. 중앙값은 그쪽으로 끌려간다. 광물
+        # 표면은 깊이가 거의 같은 화소 무리로 나오므로, bbox 가운데 60% 에서 깊이가
+        # 가장 촘촘히 모인 구간(폭 = 0.3 m 또는 거리의 4%)을 찾아 그 중앙값을 쓴다.
+        a0 = int(np.clip(round(px - 0.3 * bw), 0, w - 1))
+        a1 = int(np.clip(round(px + 0.3 * bw), a0, w - 1))
+        c0 = int(np.clip(round(py - 0.3 * bh), 0, h - 1))
+        c1 = int(np.clip(round(py + 0.3 * bh), c0, h - 1))
+        box = depth[c0:c1 + 1, a0:a1 + 1]
+        box = np.sort(box[np.isfinite(box) & (box > 0.05) & (box < 50.0)])
+        if box.size >= 6:
+            width = np.maximum(0.3, 0.04 * box)
+            hi = np.searchsorted(box, box + width, side="right")
+            k = int(np.argmax(hi - np.arange(box.size)))
+            z = float(np.median(box[k:hi[k]]))
 
         # Camera optical frame (z forward, x right, y down). depth 는 광축 방향 거리.
         pt = np.array([(px - self.intr.cx) * z / self.intr.fx,

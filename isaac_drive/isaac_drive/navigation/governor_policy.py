@@ -98,7 +98,7 @@ class GovernorPolicy:
                      for k in data.files if not (k[0] in "wb" and k[1:].isdigit())}
 
     def __call__(self, obs: np.ndarray) -> np.ndarray:
-        h = np.asarray(obs, dtype=np.float64).reshape(-1, OBS_DIM)
+        h = np.asarray(obs, dtype=np.float64).reshape(-1, self.layers[0][0].shape[1])
         for w, b in self.layers:
             h = np.tanh(h @ w.T + b)
         return h

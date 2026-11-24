@@ -25,6 +25,8 @@ _p.add_argument("--steep-goal-frac", type=float, default=0.0,
                 help="목표점 추종 에피소드에서 목표를 15° 이상 비탈에 두는 비율")
 _p.add_argument("--friction-every", type=int, default=4,
                 help="몇 번 갱신마다 지면 마찰 배율을 새로 뽑을지")
+_p.add_argument("--balance", action="store_true",
+                help="균형 정책(balance_env: 뒤로 빼기 + 팔 균형추)을 학습한다")
 args, _ = _p.parse_known_args()
 
 from isaacsim import SimulationApp  # noqa: E402
@@ -35,7 +37,11 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from drive_env import ACT_DIM, OBS_DIM, RoverDriveEnv  # noqa: E402
+if args.balance:
+    from balance_env import ACT_DIM, OBS_DIM  # noqa: E402
+    from balance_env import BalanceEnv as RoverDriveEnv  # noqa: E402
+else:
+    from drive_env import ACT_DIM, OBS_DIM, RoverDriveEnv  # noqa: E402
 from ppo import ActorCritic, RolloutBuffer, ppo_update  # noqa: E402
 
 torch.set_num_threads(2)

@@ -29,6 +29,7 @@ setup(
             "odom_to_estimated_pose = isaac_drive.odom_to_estimated_pose:main",
             "hazard_map_node = isaac_drive.hazard_map_node:main",
             "drive_governor_node = isaac_drive.drive_governor_node:main",
+            "self_right_node = isaac_drive.self_right_node:main",
         ],
     },
 )

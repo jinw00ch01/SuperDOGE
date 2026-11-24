@@ -88,6 +88,49 @@ def _stop_dist_for(class_name: str, default_m: float) -> float:
     return float(CLASS_STOP_DIST_M.get(class_name, default_m))
 
 
+def turn_rate_cap(heading_err: float, decel: float = 0.4, spin_gain: float = 1.9) -> float:
+    """남은 각도 안에서 멈출 수 있는 회전 명령의 상한 (rad/s).
+
+    방향 오차가 클 때 로버는 거의 제자리에서 돈다. 시뮬레이터가 각가속도를
+    제한하고(화성 0.99 rad/s²) 명령의 약 1.9 배로 돌기 때문에, 오차에 비례한
+    명령만 주면 목표 방향을 지나쳤다 되돌아오기를 반복한다 (좌우로 흔들림).
+    Navigator 의 제자리 회전과 같은 식.
+    """
+    return math.sqrt(2.0 * decel * abs(heading_err)) / spin_gain
+
+
+def confirm_hits(seen: list, items, now_ns: int, need: int, radius_m: float,
+                 window_ns: int) -> list:
+    """같은 자리에서 여러 번 본 검출만 통과시킨다.
+
+    seen: [[class, x, y, 횟수, 마지막으로 본 시각]] — 호출할 때마다 갱신된다.
+    items: [(class, x, y)]. return: items 와 같은 길이의 bool 목록.
+    위치 추정은 가끔 한 번씩 몇 m 튄다 (깊이 화소가 광물 뒤 배경을 잡을 때).
+    그런 값이 그대로 목표가 되면 로버는 엉뚱한 곳으로 가고, 목표 고정(lock)이
+    그 값에 걸려 진짜 위치의 검출을 "다른 광물" 로 버린다.
+    """
+    seen[:] = [s for s in seen if now_ns - s[4] < window_ns]
+    r2 = radius_m * radius_m
+    out = []
+    for cls, x, y in items:
+        best, bd = None, r2
+        for s in seen:
+            if s[0] != cls:
+                continue
+            dd = (s[1] - x) ** 2 + (s[2] - y) ** 2
+            if dd < bd:
+                best, bd = s, dd
+        if best is None:
+            best = [cls, x, y, 0, now_ns]
+            seen.append(best)
+        best[1] = 0.5 * best[1] + 0.5 * x
+        best[2] = 0.5 * best[2] + 0.5 * y
+        best[3] += 1
+        best[4] = now_ns
+        out.append(best[3] >= need)
+    return out
+
+
 class MissionManagerNode(Node):
     def __init__(self) -> None:
         super().__init__("mission_manager_node")
@@ -101,6 +144,16 @@ class MissionManagerNode(Node):
         # pick 이 실패한 지점(오검출 등) 을 이 시간 동안 후보에서 제외 — 같은
         # 허상 target 으로 무한 재시도하는 것 방지. 반경은 post_pick_skip_radius_m.
         self.declare_parameter("failed_pick_ignore_sec", 60.0)
+        # 지도 없는 주행(map_source=online)에서는 광물도 위험 칸으로 잡힌다. 그 광물을
+        # 집으러 갈 때는 목표 주변 이 반경의 위험 칸을 없는 것으로 치고 계획한다.
+        self.declare_parameter("approach_target_clear_m", 0.5)
+        # 같은 자리(반경 안)에서 이 횟수만큼 본 검출만 목표 후보로 삼는다.
+        # 한 번 튄 위치 추정이 목표가 되는 것을 막는다. 1 이면 예전 동작.
+        self.declare_parameter("target_confirm_hits", 3)
+        self.declare_parameter("target_confirm_radius_m", 1.0)
+        self.declare_parameter("target_confirm_window_sec", 3.0)
+        # 계획이 목표에 못 미친 곳에서 끝났을 때 (목표 주변이 막힘) 다시 계획해 보는 주기.
+        self.declare_parameter("approach_short_plan_retry_sec", 1.0)
         self.declare_parameter("arm_action_name", "/execute_arm_task")
         self.declare_parameter("enable_arm_action", True)
         self.declare_parameter("approach_lin_speed", 0.6)
@@ -119,6 +172,8 @@ class MissionManagerNode(Node):
         self.declare_parameter("state_topic", "/mission/state")
         self.declare_parameter("mode_topic", "/mission/mode")
         self.declare_parameter("estop_topic", "/mission/estop")
+        # self_right_node 가 넘어진 로버를 세우는 동안 True 를 보낸다 → 바퀴 정지.
+        self.declare_parameter("righting_active_topic", "righting/active")
         self.declare_parameter("battery_topic", "/battery_state")
         self.declare_parameter("min_confidence", 0.6)
         self.declare_parameter("terrain_dir", _default_terrain_dir())
@@ -178,6 +233,8 @@ class MissionManagerNode(Node):
         self.phase = "EXPLORE"
         self.mode = "AUTO"
         self.estop = False
+        self.righting_active = False
+        self._righting_stamp_ns = 0
         # Mineral collection / battery
         self.collected_count: int = 0
         self.cargo_count: int = 0
@@ -218,6 +275,10 @@ class MissionManagerNode(Node):
         self.last_pick_world: Optional[Tuple[float, float]] = None
         # (x, y, expire_ns) — pick 실패 지점 임시 제외 목록
         self.failed_pick_points: list = []
+        self.plan_goal_gap = 0.0        # 마지막 계획의 끝점 ↔ 목표 거리 (m)
+        self._seen_dets: list = []      # confirm_hits 의 기억
+        self._defer_since_ns = 0
+        self.last_plan_ns = 0
         self.last_pick_done_ns: int = 0
         # Target lock-on (kept while APPROACH, even if detection briefly lost)
         self.lock_target: Optional[Detection] = None
@@ -297,6 +358,10 @@ class MissionManagerNode(Node):
         self.create_subscription(
             String, str(self.get_parameter("mode_topic").value),
             self._on_mode, 10)
+        from std_msgs.msg import Bool as _Bool
+        self.create_subscription(
+            _Bool, str(self.get_parameter("righting_active_topic").value),
+            self._on_righting, 10)
         self.create_subscription(
             Empty, str(self.get_parameter("estop_topic").value),
             self._on_estop, 10)
@@ -392,6 +457,25 @@ class MissionManagerNode(Node):
             and not self._is_claimed_by_other(
                 d.world_position.x, d.world_position.y)
         ]
+        if candidates:
+            ok = confirm_hits(
+                self._seen_dets,
+                [(d.class_name, d.world_position.x, d.world_position.y) for d in candidates],
+                now_ns, int(self.get_parameter("target_confirm_hits").value),
+                float(self.get_parameter("target_confirm_radius_m").value),
+                int(float(self.get_parameter("target_confirm_window_sec").value) * 1e9))
+            pending = [d for d, keep in zip(candidates, ok) if not keep]
+            candidates = [d for d, keep in zip(candidates, ok) if keep]
+            # 더 값진 광물이 보이는데 아직 확인 횟수를 못 채웠다면, 덜 값진 것에
+            # 먼저 고정되지 않도록 잠깐(최대 1.5 s) 기다린다.
+            if (self.lock_target is None and candidates and pending
+                    and max(map(_score, pending)) > max(map(_score, candidates)) + 1.0):
+                if self._defer_since_ns == 0:
+                    self._defer_since_ns = now_ns
+                if now_ns - self._defer_since_ns < int(1.5e9):
+                    return
+            else:
+                self._defer_since_ns = 0
         if not candidates:
             return
 
@@ -422,6 +506,32 @@ class MissionManagerNode(Node):
                 self.last_det_stamp_ns = now_ns
                 self.lock_target = best
                 self.lock_started_ns = now_ns  # 갱신: 시야 안 들어오면 timeout reset
+            elif self.last_odom is not None:
+                # 같은 방향인데 더 가까운 같은 종류의 검출 = 같은 광물이고, 고정해 둔
+                # 위치의 거리가 길게 잘못 잡혔던 것 (먼 광물의 깊이 오차). 옮겨 잡는다.
+                p = self.last_odom.pose.pose.position
+                lb = math.atan2(ly - p.y, lx - p.x)
+                ld = math.hypot(lx - p.x, ly - p.y)
+                best = None
+                for d in candidates:
+                    if d.class_name != self.lock_target.class_name:
+                        continue
+                    dx, dy = d.world_position.x - p.x, d.world_position.y - p.y
+                    diff = abs((math.atan2(dy, dx) - lb + math.pi) % (2 * math.pi) - math.pi)
+                    dist = math.hypot(dx, dy)
+                    if diff < math.radians(6.0) and dist < ld and \
+                            (best is None or dist < best[0]):
+                        best = (dist, d)
+                if best is not None:
+                    d = best[1]
+                    self.get_logger().info(
+                        f"고정한 목표 위치 수정: ({lx:.2f},{ly:.2f}) → "
+                        f"({d.world_position.x:.2f},{d.world_position.y:.2f}) "
+                        f"(같은 방향, {ld - best[0]:.1f} m 더 가까움)")
+                    self.target = d
+                    self.last_det_stamp_ns = now_ns
+                    self.lock_target = d
+                    self.lock_started_ns = now_ns
             # 같은 mineral 없으면 lock 유지 (timeout 자연 흐름)
             return
 
@@ -460,6 +570,15 @@ class MissionManagerNode(Node):
             self.wp_idx = 0
             self.last_plan_target = None
 
+    def _on_righting(self, msg) -> None:
+        if msg.data and not self.righting_active:
+            self.get_logger().warn("넘어짐 복구 중 — 주행 정지")
+        elif not msg.data and self.righting_active:
+            self.get_logger().info("넘어짐 복구 끝 — 주행 재개")
+            self.waypoints = []                 # 자세가 바뀌었으니 다시 계획
+        self.righting_active = bool(msg.data)
+        self._righting_stamp_ns = self.get_clock().now().nanoseconds
+
     def _on_estop(self, _msg: Empty) -> None:
         if not self.estop:
             self.get_logger().warn("ESTOP received — mission halted.")
@@ -481,6 +600,14 @@ class MissionManagerNode(Node):
             self._enter_phase("MISSION_COMPLETE", reason="ESTOP")
             self.cmd_pub.publish(Twist())
             return
+
+        if self.righting_active:
+            # 복구 노드가 죽어 신호가 끊긴 경우(3 s)에는 풀어 준다.
+            if self.get_clock().now().nanoseconds - self._righting_stamp_ns > int(3e9):
+                self.righting_active = False
+            else:
+                self.cmd_pub.publish(Twist())
+                return
 
         if self.mode == "MANUAL":
             # Phase stays where it was (for telemetry) but we don't transition.
@@ -571,6 +698,7 @@ class MissionManagerNode(Node):
                 self.waypoints = []
                 self.wp_idx = 0
                 self.last_plan_target = None
+                self.plan_goal_gap = 0.0
             if self.phase == "APPROACH" and prev_phase != "APPROACH":
                 # Lock onto this target's coordinates for the duration of APPROACH
                 self.lock_target = self.target
@@ -654,6 +782,26 @@ class MissionManagerNode(Node):
                 else:
                     break
             goal_x, goal_y = self.waypoints[self.wp_idx]
+            stop_d = _stop_dist_for(
+                self.target.class_name,
+                float(self.get_parameter("approach_stop_dist_m").value))
+            if (self.wp_idx == len(self.waypoints) - 1
+                    and math.hypot(goal_x - rx, goal_y - ry) < wp_reach
+                    and dist > stop_d + 0.3):
+                # 계획의 끝에 왔는데 광물은 아직 멀다 = 계획이 목표에 못 미친 곳에서
+                # 끝났다 (목표 주변이 실제로 막혀 있음). 발밑의 점을 향해 조향하면
+                # 제자리에서 좌우로 맴돌기만 하므로, 이 광물은 한동안 포기한다.
+                ignore_ns = int(float(
+                    self.get_parameter("failed_pick_ignore_sec").value) * 1e9)
+                self.failed_pick_points.append(
+                    (tx, ty, self.get_clock().now().nanoseconds + ignore_ns))
+                self.get_logger().warn(
+                    f"APPROACH: 광물 ({tx:.2f},{ty:.2f}) 까지 {dist:.2f} m 남기고 "
+                    f"길이 막힘 — 이 광물은 잠시 제외하고 EXPLORE 로")
+                self.target = None
+                self.lock_target = None
+                self.last_det_stamp_ns = 0
+                return Twist()
         else:
             # A* 실패 — 이 mineral 까지 obstacle 회피 path 없음. 직진하면
             # obstacle 통과 위험. 정지 + target/lock 폐기로 다음 tick 에
@@ -685,6 +833,8 @@ class MissionManagerNode(Node):
         t.linear.x = lin
         t.angular.z = float(self.get_parameter("steer_gain").value) * heading_err
         max_ang = 1.2
+        if abs(heading_err) > 0.4:
+            max_ang = min(max_ang, turn_rate_cap(heading_err))
         if t.angular.z > max_ang:
             t.angular.z = max_ang
         elif t.angular.z < -max_ang:
@@ -752,20 +902,23 @@ class MissionManagerNode(Node):
             alive[rid] = (rx, ry)
         return alive
 
-    def _build_dynamic_grid(self):
+    def _build_dynamic_grid(self, base=None):
         """static obstacle_grid + 다른 rover 위치를 inflate 한 snapshot grid.
 
         enable_rover_avoid=False 거나 다른 rover 없으면 static grid 그대로.
+        base: 기준 격자 (없으면 self.ogrid.grid).
         """
         if self.ogrid is None:
             return None
+        if base is None:
+            base = self.ogrid.grid
         if self.rover_pos_pub is None:
-            return self.ogrid.grid
+            return base
         others = self._other_rovers_alive()
         if not others:
-            return self.ogrid.grid
+            return base
         import numpy as np
-        g = self.ogrid.grid.copy()
+        g = base.copy()
         r_m = float(self.get_parameter("rover_avoid_radius_m").value)
         cells_r = max(1, int(math.ceil(r_m / self.ogrid.cell_size)))
         cells_r2 = cells_r * cells_r
@@ -824,7 +977,13 @@ class MissionManagerNode(Node):
             return
         p = self.last_odom.pose.pose.position
         rest = [(p.x, p.y)] + list(self.waypoints[self.wp_idx:])
-        if self.map_layer.path_blocked(rest):
+        ignore = None
+        if self.phase == "APPROACH" and self.target is not None:
+            # 다가가는 광물 주변은 "막혔다" 로 보지 않는다 (계획도 그렇게 짰다).
+            ignore = (self.target.world_position.x, self.target.world_position.y,
+                      float(self.get_parameter("approach_target_clear_m").value)
+                      + self.ogrid.robot_radius + self.ogrid.cell_size)
+        if self.map_layer.path_blocked(rest, ignore=ignore):
             self.waypoints = []          # 다음 _maybe_replan 에서 새로 계획
             self.map_replans += 1
             self.get_logger().info(
@@ -843,21 +1002,34 @@ class MissionManagerNode(Node):
             # Multi-rover: 다른 rover 가 trigger_m 이상 움직였으면 replan.
             or self._other_rovers_moved()
         )
+        now_ns = self.get_clock().now().nanoseconds
+        if not need_replan and self.plan_goal_gap > 0.3:
+            # 지난 계획은 목표에 못 미친 곳에서 끝났다 (목표 주변이 막혀 있었음).
+            # 지도가 바뀌어 열렸을 수 있으니 주기적으로 다시 짜 본다.
+            retry_ns = int(float(
+                self.get_parameter("approach_short_plan_retry_sec").value) * 1e9)
+            need_replan = (now_ns - self.last_plan_ns) > retry_ns
         if not need_replan:
             return
+        self.last_plan_ns = now_ns
 
         # static grid 또는 dynamic grid (다른 rover 위치 inflate 후) 사용.
         # multi-rover off 시 static grid 그대로 반환되어 비용 없음.
-        active_grid = self._build_dynamic_grid()
+        base = None
+        if self.map_layer is not None:
+            # 온라인 지도에서는 목표 광물 자체가 위험 칸이다 → 목표 주변만 빼고 계획.
+            base = self.map_layer.grid_excluding(
+                tx, ty, float(self.get_parameter("approach_target_clear_m").value))
+        active_grid = self._build_dynamic_grid(base)
         if active_grid is None:
             active_grid = self.ogrid.grid
 
         start = self.ogrid.world_to_cell(rx, ry, clip=True)
         goal = self.ogrid.world_to_cell(tx, ty, clip=True)
         if start and active_grid[start] == 1:
-            start = self._nearest_free(start)
+            start = self._nearest_free(start, active_grid)
         if goal is not None and active_grid[goal] == 1:
-            goal = self._nearest_free(goal)
+            goal = self._nearest_free(goal, active_grid)
 
         # 1차 시도 — 표준 grid 로.
         path = astar(active_grid, start, goal) if start and goal else None
@@ -891,9 +1063,19 @@ class MissionManagerNode(Node):
         self.waypoints = [self.ogrid.cell_to_world(i, j) for (i, j) in path]
         self.wp_idx = 1 if len(self.waypoints) > 1 else 0
         self.last_plan_target = (tx, ty)
-        self.get_logger().info(
-            f"A* replanned: {len(self.waypoints)} waypoints "
-            f"to ({tx:.2f},{ty:.2f})")
+        ex, ey = self.waypoints[-1]
+        gap = math.hypot(ex - tx, ey - ty)
+        changed = (gap > 0.3) != (self.plan_goal_gap > 0.3)
+        self.plan_goal_gap = gap
+        if gap > 0.3:
+            if changed:
+                self.get_logger().warn(
+                    f"A* replanned: 목표 ({tx:.2f},{ty:.2f}) 주변이 막혀 "
+                    f"{gap:.2f} m 떨어진 곳까지만 계획함")
+        else:
+            self.get_logger().info(
+                f"A* replanned: {len(self.waypoints)} waypoints "
+                f"to ({tx:.2f},{ty:.2f})")
 
     def _send_arm_goal(self) -> None:
         if self.arm_client is None or self.target is None or self.arm_in_flight:
@@ -1073,7 +1255,10 @@ class MissionManagerNode(Node):
         if abs(heading_err) > 0.4:
             lin *= 0.3
         t.linear.x = lin
-        t.angular.z = max(-1.2, min(1.2,
+        max_ang = 1.2
+        if abs(heading_err) > 0.4:
+            max_ang = min(max_ang, turn_rate_cap(heading_err))
+        t.angular.z = max(-max_ang, min(max_ang,
             float(self.get_parameter("steer_gain").value) * heading_err))
         self.cmd_pub.publish(t)
 
@@ -1125,9 +1310,11 @@ class MissionManagerNode(Node):
         s.last_error = self.last_error
         self.state_pub.publish(s)
 
-    def _nearest_free(self, cell: Tuple[int, int]) -> Tuple[int, int]:
+    def _nearest_free(self, cell: Tuple[int, int], grid=None) -> Tuple[int, int]:
         # search radius 25 cell (= 5m at cell_size=0.2). 이전 12 cell (2.4m) 은
         # basecamp 같은 큰 obstacle 영역 옆에서 free 못 찾는 케이스가 있었음.
+        if grid is None:
+            grid = self.ogrid.grid
         i0, j0 = cell
         for r in range(1, 25):
             for di in range(-r, r + 1):
@@ -1135,7 +1322,7 @@ class MissionManagerNode(Node):
                     if max(abs(di), abs(dj)) != r:
                         continue
                     ni, nj = i0 + di, j0 + dj
-                    if self.ogrid.in_bounds(ni, nj) and self.ogrid.grid[ni, nj] == 0:
+                    if self.ogrid.in_bounds(ni, nj) and grid[ni, nj] == 0:
                         return (ni, nj)
         return cell
 

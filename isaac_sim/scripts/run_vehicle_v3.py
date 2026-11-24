@@ -73,6 +73,13 @@ _p.add_argument("--drive-limits", default="auto",
                      "(earth 는 제한 없음 = 원래 동작). off: 제한 없음. "
                      "또는 'max_lin=0.8,acc_lin=0.5' 처럼 항목별 override "
                      "(항목: max_lin, max_ang, acc_lin, acc_ang).")
+_p.add_argument("--structure-collision", choices=["mesh", "box"], default="mesh",
+                help="큰 구조물(배럭·골리앗 등)의 충돌 형상. box (원본): 보이지 않는 상자 — "
+                     "모델보다 커서 카메라에 안 보이는 벽이 생긴다. mesh (기본): 보이는 "
+                     "모델 그대로 — 보이는 것에만 부딪힌다.")
+_p.add_argument("--flip-at", type=float, default=0.0,
+                help="시험용: 시뮬레이션 시각이 이 값(초)이 되면 첫 로버를 뒤집어 놓는다 "
+                     "(넘어짐 복구 self_right_node 시험). 0 = 안 함.")
 _p.add_argument("--kit-arg", action="append", default=[],
                 help="Kit 에 그대로 넘길 인자 (반복 가능). 예: "
                      "--kit-arg=--/rtx/reflections/enabled=false")
@@ -1004,6 +1011,58 @@ def _close_spawn_for(spots, idx, spacing):
     return (base[0] + idx * spacing, base[1], base[2])
 
 
+def _structures_collide_as_seen(stage, scene_root: str) -> int:
+    """구조물의 '보이지 않는 충돌 상자' 를 끄고 보이는 모델(mesh)에 충돌을 건다.
+
+    원본 자산은 구조물마다 바닥 면적 전체를 덮는 투명 상자로 충돌을 처리한다. 골리앗은
+    다리 사이가 뚫려 있고 배럭은 밑동이 상자보다 좁아서, 깊이 카메라는 빈 땅을 보는데
+    로버는 벽에 막힌다 (지도 없는 주행에서는 피할 방법이 없다).
+    """
+    from pxr import Usd, UsdGeom, UsdPhysics
+    n = 0
+    for prim in Usd.PrimRange(stage.GetPrimAtPath(scene_root)):
+        if prim.GetName() != "CollisionBox" or not prim.HasAPI(UsdPhysics.CollisionAPI):
+            continue
+        visual = prim.GetParent().GetChild("VisualModel")
+        if not visual or not visual.IsValid():
+            continue
+        meshes = [m for m in Usd.PrimRange(visual) if m.IsA(UsdGeom.Mesh)]
+        if not meshes:
+            continue
+        for m in meshes:
+            UsdPhysics.CollisionAPI.Apply(m)
+            UsdPhysics.MeshCollisionAPI.Apply(m).CreateApproximationAttr().Set("none")
+        UsdPhysics.CollisionAPI(prim).CreateCollisionEnabledAttr().Set(False)
+        n += 1
+    return n
+
+
+def _flip_first_rover(stage) -> None:
+    """시험용: 첫 로버를 0.8 m 들어 올려 뒤집힌 자세(roll 170°)로 놓는다."""
+    import numpy as np
+    from isaacsim.core.prims import Articulation
+    from pxr import UsdPhysics
+    root = None
+    for prim in stage.Traverse():
+        if prim.HasAPI(UsdPhysics.ArticulationRootAPI) and "/Vehicle" in str(prim.GetPath()):
+            root = str(prim.GetPath())
+            break
+    if root is None:
+        print("[run_v3] --flip-at: 로버 articulation 을 못 찾음")
+        return
+    art = Articulation(prim_paths_expr=root, name="flip_test")
+    art.initialize()
+    pos, quat = art.get_world_poses()
+    w, x, y, z = [float(v) for v in np.asarray(quat)[0]]
+    a = np.radians(170.0) / 2.0                 # 차체 x 축(앞쪽) 둘레로 굴린다: q ⊗ qx
+    c, sn = np.cos(a), np.sin(a)
+    q2 = np.array([[w * c - x * sn, w * sn + x * c, y * c + z * sn, z * c - y * sn]])
+    p2 = np.asarray(pos, dtype=np.float64) + np.array([[0.0, 0.0, 0.8]])
+    art.set_world_poses(positions=p2, orientations=q2)
+    art.set_velocities(np.zeros((1, 6)))
+    print(f"[run_v3] --flip-at: {root} 를 뒤집어 놓음 (시험)")
+
+
 def _load_rover(stage, world, prim_path: str, spawn,
                 usd_source: str = V3) -> None:
     """vehicle_v3 USD 를 prim_path 에 reference + 위치 설정.
@@ -1287,6 +1346,9 @@ def main() -> None:
     # 중력·접촉 재질 — 로버가 stage 에 올라온 뒤, physics 파싱(reset) 전에.
     rover_roots = ([f"/World/{_ns_to_prim_name(ns)}" for ns in _a.rovers]
                    if _a.rovers else [ROVER_PRIM])
+    if _a.structure_collision == "mesh":
+        print(f"[run_v3] 구조물 충돌: 보이는 모델 그대로 "
+              f"({_structures_collide_as_seen(stage, '/World/MarsScene')}개, 투명 상자 끔)")
     physics_info = apply_planet_physics(
         stage, world, _a.physics, meta=terrain_meta,
         scene_root="/World/MarsScene", rover_roots=rover_roots)
@@ -1378,8 +1440,12 @@ def main() -> None:
     last_log_wall = time.time()
     next_step_wall = time.perf_counter()
     try:
+        flip_at = float(_a.flip_at)
         while app.is_running():
             world.step(render=(step % render_every == 0))
+            if flip_at > 0.0 and float(world.current_time) >= flip_at:
+                flip_at = 0.0
+                _flip_first_rover(stage)
             if max_rtf > 0.0:
                 # 실시간 배율 상한 — 다음 step 예정 시각까지 대기. 밀렸으면
                 # 빚을 쌓지 않고 현재 시각 기준으로 다시 잡음.

@@ -86,6 +86,15 @@ class HazardMapNode(Node):
         self.declare_parameter("rough_m", 0.04)
         self.declare_parameter("arm_home_tolerance_deg", 5.0)
         self.declare_parameter("mineral_clear_radius_m", 0.4)
+        # 막힘 감지: 전진(후진) 명령을 stall_sec 동안 받았는데 stall_move_m 도 못 갔으면
+        # 카메라가 못 본 무언가에 막힌 것으로 보고, 진행 방향 앞에 위험 원을 찍는다.
+        # 접촉 센서가 없는 로버의 "범퍼" 대용 (바퀴 명령과 실제 이동의 비교).
+        self.declare_parameter("cmd_topic", "/cmd_vel")
+        self.declare_parameter("stall_sec", 4.0)
+        self.declare_parameter("stall_cmd_mps", 0.2)
+        self.declare_parameter("stall_move_m", 0.15)
+        self.declare_parameter("stall_mark_ahead_m", 0.9)
+        self.declare_parameter("stall_mark_radius_m", 0.45)
         self.declare_parameter("mineral_min_confidence", 0.5)
         # 먼 검출은 위치가 부정확해서 엉뚱한 곳(바위)을 지울 수 있다.
         self.declare_parameter("mineral_max_range_m", 4.0)
@@ -136,6 +145,12 @@ class HazardMapNode(Node):
         self.create_timer(1.0 / max(0.2, float(self.get_parameter("publish_hz").value)),
                           self._publish)
         self.create_timer(10.0, self._status)
+        from geometry_msgs.msg import Twist
+        self._bumps: list = []                  # [(x, y)] 막혀서 찍은 위험 원
+        self._cmd_lin = 0.0
+        self._stall_ref = None                  # (시각, 위치, 방향 부호)
+        self.create_subscription(Twist, str(self.get_parameter("cmd_topic").value),
+                                 self._on_cmd, 10)
         self.get_logger().info(
             f"hazard_map_node ready — {size[0]:.0f}×{size[1]:.0f} m @ {self.hm.cell:.2f} m, "
             f"거리 {self.hm.min_range}~{self.hm.max_range} m, 경사 한계 "
@@ -147,8 +162,37 @@ class HazardMapNode(Node):
         if self.K is None and msg.k[0] > 0:
             self.K = (float(msg.k[0]), float(msg.k[4]), float(msg.k[2]), float(msg.k[5]))
 
+    def _on_cmd(self, msg) -> None:
+        self._cmd_lin = float(msg.linear.x)
+
+    def _check_stall(self, t: float, pos: np.ndarray, quat: np.ndarray) -> None:
+        need = float(self.get_parameter("stall_cmd_mps").value)
+        sign = 1.0 if self._cmd_lin > need else (-1.0 if self._cmd_lin < -need else 0.0)
+        ref = self._stall_ref
+        if sign == 0.0 or ref is None or ref[2] != sign or t < ref[0] \
+                or float(np.hypot(*(pos[:2] - ref[1][:2]))) > float(
+                    self.get_parameter("stall_move_m").value):
+            self._stall_ref = (t, pos.copy(), sign) if sign != 0.0 else None
+            return
+        if t - ref[0] < float(self.get_parameter("stall_sec").value):
+            return
+        x, y, z, w = quat
+        yaw = math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+        d = sign * float(self.get_parameter("stall_mark_ahead_m").value)
+        bx, by = float(pos[0] + d * math.cos(yaw)), float(pos[1] + d * math.sin(yaw))
+        self._stall_ref = None
+        if any(math.hypot(bx - x0, by - y0) < 0.3 for (x0, y0) in self._bumps):
+            return                              # 이미 찍은 자리 — 계획기가 돌아갈 때까지 기다림
+        self._bumps.append((bx, by))
+        self.get_logger().warn(
+            f"막힘 감지: {t - ref[0]:.1f} s 동안 {'전진' if sign > 0 else '후진'} 명령에도 "
+            f"제자리 → ({bx:.2f},{by:.2f}) 을 위험으로 표시 (누적 {len(self._bumps)}곳)")
+        self._publish()
+
     def _on_odom(self, msg: Odometry) -> None:
         p, q = msg.pose.pose.position, msg.pose.pose.orientation
+        self._check_stall(_stamp_sec(msg.header), np.array([p.x, p.y, p.z]),
+                          np.array([q.x, q.y, q.z, q.w]))
         self._odom.append((_stamp_sec(msg.header),
                            np.array([p.x, p.y, p.z]),
                            np.array([q.x, q.y, q.z, q.w])))
@@ -221,13 +265,19 @@ class HazardMapNode(Node):
 
     # ── 출력 ────────────────────────────────────────────────────────────
     def _publish(self) -> None:
-        if self.hm.frames == 0:
+        if self.hm.frames == 0 and not self._bumps:
             return
         for (x, y) in self._minerals:
             self.hm.clear_disk(x, y, self.clear_r)
         cells = np.full((self.hm.rows, self.hm.cols), -1, dtype=np.int8)
         cells[self.hm.observed_mask()] = 0
         cells[self.hm.obstacle_mask()] = 100
+        if self._bumps:
+            r = float(self.get_parameter("stall_mark_radius_m").value) / self.hm.cell
+            ii, jj = np.mgrid[0:self.hm.rows, 0:self.hm.cols]
+            for (x, y) in self._bumps:
+                ci, cj = self.hm.world_to_cell(x, y)
+                cells[(ii - int(ci)) ** 2 + (jj - int(cj)) ** 2 <= r * r] = 100
         msg = OccupancyGrid()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = str(self.get_parameter("frame_id").value)

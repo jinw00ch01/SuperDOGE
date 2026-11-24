@@ -29,6 +29,8 @@ _p.add_argument("--seed", type=int, default=100)
 _p.add_argument("--friction", type=float, default=1.0, help="지면 마찰 배율")
 _p.add_argument("--steep-goal-frac", type=float, default=0.0,
                 help="목표점을 15° 이상 비탈 위에 두는 비율 (비탈 주행을 일부러 늘린 시험)")
+_p.add_argument("--nav-turn-decel", type=float, default=0.4,
+                help="목표점 추종의 제자리 회전 감속도 (0 = 예전 식)")
 _p.add_argument("--out", default="")
 args, _ = _p.parse_known_args()
 
@@ -41,6 +43,7 @@ import numpy as np  # noqa: E402
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from drive_env import RoverDriveEnv, gp  # noqa: E402
 
+RoverDriveEnv.NAV_TURN_DECEL = args.nav_turn_decel
 env = RoverDriveEnv(app, terrain=args.terrain, num_envs=args.num_envs, seed=args.seed)
 env.max_steps = 10 ** 9
 env.friction_range = (args.friction, args.friction)
