@@ -141,6 +141,14 @@ for name in names:
         m = moving & (L["slope"] >= lo) & (L["slope"] < hi)
         res[f"speed_slope_{lo}_{hi}"] = round(float(np.clip(L["vx"], 0, None)[m].mean()), 3) if m.any() else None
         res[f"share_slope_{lo}_{hi}_pct"] = round(100.0 * float(m.sum()) / max(int(moving.sum()), 1), 1)
+    # 가파른 구간을 더 잘게: 마찰 한계(미끄럼 27.5°, 정지 30°) 앞뒤로 얼마나 가는지.
+    for lo, hi in ((20, 25), (25, 28), (28, 90)):
+        m = moving & (L["slope"] >= lo) & (L["slope"] < hi)
+        res[f"speed_slope_{lo}_{hi}"] = round(float(np.clip(L["vx"], 0, None)[m].mean()), 3) if m.any() else None
+        res[f"slipfrac_slope_{lo}_{hi}"] = (round(float(np.mean(
+            1.0 - np.clip(L["vx"][m], 0, None) / np.maximum(np.abs(L["v_out"][m]), 0.05))), 2)
+            if m.any() else None)
+        res[f"share_slope_{lo}_{hi}_pct"] = round(100.0 * float(m.sum()) / max(int(moving.sum()), 1), 2)
     res["flip_events"] = flip_events
     results[name] = res
     print(f"[eval] {name}: " + json.dumps({k: v for k, v in res.items() if k != "flip_events"},
@@ -148,7 +156,10 @@ for name in names:
 
 keys = ["goals_per_min", "distance_m", "flips", "flips_per_km", "flips_per_hour", "rock_stops",
         "speed_mean", "slip_mean", "lateral_mean", "tilt_p99", "tilt_over_30_pct",
-        "speed_slope_0_10", "speed_slope_10_20", "speed_slope_20_90"]
+        "speed_slope_0_10", "speed_slope_10_20", "speed_slope_20_90",
+        "speed_slope_20_25", "speed_slope_25_28", "speed_slope_28_90",
+        "slipfrac_slope_25_28", "slipfrac_slope_28_90", "share_slope_25_28_pct",
+        "share_slope_28_90_pct"]
 print(f"\n[eval] {args.terrain} · 마찰 ×{args.friction} · 로버 {n}대 × {args.minutes:.0f}분")
 short = [c if len(c) <= 11 else f"fixed#{i}" for i, c in enumerate(names)]
 for c, sname in zip(names, short):

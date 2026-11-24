@@ -30,6 +30,7 @@ setup(
             "hazard_map_node = isaac_drive.hazard_map_node:main",
             "drive_governor_node = isaac_drive.drive_governor_node:main",
             "self_right_node = isaac_drive.self_right_node:main",
+            "balance_node = isaac_drive.balance_node:main",
         ],
     },
 )

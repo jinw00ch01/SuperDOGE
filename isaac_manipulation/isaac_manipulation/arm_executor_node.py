@@ -178,6 +178,7 @@ class ArmExecutorNode(Node):
         self.declare_parameter("use_wrist_correction", True)
         # 손목 카메라가 목표 자리에서 광물을 한 번도 못 보면 집지 않는다 (허공 집기 방지).
         self.declare_parameter("abort_if_wrist_sees_nothing", True)
+        self.declare_parameter("wrist_presence_radius_m", 0.5)
         self.declare_parameter("wrist_correction_gate_m", 0.15)   # 이보다 먼 검출은 다른 물체로 봄
         self.declare_parameter("wrist_settle_sec", 1.0)
         self.declare_parameter("grasp_command_topic", "/grasp/command")
@@ -651,6 +652,7 @@ class ArmExecutorNode(Node):
         time.sleep(max(0.0, float(self.get_parameter("wrist_settle_sec").value)))
         samples: List[np.ndarray] = []
         rejected: List[str] = []
+        self._wrist_nearest_m = None     # 이번 측정에서 본 광물 중 예상 위치에 가장 가까운 거리
         last_stamp = 0
         t_end = time.monotonic() + 2.5
         while time.monotonic() < t_end and len(samples) < 5:
@@ -672,6 +674,8 @@ class ArmExecutorNode(Node):
                         continue
                     p_base = T[:3, :3] @ (R_oc @ xyz + mount) + T[:3, 3]
                     off = float(np.linalg.norm((p_base - expected)[:2]))
+                    if self._wrist_nearest_m is None or off < self._wrist_nearest_m:
+                        self._wrist_nearest_m = off
                     if off < gate and (best is None or off < best[0]):
                         dist = float(np.linalg.norm(xyz))
                         r_obj = min(0.5 * float(d.bbox_size_m.z), 0.9 * dist)
@@ -821,7 +825,12 @@ class ArmExecutorNode(Node):
             for attempt in range(2):
                 measured = self._wrist_measure(center)
                 if measured is None:
-                    if attempt == 0 and bool(
+                    # 보정 범위(gate) 밖이라도 근처에 광물이 보였으면 있는 것이다
+                    # (가스처럼 큰 것은 중심 추정이 15 cm 넘게 어긋난다) → 그대로 진행.
+                    near = getattr(self, "_wrist_nearest_m", None)
+                    nothing = near is None or near > float(
+                        self.get_parameter("wrist_presence_radius_m").value)
+                    if attempt == 0 and nothing and bool(
                             self.get_parameter("abort_if_wrist_sees_nothing").value):
                         self.get_logger().warn(
                             "contact pick: 손목 카메라에 광물이 안 보임 — 그 자리에 광물이 "

@@ -37,18 +37,21 @@ from sensor_msgs.msg import JointState
 from isaac_drive.navigation import governor_policy as gp
 
 
-def default_policy_path() -> str:
+def default_policy_path(name: str = "drive_governor.npz") -> str:
     try:
         from ament_index_python.packages import get_package_share_directory
-        return os.path.join(get_package_share_directory("isaac_drive"),
-                            "policies", "drive_governor.npz")
+        return os.path.join(get_package_share_directory("isaac_drive"), "policies", name)
     except Exception:
         return ""
 
 
 class DriveGovernor(Node):
+    NODE_NAME = "drive_governor_node"
+    POLICY_FILE = "drive_governor.npz"
+    DIMS = (gp.OBS_DIM, gp.ACT_DIM)
+
     def __init__(self) -> None:
-        super().__init__("drive_governor_node")
+        super().__init__(self.NODE_NAME)
         self.declare_parameter("policy_path", "")
         self.declare_parameter("cmd_in_topic", "cmd_vel_raw")
         self.declare_parameter("cmd_out_topic", "cmd_vel")
@@ -59,8 +62,9 @@ class DriveGovernor(Node):
         self.declare_parameter("twist_in_body_frame", True)      # twist 를 쓸 때만
         self.declare_parameter("sensor_timeout_sec", 0.5)
 
-        path = str(self.get_parameter("policy_path").value) or default_policy_path()
-        self.policy = gp.GovernorPolicy(path)
+        path = (str(self.get_parameter("policy_path").value)
+                or default_policy_path(self.POLICY_FILE))
+        self.policy = gp.GovernorPolicy(path, *self.DIMS)
         self.period = 1.0 / float(self.get_parameter("control_hz").value)
         self.twist_in_body = bool(self.get_parameter("twist_in_body_frame").value)
         self.use_twist = str(self.get_parameter("velocity_source").value) == "twist"
@@ -93,7 +97,7 @@ class DriveGovernor(Node):
         self.create_timer(0.1, self._watchdog)
         self.create_timer(10.0, self._report)
         self.get_logger().info(
-            f"drive governor ready — 정책 {path} (학습 샘플 "
+            f"{self.NODE_NAME} ready — 정책 {path} (학습 샘플 "
             f"{int(self.policy.meta.get('samples', 0)):,}), 제어 {1.0 / self.period:.0f} Hz")
 
     def _on_cmd(self, msg: Twist) -> None:
@@ -127,18 +131,21 @@ class DriveGovernor(Node):
         if self._last_run is not None and 0.0 <= stamp - self._last_run < self.period - 1e-3:
             return
         self._last_run = stamp
-        obs = gp.build_obs([self.v_des], [self.w_des], gp.gravity_in_body(quat),
-                           self.w_b, self.v_b, self.wheel,
-                           [self.v_out], [self.w_out], [self.steer_fix])
-        action = self.policy(obs)
-        v_cmd, w_cmd = gp.action_to_command(action, [self.v_des], [self.w_des])
-        self.v_out, self.w_out = float(v_cmd[0]), float(w_cmd[0])
-        self.steer_fix = float(action[0, 2])
+        self.v_out, self.w_out, self.steer_fix = self._decide(quat)
         self._publish(self.v_out, self.w_out)
         self._stopped = False
         if abs(self.v_des) > 0.05:
             self._n += 1
             self._scale_sum += abs(self.v_out) / min(abs(self.v_des), gp.V_CAP)
+
+    def _decide(self, quat) -> tuple:
+        """정책 한 번 → (v, w, 조향 보정). 하위 클래스가 바꿔 쓴다."""
+        obs = gp.build_obs([self.v_des], [self.w_des], gp.gravity_in_body(quat),
+                           self.w_b, self.v_b, self.wheel,
+                           [self.v_out], [self.w_out], [self.steer_fix])
+        action = self.policy(obs)
+        v_cmd, w_cmd = gp.action_to_command(action, [self.v_des], [self.w_des])
+        return float(v_cmd[0]), float(w_cmd[0]), float(action[0, 2])
 
     def _velocity_from_pose(self, stamp: float, position, quat) -> None:
         """연속한 두 자세의 차이 → 차체 기준 선속도·각속도."""

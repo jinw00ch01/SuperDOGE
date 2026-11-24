@@ -91,7 +91,7 @@ class HazardMapNode(Node):
         # 접촉 센서가 없는 로버의 "범퍼" 대용 (바퀴 명령과 실제 이동의 비교).
         self.declare_parameter("cmd_topic", "/cmd_vel")
         self.declare_parameter("stall_sec", 4.0)
-        self.declare_parameter("stall_cmd_mps", 0.2)
+        self.declare_parameter("stall_cmd_mps", 0.15)    # 구간 평균 명령이 이보다 작으면 판단 안 함
         self.declare_parameter("stall_move_m", 0.15)
         self.declare_parameter("stall_mark_ahead_m", 0.9)
         self.declare_parameter("stall_mark_radius_m", 0.45)
@@ -166,27 +166,47 @@ class HazardMapNode(Node):
         self._cmd_lin = float(msg.linear.x)
 
     def _check_stall(self, t: float, pos: np.ndarray, quat: np.ndarray) -> None:
-        need = float(self.get_parameter("stall_cmd_mps").value)
-        sign = 1.0 if self._cmd_lin > need else (-1.0 if self._cmd_lin < -need else 0.0)
-        ref = self._stall_ref
-        if sign == 0.0 or ref is None or ref[2] != sign or t < ref[0] \
-                or float(np.hypot(*(pos[:2] - ref[1][:2]))) > float(
-                    self.get_parameter("stall_move_m").value):
-            self._stall_ref = (t, pos.copy(), sign) if sign != 0.0 else None
-            return
-        if t - ref[0] < float(self.get_parameter("stall_sec").value):
-            return
+        """명령한 거리와 실제로 간 거리를 stall_sec 구간마다 비교한다.
+
+        벽에 막힌 경우뿐 아니라 비탈에서 바퀴만 헛도는 경우도 잡는다 (27° 비탈에서
+        바퀴는 0.2~0.3 m/s 로 도는데 차체는 0.03 m/s — 마찰 한계). 명령이 잠깐
+        작아져도 구간이 끊기지 않도록 속도 문턱이 아니라 누적 거리로 본다.
+        """
+        cmd = self._cmd_lin
+        sign = 1.0 if cmd > 0.05 else (-1.0 if cmd < -0.05 else 0.0)
         x, y, z, w = quat
         yaw = math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+        ref = self._stall_ref
+        if sign == 0.0:
+            self._stall_ref = None
+            return
+        if ref is None or ref[2] != sign or t < ref[3]:
+            self._stall_ref = [t, pos.copy(), sign, t, 0.0, yaw, 0.0]
+            return
+        # 상위 노드가 3 m/s 를 보내도 실제로 낼 수 있는 속도는 1 m/s 안쪽이다.
+        ref[4] += min(abs(cmd), 0.8) * min(t - ref[3], 0.2)
+        ref[3] = t
+        ref[6] = max(ref[6], abs((yaw - ref[5] + math.pi) % (2.0 * math.pi) - math.pi))
+        if t - ref[0] < float(self.get_parameter("stall_sec").value):
+            return
+        moved = float(np.hypot(*(pos[:2] - ref[1][:2])))
+        asked = ref[4]
+        self._stall_ref = [t, pos.copy(), sign, t, 0.0, yaw, 0.0]     # 다음 구간
+        if ref[6] > math.radians(40.0):          # 방향을 크게 트는 중 — 제자리여도 막힌 게 아니다
+            return
+        if asked < float(self.get_parameter("stall_cmd_mps").value) * (t - ref[0]) \
+                or moved > max(float(self.get_parameter("stall_move_m").value),
+                               0.15 * asked):
+            return
         d = sign * float(self.get_parameter("stall_mark_ahead_m").value)
         bx, by = float(pos[0] + d * math.cos(yaw)), float(pos[1] + d * math.sin(yaw))
-        self._stall_ref = None
         if any(math.hypot(bx - x0, by - y0) < 0.3 for (x0, y0) in self._bumps):
             return                              # 이미 찍은 자리 — 계획기가 돌아갈 때까지 기다림
         self._bumps.append((bx, by))
         self.get_logger().warn(
-            f"막힘 감지: {t - ref[0]:.1f} s 동안 {'전진' if sign > 0 else '후진'} 명령에도 "
-            f"제자리 → ({bx:.2f},{by:.2f}) 을 위험으로 표시 (누적 {len(self._bumps)}곳)")
+            f"막힘 감지: {t - ref[0]:.1f} s 동안 {'전진' if sign > 0 else '후진'} 명령 "
+            f"{asked:.2f} m 에 실제 {moved:.2f} m → ({bx:.2f},{by:.2f}) 을 위험으로 표시 "
+            f"(누적 {len(self._bumps)}곳)")
         self._publish()
 
     def _on_odom(self, msg: Odometry) -> None:
@@ -203,7 +223,11 @@ class HazardMapNode(Node):
             q = np.array([pos[n] for n in ARM_JOINTS])
         except KeyError:
             return
-        self._arm_dev = float(np.abs(q - ARM_HOME_RAD).max())
+        dev = float(np.abs(q - ARM_HOME_RAD).max())
+        # 팔이 차체 뒤쪽 반(joint_1 이 ±90° 밖)을 향하고 있으면 앞을 보는 깊이 카메라를
+        # 가리지 않는다 (균형추로 뒤로 뻗은 경우). 그때는 영상을 그대로 쓴다.
+        heading = abs((float(q[0]) + math.pi) % (2.0 * math.pi) - math.pi)
+        self._arm_dev = 0.0 if heading >= math.radians(90.0) else dev
 
     def _on_detections(self, msg: DetectionArray) -> None:
         if not self._odom:
