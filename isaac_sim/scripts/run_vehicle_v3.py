@@ -77,6 +77,9 @@ _p.add_argument("--wheel-collider", choices=["round", "mesh"], default="round",
                 help="바퀴 충돌 형상. round = 구동축에 중심을 맞춘 캡슐 (기본). "
                      "mesh = 로버 모델 그대로 (바퀴 mesh 의 convex hull). mesh 는 "
                      "다각형이라 돌 때 땅에서 튀어 구동 접지력이 설정 마찰의 60~65%% 만 나온다")
+_p.add_argument("--link-speed-cap", choices=["off", "model"], default="off",
+                help="로버 link 의 선속도 상한. model = 로버 모델 그대로 (1.5 m/s 에서 속도를 "
+                     "잘라 냄 — 주행뿐 아니라 넘어질 때 떨어지는 속도까지). off (기본) = 해제")
 _p.add_argument("--structure-collision", choices=["mesh", "box"], default="mesh",
                 help="큰 구조물(배럭·골리앗 등)의 충돌 형상. box (원본): 보이지 않는 상자 — "
                      "모델보다 커서 카메라에 안 보이는 벽이 생긴다. mesh (기본): 보이는 "
@@ -133,7 +136,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 from planet_physics import MINERAL_MASS_KG, apply_mineral_mass, apply_planet_physics  # noqa: E402
-from wheel_colliders import round_wheel_colliders  # noqa: E402
+from wheel_colliders import lift_link_speed_cap, round_wheel_colliders  # noqa: E402
 from contact_grasp import ContactGrasp  # noqa: E402
 from wide_gripper import FrictionGrasp, install_wide_gripper  # noqa: E402
 from drive_limits import apply_drive_limits, limits_for_gravity, parse_limits  # noqa: E402
@@ -1130,39 +1133,9 @@ def _per_rover_usd_copies(namespaces) -> dict:
 
 
 def _localize_asset_paths(usd_path: str) -> int:
-    """다른 PC 의 절대경로로 저장된 asset 경로를 이 checkout 기준으로 치환.
-
-    vehicle_v3.usd 의 MDL 재질이 저장한 PC 의 절대경로
-    (.../a2_isaac/isaac_sim/assets/...) 를 들고 있어, checkout 위치가 다르면
-    재질 로드가 실패함. 존재하지 않는 절대경로 중 '/isaac_sim/assets/' 를
-    포함하고 이 checkout 에 같은 파일이 있는 것만 바꿈. 치환 개수 반환.
-    """
-    from pxr import UsdUtils
-
-    layer = Sdf.Layer.FindOrOpen(usd_path)
-    if layer is None:
-        return 0
-    marker = "/isaac_sim/assets/"
-    count = 0
-
-    def _fix(path: str) -> str:
-        nonlocal count
-        raw = path[5:] if path.startswith("file:") else path
-        if not raw.startswith("/") or os.path.exists(raw):
-            return path
-        i = raw.find(marker)
-        if i < 0:
-            return path
-        local = ISAAC_SIM + raw[i + len("/isaac_sim"):]
-        if not os.path.exists(local):
-            return path
-        count += 1
-        return local
-
-    UsdUtils.ModifyAssetPaths(layer, _fix)
-    if count:
-        layer.Save()
-    return count
+    """다른 PC 의 절대경로로 저장된 asset 경로를 이 checkout 기준으로 치환 (asset_paths.py)."""
+    from asset_paths import localize_asset_paths
+    return localize_asset_paths(usd_path)
 
 
 def _patch_topic_names(stage, rover_root: str, ns: str) -> int:
@@ -1375,6 +1348,9 @@ def main() -> None:
         _w = round_wheel_colliders(stage, rover_roots)
         print(f"[run_v3] 바퀴 충돌 형상: 캡슐 {_w['wheels']}개 (반지름 {_w['radius']} m, "
               f"원래 mesh 의 편심 {_w['eccentricity_mm']} mm)")
+    if _a.link_speed_cap == "off":
+        _c = lift_link_speed_cap(stage, rover_roots)
+        print(f"[run_v3] link 속도 상한 해제: {_c['links']}개 ({_c['before']} → {_c['after']} m/s)")
     physics_info = apply_planet_physics(
         stage, world, _a.physics, meta=terrain_meta,
         scene_root="/World/MarsScene", rover_roots=rover_roots)

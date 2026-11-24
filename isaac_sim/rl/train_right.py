@@ -21,6 +21,8 @@ _p.add_argument("--horizon", type=int, default=128)
 _p.add_argument("--lr", type=float, default=3e-4)
 _p.add_argument("--gamma", type=float, default=0.99)
 _p.add_argument("--lam", type=float, default=0.95)
+_p.add_argument("--speed-cap", default="off", choices=["off", "model"],
+                help="link 선속도 상한. model = 로버 모델 그대로 (1.5 m/s)")
 _p.add_argument("--wheels", default="capsule", choices=["capsule", "mesh"],
                 help="바퀴 충돌 형상. mesh = 로버 모델 그대로 (예전 결과 재현용)")
 _p.add_argument("--seed", type=int, default=0)
@@ -47,6 +49,7 @@ torch.manual_seed(args.seed)
 os.makedirs(args.out, exist_ok=True)
 effort = [float(v) for v in args.arm_effort.split(",")] if args.arm_effort else None
 RightingEnv.WHEEL_SHAPE = args.wheels
+RightingEnv.LIFT_SPEED_CAP = args.speed_cap == "off"
 env = RightingEnv(app, arm_effort=effort, terrain=args.terrain, num_envs=args.num_envs,
                   seed=args.seed)
 model = ActorCritic(OBS_DIM, ACT_DIM)

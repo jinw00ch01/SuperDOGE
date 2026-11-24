@@ -84,3 +84,31 @@ def round_wheel_colliders(stage, rover_roots, min_radius: float = 0.08,
             count += 1
     return {"wheels": count, "radius": sorted(set(radii)),
             "eccentricity_mm": sorted(set(ecc))}
+
+
+def lift_link_speed_cap(stage, rover_roots, max_linear: float = 100.0) -> dict:
+    """로버 link 에 걸린 선속도 상한(physxRigidBody:maxLinearVelocity)을 올린다.
+
+    로버 모델은 차체·바퀴·조향 link 16 개에 1.5 m/s 상한을 두고 있다. PhysX 는 이 값을
+    넘는 link 속도를 그냥 잘라 낸다 — 힘이 아니라 속도를 직접 깎으므로 물리적 근거가 없다.
+      · 바퀴를 2.2 m/s 로 헛돌려도 차체는 1.57 m/s 에서 멈춘다 (접지력은 남아 있는데도).
+      · 떨어지는 속도도 잘린다. 화성 중력에서 0.30 m 만 떨어지면 1.5 m/s 인데, 넘어지는
+        로버의 link 는 그보다 빨라질 수 없다 → 전복이 실제보다 느리고 약하게 나온다.
+    return: {"links": 바꾼 link 수, "before": 원래 값들, "after": max_linear}
+    """
+    before, n = set(), 0
+    for root in rover_roots:
+        rp = stage.GetPrimAtPath(root)
+        if not rp or not rp.IsValid():
+            continue
+        for prim in Usd.PrimRange(rp):
+            attr = prim.GetAttribute("physxRigidBody:maxLinearVelocity")
+            if not attr or not attr.HasAuthoredValue():
+                continue
+            old = attr.Get()
+            if old is None or float(old) >= max_linear:
+                continue
+            before.add(round(float(old), 3))
+            attr.Set(float(max_linear))
+            n += 1
+    return {"links": n, "before": sorted(before), "after": max_linear}

@@ -25,6 +25,8 @@ _p.add_argument("--policy", default="")
 _p.add_argument("--controllers", default="raw,fixed,policy")
 _p.add_argument("--num-envs", type=int, default=16)
 _p.add_argument("--minutes", type=float, default=6.0, help="제어 방식 하나당 로버 1 대의 주행 시간")
+_p.add_argument("--speed-cap", default="off", choices=["off", "model"],
+                help="link 선속도 상한. model = 로버 모델 그대로 (1.5 m/s)")
 _p.add_argument("--wheels", default="capsule", choices=["capsule", "mesh"],
                 help="바퀴 충돌 형상. mesh = 로버 모델 그대로 (예전 결과 재현용)")
 _p.add_argument("--seed", type=int, default=100)
@@ -35,6 +37,10 @@ _p.add_argument("--balance", action="store_true",
                 help="--policy 가 균형 정책(balance_env)일 때. 비교 기준 제어기는 팔을 home 에 둔다")
 _p.add_argument("--nav-turn-decel", type=float, default=0.4,
                 help="목표점 추종의 제자리 회전 감속도 (0 = 예전 식)")
+_p.add_argument("--guard-pitch", type=float, default=30.0,
+                help="guard 제어기: 앞이 이만큼(도) 들리면 밀기를 멈추고 물러난다")
+_p.add_argument("--guard-roll", type=float, default=32.0)
+_p.add_argument("--guard-back", default="0.5,1.5", help="guard: 후진 속도(m/s), 시간(s)")
 _p.add_argument("--out", default="")
 args, _ = _p.parse_known_args()
 
@@ -51,7 +57,10 @@ if args.balance:
 
 RoverDriveEnv.NAV_TURN_DECEL = args.nav_turn_decel
 RoverDriveEnv.WHEEL_SHAPE = args.wheels
+RoverDriveEnv.LIFT_SPEED_CAP = args.speed_cap == "off"
 env = RoverDriveEnv(app, terrain=args.terrain, num_envs=args.num_envs, seed=args.seed)
+from scipy import ndimage as _ndi  # noqa: E402
+GY, GX = np.gradient(_ndi.uniform_filter(env.hm.astype(np.float64), 16), env.res)   # 차체 길이로 고른 경사
 env.max_steps = 10 ** 9
 env.friction_range = (args.friction, args.friction)
 env.randomize_friction()
@@ -70,7 +79,7 @@ for i in range(n):
 
 names = [c for c in args.controllers.split(",") if c and (c != "policy" or args.policy)]
 for c in names:
-    if c not in ("raw", "fixed", "policy") and not c.startswith("fixed:"):
+    if c not in ("raw", "fixed", "policy", "guard") and not c.startswith("fixed:"):
         raise SystemExit(f"알 수 없는 제어 방식: {c}")
 policy = (gp.GovernorPolicy(args.policy, *((24, 5) if args.balance else ()))
           if "policy" in names else None)
@@ -79,6 +88,9 @@ for name in names:
     env.set_script(starts, goals)
     obs = env.reset_all()
     limiter = env.baseline_limiter()
+    g_left = np.zeros(env.n, dtype=np.int64)        # guard: 남은 후진 스텝
+    g_count = 0
+    G_BACK_V, G_BACK_T = [float(x) for x in args.guard_back.split(",")]
     if name.startswith("fixed:"):
         spec = name.split(":", 1)[1]
         if "=" in spec:
@@ -89,7 +101,7 @@ for name in names:
     log = {k: [] for k in ("tilt", "vx", "vy", "v_out", "v_des", "w_des", "wz", "slope")}
     flips = outs = 0
     dist = 0.0
-    hist = []            # 최근 1.5 s 의 (tilt, v_out, vx, v_des, w_des) — 전복 직전 상황 기록용
+    hist = []            # 최근 1.5 s 의 (tilt, v_out, vx, v_des, w_des, pitch, roll, 진행방향 경사, z)
     flip_events = []
     for t in range(T):
         if name == "policy":
@@ -98,28 +110,61 @@ for name in names:
             settle = env._settle > 0
             v_des = np.where(settle, 0.0, env.v_des)
             w_des = np.where(settle, 0.0, env.w_des)
+            if name.startswith("guard"):
+                # 기울기 반사: 앞이 들리거나 옆으로 기울면 밀기를 멈추고 물러난 뒤 다른 목표로.
+                R0 = env._state["R"]
+                pitch = np.degrees(np.arcsin(np.clip(R0[:, 2, 0], -1, 1)))
+                roll = np.degrees(np.arcsin(np.clip(R0[:, 2, 1], -1, 1)))
+                trig = (g_left == 0) & ~settle & ((pitch > args.guard_pitch)
+                                                  | (np.abs(roll) > args.guard_roll))
+                g_left[trig] = int(G_BACK_T / env.dt)
+                g_count += int(trig.sum())
+                backing = g_left > 0
+                v_des = np.where(backing, -G_BACK_V, v_des)
+                w_des = np.where(backing, 0.0, w_des)
+                for i in np.nonzero(g_left == 1)[0]:
+                    if env.mode[i] == 1:
+                        env._next_goal(int(i))            # 실제 스택에서는 "위험 표시 + 다시 계획"
+                g_left = np.maximum(g_left - 1, 0)
             cmd = (v_des, w_des) if name == "raw" else limiter(v_des, w_des)
             obs, r, flipped, trunc, info = env.step(command=cmd)
         for k in log:
             log[k].append(info[k])
         dist += float(np.abs(info["vx"]).sum() * env.dt)
         flips += int(flipped.sum())
-        hist.append((info["tilt"], info["v_out"], info["vx"], info["v_des"], info["w_des"]))
+        R_ = env._state["R"]
+        ci, cj = env._cell(info["pos"][:, 0], info["pos"][:, 1])
+        hx, hy = R_[:, 0, 0], R_[:, 1, 0]
+        hn = np.maximum(np.hypot(hx, hy), 1e-6)
+        grade = np.degrees(np.arctan((GX[ci, cj] * hx + GY[ci, cj] * hy) / hn))
+        hist.append((info["tilt"], info["v_out"], info["vx"], info["v_des"], info["w_des"],
+                     np.degrees(np.arcsin(np.clip(R_[:, 2, 0], -1, 1))),
+                     np.degrees(np.arcsin(np.clip(R_[:, 2, 1], -1, 1))), grade,
+                     info["pos"][:, 2].copy()))
         hist = hist[-23:]
         for i in np.nonzero(flipped)[0]:
-            h = [np.array([row[c][i] for row in hist]) for c in range(5)]
+            h = [np.array([row[c][i] for row in hist]) for c in range(9)]
+            b1 = max(len(hist) - 16, 0)          # 1 s 전
+            b0 = max(len(hist) - 4, 0)           # 0.2 s 전
             flip_events.append({
                 "slope_deg": round(float(info["slope"][i]), 1),
                 "tilt_1s_before": round(float(h[0][max(len(hist) - 16, 0)]), 1),
                 "v_out_mean": round(float(h[1][:-3].mean()), 2) if len(hist) > 3 else None,
                 "vx_max": round(float(np.abs(h[2]).max()), 2),
                 "v_des": round(float(h[3][-1]), 2), "w_des": round(float(h[4][-1]), 2),
+                "pos": [round(float(info["pos"][i, 0]), 2), round(float(info["pos"][i, 1]), 2)],
+                "pitch_1s": round(float(h[5][b1]), 0), "roll_1s": round(float(h[6][b1]), 0),
+                "pitch_02s": round(float(h[5][b0]), 0), "roll_02s": round(float(h[6][b0]), 0),
+                "grade_1s": round(float(h[7][b1]), 0),      # 진행 방향 지형 경사 (+ 오르막)
+                "vx_1s": round(float(h[2][b1]), 2),
+                "drop_1s": round(float(h[8][b1] - h[8][-1]), 2),   # 마지막 1 s 동안 내려간 높이
                 "steps_since_reset": int(env.steps[i])})
         outs += int(trunc.sum())
         done = flipped | trunc
         if done.any():
             idx = np.nonzero(done)[0]
             limiter.reset(idx)
+            g_left[idx] = 0
             obs = env.reset_idx(idx)
     L = {k: np.concatenate(v) for k, v in log.items()}
     moving = np.abs(L["v_des"]) > 0.05
@@ -130,6 +175,7 @@ for name in names:
         "goals": int(env.goals_reached.sum()),
         "goals_per_min": round(env.goals_reached.sum() / (hours * 60.0), 2),
         "flips": flips,
+        "guard_triggers": g_count,
         "flips_per_km": round(flips / max(dist / 1000.0, 1e-9), 2),
         "flips_per_hour": round(flips / hours, 1),
         "rock_stops": outs,

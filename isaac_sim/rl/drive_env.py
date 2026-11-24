@@ -57,7 +57,7 @@ sys.path.insert(0, os.path.join(ISAAC_SIM, "scripts"))
 sys.path.insert(0, os.path.join(os.path.dirname(ISAAC_SIM), "isaac_drive",
                                 "isaac_drive", "navigation"))
 from planet_physics import apply_planet_physics  # noqa: E402
-from wheel_colliders import round_wheel_colliders  # noqa: E402
+from wheel_colliders import lift_link_speed_cap, round_wheel_colliders  # noqa: E402
 from drive_limits import limits_for_gravity      # noqa: E402
 import governor_policy as gp                     # noqa: E402
 
@@ -151,6 +151,8 @@ class RoverDriveEnv:
     # (다각형 convex hull — 돌 때 땅에서 튀어 구동 접지력이 설정 마찰의 60~65% 만 나온다.
     # probe_traction.py 로 잰 값). sphere · cylinder 는 비교 시험용.
     WHEEL_SHAPE = "capsule"
+    # 로버 모델의 link 선속도 상한(1.5 m/s)을 푼다. False 면 모델 그대로.
+    LIFT_SPEED_CAP = True
 
     def __init__(self, app, terrain: str = "terrain_00026", num_envs: int = 16,
                  control_hz: float = 15.0, episode_sec: float = 20.0, seed: int = 0,
@@ -207,6 +209,8 @@ class RoverDriveEnv:
         if self.WHEEL_SHAPE != "mesh":
             self.wheel_info = round_wheel_colliders(stage, roots, shape=self.WHEEL_SHAPE)
             print(f"[drive_env] 바퀴 충돌 형상 → {self.WHEEL_SHAPE}: {self.wheel_info}")
+        if self.LIFT_SPEED_CAP:
+            print(f"[drive_env] link 속도 상한 해제: {lift_link_speed_cap(stage, roots)}")
         self.physics_info = apply_planet_physics(
             stage, self.world, planet, meta=self.meta,
             scene_root="/World/MarsScene", rover_roots=roots)
