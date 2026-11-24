@@ -179,6 +179,9 @@ class ArmExecutorNode(Node):
         # 손목 카메라가 목표 자리에서 광물을 한 번도 못 보면 집지 않는다 (허공 집기 방지).
         self.declare_parameter("abort_if_wrist_sees_nothing", True)
         self.declare_parameter("wrist_presence_radius_m", 0.5)
+        # 손목 카메라가 안정적으로 알아보는 종류에만 적용한다. 초록 가스는 실제로 있어도
+        # 손목 카메라에 안 잡히는 일이 잦아서(3 번 중 3 번) 예전처럼 그대로 진행한다.
+        self.declare_parameter("wrist_presence_classes", ["blue_mineral", "yellow_mineral"])
         self.declare_parameter("wrist_correction_gate_m", 0.15)   # 이보다 먼 검출은 다른 물체로 봄
         self.declare_parameter("wrist_settle_sec", 1.0)
         self.declare_parameter("grasp_command_topic", "/grasp/command")
@@ -830,7 +833,9 @@ class ArmExecutorNode(Node):
                     near = getattr(self, "_wrist_nearest_m", None)
                     nothing = near is None or near > float(
                         self.get_parameter("wrist_presence_radius_m").value)
-                    if attempt == 0 and nothing and bool(
+                    cls = str(goal_handle.request.metadata or "")
+                    trusted = cls in list(self.get_parameter("wrist_presence_classes").value)
+                    if attempt == 0 and nothing and trusted and bool(
                             self.get_parameter("abort_if_wrist_sees_nothing").value):
                         self.get_logger().warn(
                             "contact pick: 손목 카메라에 광물이 안 보임 — 그 자리에 광물이 "
