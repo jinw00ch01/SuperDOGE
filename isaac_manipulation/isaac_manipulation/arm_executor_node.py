@@ -176,6 +176,8 @@ class ArmExecutorNode(Node):
         # (표면→중심) 이 불확실하지만, 손목 카메라는 위에서 내려다보므로 수평
         # 중심이 bbox 중심으로 바로 나온다.
         self.declare_parameter("use_wrist_correction", True)
+        # 손목 카메라가 목표 자리에서 광물을 한 번도 못 보면 집지 않는다 (허공 집기 방지).
+        self.declare_parameter("abort_if_wrist_sees_nothing", True)
         self.declare_parameter("wrist_correction_gate_m", 0.15)   # 이보다 먼 검출은 다른 물체로 봄
         self.declare_parameter("wrist_settle_sec", 1.0)
         self.declare_parameter("grasp_command_topic", "/grasp/command")
@@ -819,6 +821,16 @@ class ArmExecutorNode(Node):
             for attempt in range(2):
                 measured = self._wrist_measure(center)
                 if measured is None:
+                    if attempt == 0 and bool(
+                            self.get_parameter("abort_if_wrist_sees_nothing").value):
+                        self.get_logger().warn(
+                            "contact pick: 손목 카메라에 광물이 안 보임 — 그 자리에 광물이 "
+                            "없는 것으로 보고 집지 않음")
+                        self._goto(cur_deg, HOME_DEG, goal_handle, "HOME_ABORT", 0.6, 1.0)
+                        self._publish_joint_state(HOME_DEG)
+                        goal_handle.abort()
+                        return ExecuteArmTask.Result(
+                            success=False, message="no mineral at the target (wrist camera)")
                     self.get_logger().warn(
                         "contact pick: 손목 카메라에 광물이 안 잡힘 — 로버 카메라 "
                         "추정값 그대로 진행")

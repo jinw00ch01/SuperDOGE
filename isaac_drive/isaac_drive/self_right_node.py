@@ -44,12 +44,13 @@ class SelfRight(Node):
         self.declare_parameter("joint_topic", "joint_states_raw")
         self.declare_parameter("joint_command_topic", "arm/joint_command")
         self.declare_parameter("active_topic", "righting/active")
+        self.declare_parameter("status_topic", "righting/status")
         self.declare_parameter("flipped_hold_sec", 2.0)
         self.declare_parameter("attempt_sec", 20.0)
         self.declare_parameter("max_attempts", 3)
 
         path = str(self.get_parameter("policy_path").value) or default_policy_path()
-        self.policy = rp.GovernorPolicy(path)
+        self.policy = rp.GovernorPolicy(path, rp.OBS_DIM, rp.ACT_DIM)
         self.period = 1.0 / rp.CONTROL_HZ
         self.hold_sec = float(self.get_parameter("flipped_hold_sec").value)
         self.attempt_sec = float(self.get_parameter("attempt_sec").value)
@@ -77,6 +78,10 @@ class SelfRight(Node):
             Odometry, str(self.get_parameter("odom_topic").value), self._on_odom, 10)
         self.create_subscription(
             JointState, str(self.get_parameter("joint_topic").value), self._on_joint, 10)
+        from std_msgs.msg import String
+        self._String = String
+        self.status_pub = self.create_publisher(
+            String, str(self.get_parameter("status_topic").value), 10)
         self.create_timer(0.5, self._publish_active)
         self.get_logger().info(
             f"self-right ready — 정책 {path} (학습 샘플 "
@@ -185,6 +190,11 @@ class SelfRight(Node):
 
     def _publish_active(self) -> None:
         self.active_pub.publish(Bool(data=self.state != "IDLE"))
+        text = {"RIGHTING": f"self-righting with arm ({self.attempts}/{self.max_attempts})",
+                "RETRACT": "folding arm after righting",
+                "GAVE_UP": "flipped - could not self-right"}.get(self.state, "")
+        if text:
+            self.status_pub.publish(self._String(data=text))
 
 
 def main(args: list[str] | None = None) -> None:

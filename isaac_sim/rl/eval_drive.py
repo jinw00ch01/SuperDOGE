@@ -29,6 +29,8 @@ _p.add_argument("--seed", type=int, default=100)
 _p.add_argument("--friction", type=float, default=1.0, help="지면 마찰 배율")
 _p.add_argument("--steep-goal-frac", type=float, default=0.0,
                 help="목표점을 15° 이상 비탈 위에 두는 비율 (비탈 주행을 일부러 늘린 시험)")
+_p.add_argument("--balance", action="store_true",
+                help="--policy 가 균형 정책(balance_env)일 때. 비교 기준 제어기는 팔을 home 에 둔다")
 _p.add_argument("--nav-turn-decel", type=float, default=0.4,
                 help="목표점 추종의 제자리 회전 감속도 (0 = 예전 식)")
 _p.add_argument("--out", default="")
@@ -42,6 +44,8 @@ import numpy as np  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from drive_env import RoverDriveEnv, gp  # noqa: E402
+if args.balance:
+    from balance_env import BalanceEnv as RoverDriveEnv  # noqa: E402,F811
 
 RoverDriveEnv.NAV_TURN_DECEL = args.nav_turn_decel
 env = RoverDriveEnv(app, terrain=args.terrain, num_envs=args.num_envs, seed=args.seed)
@@ -65,7 +69,8 @@ names = [c for c in args.controllers.split(",") if c and (c != "policy" or args.
 for c in names:
     if c not in ("raw", "fixed", "policy") and not c.startswith("fixed:"):
         raise SystemExit(f"알 수 없는 제어 방식: {c}")
-policy = gp.GovernorPolicy(args.policy) if "policy" in names else None
+policy = (gp.GovernorPolicy(args.policy, *((24, 5) if args.balance else ()))
+          if "policy" in names else None)
 results = {}
 for name in names:
     env.set_script(starts, goals)

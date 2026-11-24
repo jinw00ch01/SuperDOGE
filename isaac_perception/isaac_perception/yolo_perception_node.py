@@ -161,6 +161,11 @@ class CamChannel:
         # 그때는 잘리기 전에 본 위치를 대신 낸다. 광물은 스스로 움직이지 않는다.
         self._tracks: List[dict] = []
         self.track_gate_m = 0.5
+        # 추정 거리에서 본 bbox 의 실제 크기가 이보다 작으면 거리를 잘못 잰 것이다
+        # (먼 광물의 깊이 화소가 가까운 땅에 걸린 경우: 12 m 밖 광물이 2.7 m 로 나와
+        #  5 cm 짜리가 된다. 실제 광물은 폭 0.17~0.33 m). 좌표 없음으로 돌려준다.
+        self.min_object_m = 0.08
+        self.rejected_small = 0
         self.track_window = 9
         self.track_ttl_sec = 120.0
         self.used_memory = 0
@@ -407,6 +412,9 @@ class CamChannel:
         truncated = x1 <= 2 or y1 <= 2 or x2 >= w - 3 or y2 >= h - 3
         if truncated:
             radius = max(radius, self.object_radius_m)   # 잘린 bbox 는 작게 나옴
+        elif max(w_m, h_m) < self.min_object_m:
+            self.rejected_small += 1
+            return zero
         pt = pt * (1.0 + radius / float(np.linalg.norm(pt)))
         size_m = (w_m, h_m, 2.0 * radius)
 

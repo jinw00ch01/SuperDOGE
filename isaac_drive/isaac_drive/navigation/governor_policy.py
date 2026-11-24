@@ -80,7 +80,7 @@ def rotate_world_to_body(quat_xyzw, vec):
 class GovernorPolicy:
     """학습 결과(.npz)를 읽어 평균 행동을 낸다. 층: Linear → tanh → … → Linear → tanh."""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, obs_dim: int = OBS_DIM, act_dim: int = ACT_DIM) -> None:
         data = np.load(path)
         self.layers = []
         k = 0
@@ -90,10 +90,10 @@ class GovernorPolicy:
             k += 1
         if not self.layers:
             raise ValueError(f"{path}: 정책 가중치(w0, b0, …)가 없습니다")
-        if self.layers[0][0].shape[1] != OBS_DIM or self.layers[-1][0].shape[0] != ACT_DIM:
+        if self.layers[0][0].shape[1] != obs_dim or self.layers[-1][0].shape[0] != act_dim:
             raise ValueError(
                 f"{path}: 입출력 크기가 다릅니다 (입력 {self.layers[0][0].shape[1]} / "
-                f"출력 {self.layers[-1][0].shape[0]}, 필요 {OBS_DIM} / {ACT_DIM})")
+                f"출력 {self.layers[-1][0].shape[0]}, 필요 {obs_dim} / {act_dim})")
         self.meta = {k: data[k].item() if data[k].shape == () else data[k]
                      for k in data.files if not (k[0] in "wb" and k[1:].isdigit())}
 

@@ -174,6 +174,7 @@ class MissionManagerNode(Node):
         self.declare_parameter("estop_topic", "/mission/estop")
         # self_right_node 가 넘어진 로버를 세우는 동안 True 를 보낸다 → 바퀴 정지.
         self.declare_parameter("righting_active_topic", "righting/active")
+        self.declare_parameter("righting_status_topic", "righting/status")
         self.declare_parameter("battery_topic", "/battery_state")
         self.declare_parameter("min_confidence", 0.6)
         self.declare_parameter("terrain_dir", _default_terrain_dir())
@@ -235,6 +236,8 @@ class MissionManagerNode(Node):
         self.estop = False
         self.righting_active = False
         self._righting_stamp_ns = 0
+        self.righting_status = ""           # self_right_node 가 보내는 진행 상황 (HUD 의 TASK)
+        self._phase_before_recovery = "EXPLORE"
         # Mineral collection / battery
         self.collected_count: int = 0
         self.cargo_count: int = 0
@@ -359,6 +362,9 @@ class MissionManagerNode(Node):
             String, str(self.get_parameter("mode_topic").value),
             self._on_mode, 10)
         from std_msgs.msg import Bool as _Bool
+        self.create_subscription(
+            String, str(self.get_parameter("righting_status_topic").value),
+            lambda m: setattr(self, "righting_status", m.data), 10)
         self.create_subscription(
             _Bool, str(self.get_parameter("righting_active_topic").value),
             self._on_righting, 10)
@@ -573,11 +579,27 @@ class MissionManagerNode(Node):
     def _on_righting(self, msg) -> None:
         if msg.data and not self.righting_active:
             self.get_logger().warn("넘어짐 복구 중 — 주행 정지")
+            if self.phase != "RECOVERY":
+                self._phase_before_recovery = self.phase
+            self._enter_phase("RECOVERY", reason="rover flipped")
         elif not msg.data and self.righting_active:
             self.get_logger().info("넘어짐 복구 끝 — 주행 재개")
-            self.waypoints = []                 # 자세가 바뀌었으니 다시 계획
+            self._leave_recovery()
         self.righting_active = bool(msg.data)
         self._righting_stamp_ns = self.get_clock().now().nanoseconds
+
+    def _leave_recovery(self) -> None:
+        """RECOVERY → 하던 일로. 채취 도중이었으면 목표를 버리고 탐색부터 다시."""
+        self.righting_status = ""
+        if self.phase != "RECOVERY":
+            return
+        back = self._phase_before_recovery
+        if back not in ("RETURN_TO_BASE", "MISSION_COMPLETE"):
+            back = "EXPLORE"
+            self.target = None
+            self.lock_target = None
+        self.waypoints = []                     # 자세가 바뀌었으니 다시 계획
+        self._enter_phase(back, reason="righted")
 
     def _on_estop(self, _msg: Empty) -> None:
         if not self.estop:
@@ -605,6 +627,7 @@ class MissionManagerNode(Node):
             # 복구 노드가 죽어 신호가 끊긴 경우(3 s)에는 풀어 준다.
             if self.get_clock().now().nanoseconds - self._righting_stamp_ns > int(3e9):
                 self.righting_active = False
+                self._leave_recovery()
             else:
                 self.cmd_pub.publish(Twist())
                 return
@@ -1304,7 +1327,8 @@ class MissionManagerNode(Node):
         s.collected_blue   = int(self.collected_by_class.get("blue_mineral", 0))
         s.collected_yellow = int(self.collected_by_class.get("yellow_mineral", 0))
         s.collected_green  = int(self.collected_by_class.get("green_gas", 0))
-        s.active_task = ("picking" if self.arm_in_flight
+        s.active_task = ((self.righting_status or "self-righting") if self.phase == "RECOVERY"
+                         else "picking" if self.arm_in_flight
                          else "manual" if self.mode == "MANUAL"
                          else self.phase.lower())
         s.last_error = self.last_error

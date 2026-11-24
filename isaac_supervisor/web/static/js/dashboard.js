@@ -100,6 +100,7 @@
   const PHASE_CLASSES = [
     "phase-EXPLORE", "phase-APPROACH", "phase-PICK_READY",
     "phase-RETURN_TO_BASE", "phase-MISSION_COMPLETE", "phase-MANUAL",
+    "phase-RECOVERY",
   ];
 
   function paintPhase(rawState) {

@@ -351,6 +351,7 @@ body {
 .phase-RETURN_TO_BASE    { background: #5a2a8a; }
 .phase-MISSION_COMPLETE  { background: #1a7a4a; }
 .phase-MANUAL            { background: #6a6a1a; }
+.phase-RECOVERY          { background: #a01a3a; }
 
 /* status-pairs-row — POS/YAW/SPEED 같은 한 줄에 여러 pair.
    status-info 의 직접 child 라 PHASE/BAT/COLL 와 함께 6 row 균등 분포. */
