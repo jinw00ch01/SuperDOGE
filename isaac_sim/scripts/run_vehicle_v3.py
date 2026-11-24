@@ -373,8 +373,26 @@ def _update_chase_cam(stage, transform_op, state: dict) -> None:
     ry = Gf.Vec3d(m[1][0], m[1][1], m[1][2])
     rz = Gf.Vec3d(m[2][0], m[2][1], m[2][2])
     ox, oy, oz = CHASE_OFFSET_LOCAL
-    eye = Gf.Vec3d(rover_pos) + rx * ox + ry * oy + rz * oz
-    target = Gf.Vec3d(rover_pos) + rz * CHASE_TARGET_Z_BIAS
+    # 카메라는 차체의 기울기를 따라가지 않는다: 위는 항상 세계의 위, 뒤는 로버가
+    # 바라보는 방향의 수평 성분. 차체 축을 그대로 쓰면 로버가 넘어질 때 카메라도 같이
+    # 땅속으로 돌아가 넘어지는 모습과 일어서는 모습이 보이지 않는다.
+    # 60° 넘게 기울면(넘어지는 중·넘어짐) 방향은 마지막으로 서 있던 때의 것을 유지한다.
+    world_up = Gf.Vec3d(0, 0, 1)
+    flat = Gf.Vec3d(rx[0], rx[1], 0.0)
+    heading = state.get("heading")
+    if rz[2] > 0.5 and flat.GetLength() > 0.3:
+        flat = flat / flat.GetLength()
+        if heading is None:
+            heading = flat
+        else:                                   # 급회전에 화면이 튀지 않게 조금씩 따라간다
+            heading = heading * 0.85 + flat * 0.15
+            heading = heading / max(heading.GetLength(), 1e-6)
+        state["heading"] = heading
+    if heading is None:
+        heading = Gf.Vec3d(1, 0, 0)
+    left = Gf.Cross(world_up, heading)
+    eye = Gf.Vec3d(rover_pos) + heading * ox + left * oy + world_up * oz
+    target = Gf.Vec3d(rover_pos) + world_up * CHASE_TARGET_Z_BIAS
 
     # look-at 매트릭스 — camera local 의 -z(forward) 가 (target - eye) 향함.
     fwd = (target - eye)
@@ -382,7 +400,6 @@ def _update_chase_cam(stage, transform_op, state: dict) -> None:
     if fwd_len < 1e-6:
         return
     fwd = fwd / fwd_len
-    world_up = Gf.Vec3d(0, 0, 1)
     right = Gf.Cross(fwd, world_up)
     right_len = right.GetLength()
     if right_len < 1e-6:
