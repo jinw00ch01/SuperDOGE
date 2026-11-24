@@ -16,6 +16,19 @@ Phases (AUTO mode):
 - RETURN_TO_BASE   : A* path to (0, 0) basecamp — triggered when
                      collected_count >= collection_goal OR battery critical
 - MISSION_COMPLETE : stopped at basecamp, mission ended
+- RECOVERY         : 넘어져서 self_right_node 가 일으키는 중 (주행 정지)
+- ESTOP            : 운영자가 세움. RESUME 명령이 올 때까지 주행 정지
+
+Operator commands (HUD 의 ACTIONS 버튼 → <ns>/mission/command, std_msgs/String):
+  ESTOP       주행 정지 + 진행 중인 채취 동작 취소 (팔이 그 자리에 선다)
+  RESUME      ESTOP 해제. 세워 둔 팔을 HOME 으로 되돌린 뒤, 복귀/완료 중이었으면
+              그대로, 아니면 EXPLORE 부터
+  RTB         지금 기지로 복귀 (목표 수를 못 채웠어도)
+  RTB_CANCEL  운영자가 시킨 복귀를 취소하고 탐색 재개
+  RESET       채집 수를 0 으로. 임무가 끝났거나 복귀 중이면 탐색부터 다시 시작
+  REPLAN      지금 경로를 버리고 다시 계획 (coverage 에도 요청)
+  SKIP        접근 중인 목표를 failed_pick_ignore_sec 동안 건너뜀
+명령과 phase 전환은 <ns>/mission/event (String) 로도 나간다 — HUD 의 EVENT LOG.
 
 Coverage_node must be launched with topic remap:
   ros2 run isaac_drive coverage_node --ros-args -r /cmd_vel:=/coverage/cmd_vel_raw
@@ -172,6 +185,11 @@ class MissionManagerNode(Node):
         self.declare_parameter("state_topic", "/mission/state")
         self.declare_parameter("mode_topic", "/mission/mode")
         self.declare_parameter("estop_topic", "/mission/estop")
+        # 운영자 명령 (HUD 의 ACTIONS 버튼). std_msgs/String:
+        #   ESTOP | RESUME | RTB | RTB_CANCEL | RESET | REPLAN | SKIP
+        self.declare_parameter("command_topic", "/mission/command")
+        # 운영자 명령과 phase 전환을 사람이 읽는 한 줄로 내보낸다 (HUD 의 EVENT LOG).
+        self.declare_parameter("event_topic", "/mission/event")
         # self_right_node 가 넘어진 로버를 세우는 동안 True 를 보낸다 → 바퀴 정지.
         self.declare_parameter("righting_active_topic", "righting/active")
         self.declare_parameter("righting_status_topic", "righting/status")
@@ -234,6 +252,10 @@ class MissionManagerNode(Node):
         self.phase = "EXPLORE"
         self.mode = "AUTO"
         self.estop = False
+        self._phase_before_estop = "EXPLORE"
+        self.operator_rtb = False           # 운영자가 누른 RTB (목표 달성 전)
+        self._arm_goal_handle = None
+        self._arm_stopped = False           # ESTOP 으로 팔을 세웠다 → 풀리면 HOME 으로 보낸다
         self.righting_active = False
         self._righting_stamp_ns = 0
         self.righting_status = ""           # self_right_node 가 보내는 진행 상황 (HUD 의 TASK)
@@ -333,6 +355,8 @@ class MissionManagerNode(Node):
             String, str(self.get_parameter("phase_topic").value), 10)
         self.state_pub = self.create_publisher(
             MissionState, str(self.get_parameter("state_topic").value), 10)
+        self.event_pub = self.create_publisher(
+            String, str(self.get_parameter("event_topic").value), 20)
         # Tell coverage_node to drop its stale DRIVE path and replan from
         # the rover's new post-APPROACH/PICK position.
         self.replan_pub = self.create_publisher(
@@ -371,6 +395,9 @@ class MissionManagerNode(Node):
         self.create_subscription(
             Empty, str(self.get_parameter("estop_topic").value),
             self._on_estop, 10)
+        self.create_subscription(
+            String, str(self.get_parameter("command_topic").value),
+            self._on_command, 10)
         self.create_subscription(
             BatteryState, str(self.get_parameter("battery_topic").value),
             self._on_battery, 10)
@@ -566,6 +593,7 @@ class MissionManagerNode(Node):
         if new_mode == self.mode:
             return
         self.get_logger().info(f"mode: {self.mode} -> {new_mode}")
+        self._event(f"mode {self.mode} -> {new_mode}")
         self.mode = new_mode
         # Reset autonomy lock/target when switching to MANUAL so re-engaging
         # AUTO starts from a clean phase.
@@ -594,7 +622,9 @@ class MissionManagerNode(Node):
         if self.phase != "RECOVERY":
             return
         back = self._phase_before_recovery
-        if back not in ("RETURN_TO_BASE", "MISSION_COMPLETE"):
+        if self.estop:
+            back = "ESTOP"
+        elif back not in ("RETURN_TO_BASE", "MISSION_COMPLETE"):
             back = "EXPLORE"
             self.target = None
             self.lock_target = None
@@ -602,10 +632,186 @@ class MissionManagerNode(Node):
         self._enter_phase(back, reason="righted")
 
     def _on_estop(self, _msg: Empty) -> None:
-        if not self.estop:
-            self.get_logger().warn("ESTOP received — mission halted.")
+        self._engage_estop()
+
+    def _engage_estop(self) -> str:
+        if self.estop:
+            return "ESTOP 이미 걸려 있음"
+        self.get_logger().warn("ESTOP received — mission halted.")
         self.estop = True
         self.last_error = "ESTOP triggered"
+        if self.phase != "ESTOP":
+            self._phase_before_estop = self.phase
+        # 팔이 움직이는 중이면 그것도 멈춘다 (arm_executor 가 취소를 받아 준다).
+        handle = self._arm_goal_handle
+        arm_note = ""
+        if self.arm_in_flight and handle is not None:
+            try:
+                handle.cancel_goal_async()
+                self._arm_stopped = True
+                arm_note = ", 팔도 그 자리에 세움"
+            except Exception as e:
+                self.get_logger().warn(f"arm goal cancel failed: {e}")
+        self.cmd_pub.publish(Twist())
+        self._enter_phase("ESTOP", reason="operator ESTOP")
+        return "ESTOP 걸림 — 주행 정지" + arm_note
+
+    def _release_estop(self) -> str:
+        if not self.estop:
+            return "RESUME 무시 — ESTOP 상태가 아님"
+        self.estop = False
+        self.last_error = ""
+        if self.phase == "RECOVERY":         # 넘어짐 복구가 끝나면 _leave_recovery 가 이어 간다
+            if self._phase_before_recovery == "ESTOP":
+                self._phase_before_recovery = self._phase_before_estop
+            return "ESTOP 해제 — 넘어짐 복구가 끝나면 재개"
+        back = self._phase_before_estop
+        if back not in ("RETURN_TO_BASE", "MISSION_COMPLETE"):
+            back = "EXPLORE"                 # 접근·채취 도중이었으면 탐색부터 다시
+            self.target = None
+            self.lock_target = None
+        self.explore_entry_ns = self.get_clock().now().nanoseconds
+        self._enter_phase(back, reason="operator RESUME")
+        if back == "EXPLORE":
+            self.replan_pub.publish(Empty())
+        arm_note = ""
+        if self._arm_stopped:
+            arm_note = " (먼저 팔을 HOME 으로)"
+            if not self.arm_in_flight:       # 취소가 이미 끝났으면 지금, 아니면 끝나는 대로
+                self._send_arm_home()
+        return f"ESTOP 해제 — {back} 로 재개{arm_note}"
+
+    def _send_arm_home(self) -> None:
+        """ESTOP 으로 세워 둔 팔을 HOME 으로 되돌린다. 끝날 때까지 로버는 서 있는다."""
+        if self.arm_client is None or self.arm_in_flight:
+            return
+        if not self.arm_client.wait_for_server(timeout_sec=1.0):
+            self.get_logger().warn("arm action server not available — 팔을 HOME 으로 못 보냄")
+            self._arm_stopped = False
+            return
+        goal = ExecuteArmTask.Goal()
+        goal.command = "home"
+        self.arm_in_flight = True
+        self.get_logger().info("arm action sent: home (ESTOP 해제 뒤 복귀)")
+
+        def accepted(future) -> None:
+            try:
+                handle = future.result()
+            except Exception as e:
+                self.get_logger().error(f"arm home goal failed: {e}")
+                self.arm_in_flight = False
+                return
+            if not handle.accepted:
+                self.arm_in_flight = False
+                return
+            self._arm_goal_handle = handle
+            handle.get_result_async().add_done_callback(done)
+
+        def done(_future) -> None:
+            self.arm_in_flight = False
+            self._arm_goal_handle = None
+            if self.estop:                   # 복귀 도중 다시 세웠다 — 풀리면 또 보낸다
+                return
+            self._arm_stopped = False
+            self.explore_entry_ns = self.get_clock().now().nanoseconds
+            self.get_logger().info("arm home done — 주행 재개")
+            self._event("팔 HOME 복귀 끝 — 주행 재개")
+
+        self.arm_client.send_goal_async(goal).add_done_callback(accepted)
+
+    # ── 운영자 명령 (HUD) ───────────────────────────────────────────────
+    def _event(self, text: str) -> None:
+        m = String()
+        m.data = text
+        self.event_pub.publish(m)
+
+    def _on_command(self, msg: String) -> None:
+        cmd = (msg.data or "").strip().upper()
+        handlers = {
+            "ESTOP": self._engage_estop, "RESUME": self._release_estop,
+            "RTB": self._cmd_rtb, "RTB_CANCEL": self._cmd_rtb_cancel,
+            "RESET": self._cmd_reset, "REPLAN": self._cmd_replan, "SKIP": self._cmd_skip,
+        }
+        if cmd not in handlers:
+            self.get_logger().warn(f"operator command 무시 (모르는 명령): {msg.data!r}")
+            self._event(f"command {msg.data!r} 무시 — 모르는 명령")
+            return
+        result = handlers[cmd]()
+        self.get_logger().info(f"operator command {cmd}: {result}")
+        self._event(f"command {cmd}: {result}")
+        self._publish_state()
+
+    def _cmd_rtb(self) -> str:
+        if self.estop:
+            return "거부 — ESTOP 상태 (먼저 RESUME)"
+        if self.phase == "MISSION_COMPLETE":
+            return "거부 — 이미 임무 완료"
+        if self.phase == "RETURN_TO_BASE":
+            return "이미 복귀 중"
+        if self.arm_in_flight:
+            return "거부 — 채취 동작 중 (끝난 뒤 다시)"
+        self.operator_rtb = True
+        self.target = None
+        self.lock_target = None
+        self._enter_phase("RETURN_TO_BASE", reason="operator RTB")
+        return f"기지 복귀 시작 (채집 {self.collected_count}개)"
+
+    def _cmd_rtb_cancel(self) -> str:
+        if self.phase != "RETURN_TO_BASE":
+            return "무시 — 복귀 중이 아님"
+        goal = int(self.get_parameter("collection_goal").value)
+        if (goal >= 0 and self.collected_count >= goal) or self.battery_critical:
+            return "거부 — 목표 달성/배터리 때문에 하는 복귀는 취소할 수 없음"
+        self.operator_rtb = False
+        self.explore_entry_ns = self.get_clock().now().nanoseconds
+        self._enter_phase("EXPLORE", reason="operator RTB cancel")
+        self.replan_pub.publish(Empty())
+        return "복귀 취소 — 탐색 재개"
+
+    def _cmd_reset(self) -> str:
+        if self.arm_in_flight:
+            return "거부 — 채취 동작 중"
+        before = self.collected_count
+        self.collected_count = 0
+        self.cargo_count = 0
+        for k in self.collected_by_class:
+            self.collected_by_class[k] = 0
+        self.failed_pick_points = []
+        self.last_error = "" if not self.estop else self.last_error
+        self.operator_rtb = False
+        restarted = ""
+        if not self.estop and self.phase in ("MISSION_COMPLETE", "RETURN_TO_BASE"):
+            self.target = None
+            self.lock_target = None
+            self.explore_entry_ns = self.get_clock().now().nanoseconds
+            self._enter_phase("EXPLORE", reason="operator RESET")
+            self.replan_pub.publish(Empty())
+            restarted = ", 임무 다시 시작"
+        return f"채집 수 {before} → 0{restarted}"
+
+    def _cmd_replan(self) -> str:
+        self.waypoints = []
+        self.wp_idx = 0
+        self.last_plan_target = None
+        self.last_plan_ns = 0
+        self.replan_pub.publish(Empty())
+        return f"경로 다시 계획 ({self.phase})"
+
+    def _cmd_skip(self) -> str:
+        if self.arm_in_flight:
+            return "거부 — 채취 동작 중"
+        tgt = self.lock_target or self.target
+        if tgt is None or self.phase not in ("APPROACH", "PICK_READY"):
+            return "무시 — 접근 중인 목표가 없음"
+        now_ns = self.get_clock().now().nanoseconds
+        ignore_sec = float(self.get_parameter("failed_pick_ignore_sec").value)
+        x, y = float(tgt.world_position.x), float(tgt.world_position.y)
+        self.failed_pick_points.append((x, y, now_ns + int(ignore_sec * 1e9)))
+        self.target = None
+        self.lock_target = None
+        self.lock_started_ns = 0
+        self.last_det_stamp_ns = 0
+        return f"목표 {tgt.class_name} ({x:.1f}, {y:.1f}) 를 {ignore_sec:.0f} s 동안 건너뜀"
 
     def _on_battery(self, msg: BatteryState) -> None:
         self.battery_percent = float(msg.percentage)
@@ -619,7 +825,6 @@ class MissionManagerNode(Node):
     def _tick(self) -> None:
         # 1. Hard overrides (highest priority): ESTOP / MANUAL / MISSION_COMPLETE.
         if self.estop:
-            self._enter_phase("MISSION_COMPLETE", reason="ESTOP")
             self.cmd_pub.publish(Twist())
             return
 
@@ -717,6 +922,8 @@ class MissionManagerNode(Node):
                    f"{self.target.world_position.y:.2f}), dist={dist:.2f}m, "
                    f"stop_d={stop_d:.2f}m)"
                    if det_fresh else ""))
+            self._event(f"phase {prev_phase} -> {self.phase}"
+                        + (f" ({self.target.class_name} {dist:.1f} m)" if det_fresh else ""))
             if self.phase != "APPROACH":
                 self.waypoints = []
                 self.wp_idx = 0
@@ -1136,6 +1343,7 @@ class MissionManagerNode(Node):
             self.get_logger().warn("arm goal rejected by server")
             self.arm_in_flight = False
             return
+        self._arm_goal_handle = handle
         handle.get_result_async().add_done_callback(self._on_arm_result)
 
     def _on_arm_result(self, future) -> None:
@@ -1146,8 +1354,18 @@ class MissionManagerNode(Node):
         except Exception as e:
             ok, msg_text = False, f"exception: {e}"
         self.arm_in_flight = False
+        self._arm_goal_handle = None
         self.last_pick_done_ns = self.get_clock().now().nanoseconds
         self.last_pick_world = getattr(self, "_pending_pick_world", None)
+        if not ok and msg_text.startswith("canceled"):
+            # 운영자가 세운 것 — 채취 실패로 치지 않는다 (그 자리를 피하지도 않는다).
+            self.target = None
+            self.last_det_stamp_ns = 0
+            self.get_logger().info("arm action canceled by operator — 팔이 그 자리에 섬")
+            self._event("채취 동작 취소됨 — 팔이 그 자리에 섬")
+            if not self.estop and self._arm_stopped:
+                self._send_arm_home()        # 취소가 끝나기 전에 이미 RESUME 을 눌렀다
+            return
         if ok:
             self.collected_count += 1
             cap = int(self.get_parameter("cargo_capacity").value)
@@ -1159,9 +1377,11 @@ class MissionManagerNode(Node):
                 self.collected_by_class[picked_class] += 1
             # 직전 실패 메시지는 깨끗하게 — 한 번 실패가 영원히 화면에 박혀
             # 있는 현상 방지. 다음 실패가 발생하면 그때 다시 채워짐.
-            self.last_error = ""
+            if not self.estop:
+                self.last_error = ""
         else:
-            self.last_error = f"arm failed: {msg_text}"
+            if not self.estop:
+                self.last_error = f"arm failed: {msg_text}"
             if self.last_pick_world is not None:
                 ignore_ns = int(float(
                     self.get_parameter("failed_pick_ignore_sec").value) * 1e9)
@@ -1211,6 +1431,9 @@ class MissionManagerNode(Node):
             pass
         suffix = f" ({reason})" if reason else ""
         self.get_logger().info(f"phase: {prev} -> {new_phase}{suffix}")
+        self._event(f"phase {prev} -> {new_phase}{suffix}")
+        if new_phase != "RETURN_TO_BASE":
+            self.operator_rtb = False
 
     def _drive_to_basecamp(self) -> None:
         if self.last_odom is None:
@@ -1315,7 +1538,10 @@ class MissionManagerNode(Node):
 
     def _publish_state(self) -> None:
         s = MissionState()
-        s.state = self.phase if self.mode == "AUTO" else f"MANUAL/{self.phase}"
+        # ESTOP 이 걸려 있는 동안에는 안에서 phase 가 어떻게 바뀌든(넘어짐 복구 등)
+        # 밖으로는 항상 ESTOP 으로 알린다 — HUD 의 PHASE·TASK 가 정지 상태임을 보여야 한다.
+        phase = "ESTOP" if self.estop else self.phase
+        s.state = phase if self.mode == "AUTO" else f"MANUAL/{phase}"
         s.previous_state = ""
         s.battery_percent = float(self.battery_percent)
         s.low_battery = bool(self.battery_low)
@@ -1327,7 +1553,11 @@ class MissionManagerNode(Node):
         s.collected_blue   = int(self.collected_by_class.get("blue_mineral", 0))
         s.collected_yellow = int(self.collected_by_class.get("yellow_mineral", 0))
         s.collected_green  = int(self.collected_by_class.get("green_gas", 0))
-        s.active_task = ((self.righting_status or "self-righting") if self.phase == "RECOVERY"
+        s.active_task = ("E-STOP" + (" · 팔 정지" if self._arm_stopped else "")
+                         + (" · 넘어짐 복구 중" if self.phase == "RECOVERY" else "")
+                         if self.estop
+                         else (self.righting_status or "self-righting") if self.phase == "RECOVERY"
+                         else "arm → home" if self.arm_in_flight and self._arm_stopped
                          else "picking" if self.arm_in_flight
                          else "manual" if self.mode == "MANUAL"
                          else self.phase.lower())

@@ -100,7 +100,7 @@
   const PHASE_CLASSES = [
     "phase-EXPLORE", "phase-APPROACH", "phase-PICK_READY",
     "phase-RETURN_TO_BASE", "phase-MISSION_COMPLETE", "phase-MANUAL",
-    "phase-RECOVERY",
+    "phase-RECOVERY", "phase-ESTOP",
   ];
 
   function paintPhase(rawState) {
@@ -110,7 +110,11 @@
     PHASE_CLASSES.forEach((c) => badge.classList.remove(c));
     badge.classList.add(`phase-${bare}`);
     if (manual) badge.classList.add("phase-MANUAL");
-    badge.textContent = (manual ? "MANUAL · " : "") + bare;
+    badge.textContent = (manual ? "MANUAL · " : "") + phaseLabel(bare);
+  }
+  // 화면에 쓰는 이름. ESTOP 은 눈에 띄게 "E-STOP" 으로.
+  function phaseLabel(bare) {
+    return bare === "ESTOP" ? "E-STOP" : bare;
   }
 
   function paintBattery(pct, low, crit) {
@@ -139,13 +143,17 @@
       paintCollected(s.collected_count | 0, s.collection_goal | 0);
       paintMinerals(s);
       $("task").textContent = s.active_task || "—";
+      $("task").classList.toggle("bad", (s.state || "").split("/").pop() === "ESTOP");
       $("err").textContent = s.last_error || "—";
+      paintPortraitState(rid, s.state || "");
+      paintButtons(s.state || "");
     }
     if (r.odom) {
       const o = r.odom;
       $("pos-xy").textContent = `${o.x.toFixed(2)} , ${o.y.toFixed(2)}`;
       $("pos-yaw").textContent = `${o.yaw_deg.toFixed(0)} °`;
       $("spd").textContent = `${o.speed.toFixed(2)} m/s`;
+      paintAttitude(o);
     }
     if (r.cmd_vel) {
       $("cmdv").textContent = `v=${r.cmd_vel.lin.toFixed(2)}  ω=${r.cmd_vel.ang.toFixed(2)}`;
@@ -159,11 +167,12 @@
      한 번 error 가 난 뒤 스스로 다시 시도하지 않는다. 그래서
        · error 가 나면 3 초 뒤 다시 연결하고,
        · socket 이 (다시) 연결될 때 = 스택이 다시 떴을 때 전부 새로 연결한다. */
+  let yoloOn = true;       // CAM 버튼: YOLO 표시가 얹힌 영상 ↔ 카메라 원본
   const CAMERAS = [
-    // [img id, rover namespace 아래의 topic]
-    ["cam-wrist", "perception/image_annotated"],        // 차체 카메라 + YOLO
-    ["cam-chase", "camera/chase/image_raw"],            // 로버 뒤에서 따라가는 카메라
-    ["cam-arm",   "perception/wrist_image_annotated"],  // M0609 손목 카메라 (공구 z 축)
+    // [img id, rover namespace 아래의 topic (YOLO 표시), 원본 topic]
+    ["cam-wrist", "perception/image_annotated", "camera/rover/image_raw"],        // 차체 카메라
+    ["cam-chase", "camera/chase/image_raw", "camera/chase/image_raw"],            // 뒤따르는 카메라
+    ["cam-arm",   "perception/wrist_image_annotated", "camera/wrist/image_raw"],  // M0609 손목 카메라
   ];
   const camRetryTimers = {};
 
@@ -188,7 +197,7 @@
   }
 
   function refreshCameraSrcs() {
-    CAMERAS.forEach(([id, tail]) => connectCamera(id, tail));
+    CAMERAS.forEach(([id, ann, raw]) => connectCamera(id, yoloOn ? ann : raw));
   }
 
   function refreshActiveViews() {
@@ -437,8 +446,269 @@
   // initial paint with placeholder text.
   paintMap();
 
-  /* ── Action grid is intentionally inert at this stage ────────── */
-  document.querySelectorAll(".action-grid .act").forEach((btn) => {
-    btn.addEventListener("click", (e) => e.preventDefault());
+  /* ── 사진 위 표시: 이름·상태, 자세계 ─────────────────────────── */
+  const PORTRAIT_STATES = ["MANUAL", "RECOVERY", "ESTOP", "MISSION_COMPLETE"];
+
+  function paintPortraitState(rid, rawState) {
+    const frame = $("portrait-frame");
+    const manual = rawState.startsWith("MANUAL/");
+    const bare = rawState.split("/").pop();
+    PORTRAIT_STATES.forEach((c) => frame.classList.remove(`st-${c}`));
+    if (bare === "ESTOP" || bare === "RECOVERY" || bare === "MISSION_COMPLETE") {
+      frame.classList.add(`st-${bare}`);
+    } else if (manual) {
+      frame.classList.add("st-MANUAL");
+    }
+    $("portrait-name").textContent = "DOGE" + (rid ? ` · ${rid}` : "");
+    const tag = $("portrait-state");
+    PHASE_CLASSES.forEach((c) => tag.classList.remove(c));
+    tag.classList.add(`phase-${bare}`);
+    if (manual && bare !== "ESTOP") tag.classList.add("phase-MANUAL");
+    tag.textContent = (bare === "ESTOP" ? "E-STOP"
+                       : manual ? "MANUAL" : bare.replace(/_/g, " ")) || "—";
+  }
+
+  function levelClass(el, deg, warn, bad) {
+    el.classList.toggle("warn", deg >= warn && deg < bad);
+    el.classList.toggle("bad", deg >= bad);
+  }
+
+  const att = $("attitude");
+  const actx = att.getContext("2d");
+  function paintAttitude(o) {
+    const roll = o.roll_deg, pitch = o.pitch_deg, tilt = o.tilt_deg;
+    if (!Number.isFinite(roll) || !Number.isFinite(pitch)) return;
+    const sgn = (v) => (v >= 0 ? "+" : "−") + Math.abs(v).toFixed(0) + "°";
+    $("att-roll").textContent = sgn(roll);
+    $("att-pitch").textContent = sgn(pitch);
+    levelClass($("att-roll"), Math.abs(roll), 20, 32);
+    levelClass($("att-pitch"), Math.abs(pitch), 20, 30);
+    [$("tilt"), $("att-tilt")].forEach((el) => {
+      el.textContent = `${tilt.toFixed(0)}°`;
+      levelClass(el, tilt, 25, 40);
+    });
+
+    // 자세계: 운전석에서 본 지평선. 앞이 들리면(pitch +) 지평선이 내려가고,
+    // 오른쪽으로 기울면(roll +) 지평선이 왼쪽으로 돈다.
+    const W = att.width, c = W / 2, R = c - 3;
+    actx.clearRect(0, 0, W, W);
+    actx.save();
+    actx.beginPath(); actx.arc(c, c, R, 0, Math.PI * 2); actx.clip();
+    actx.translate(c, c);
+    actx.rotate(-roll * Math.PI / 180);
+    const dy = Math.max(-R, Math.min(R, (pitch / 45) * R));   // ±45° 가 가장자리
+    actx.fillStyle = "#1d4f8f"; actx.fillRect(-2 * R, -2 * R + dy, 4 * R, 2 * R);   // 하늘
+    actx.fillStyle = "#8a4a2a"; actx.fillRect(-2 * R, dy, 4 * R, 2 * R);            // 땅
+    actx.strokeStyle = "#fff"; actx.lineWidth = 2;
+    actx.beginPath(); actx.moveTo(-2 * R, dy); actx.lineTo(2 * R, dy); actx.stroke();
+    actx.restore();
+    // 차체 기준 표시 (고정)
+    const danger = tilt >= 40 ? "#ff6478" : tilt >= 25 ? "#ffba4a" : "#ffd84a";
+    actx.strokeStyle = danger; actx.lineWidth = 3;
+    actx.beginPath();
+    actx.moveTo(c - R * 0.6, c); actx.lineTo(c - R * 0.2, c);
+    actx.moveTo(c + R * 0.2, c); actx.lineTo(c + R * 0.6, c);
+    actx.stroke();
+    actx.fillStyle = danger; actx.beginPath(); actx.arc(c, c, 3, 0, Math.PI * 2); actx.fill();
+    actx.strokeStyle = tilt >= 40 ? "#ff6478" : "#2a4870"; actx.lineWidth = 3;
+    actx.beginPath(); actx.arc(c, c, R, 0, Math.PI * 2); actx.stroke();
+  }
+
+  /* ── EVENT LOG ───────────────────────────────────────────────
+     최신이 위. 칸보다 길어지면 스크롤 막대로 넘긴다. 예전 줄을 읽으려고 내려가 있는
+     동안에는 새 줄이 들어와도 보던 자리가 밀리지 않게 한다. */
+  const evList = $("event-list");
+  const EV_MAX = 400;
+  const evData = [];     // 시간순 (복사용)
+  const hh = (n) => String(n).padStart(2, "0");
+  function clock(t) {
+    const d = new Date((t || 0) * 1000);
+    return `${hh(d.getHours())}:${hh(d.getMinutes())}:${hh(d.getSeconds())}`;
+  }
+  function eventLine(ev) {
+    const li = document.createElement("li");
+    const t = document.createElement("span");
+    t.className = "t";
+    t.textContent = clock(ev.t);
+    li.appendChild(t);
+    if (ev.rover_id) {
+      const r = document.createElement("span");
+      r.className = "r";
+      r.textContent = ev.rover_id;
+      li.appendChild(r);
+    }
+    li.appendChild(document.createTextNode(ev.text || ""));
+    if (ev.kind === "action") li.classList.add("ev-action");
+    if (/ESTOP|RECOVERY|거부|실패/.test(ev.text || "")) li.classList.add("ev-warn");
+    li.title = `${t.textContent} ${ev.rover_id || ""} ${ev.text || ""}` +
+               (ev.origin ? ` (from ${ev.origin})` : "");
+    return li;
+  }
+  function addEvent(ev) {
+    evData.push(ev);
+    if (evData.length > EV_MAX) evData.shift();
+    const away = evList.scrollTop > 4;          // 예전 줄을 보고 있다
+    const li = eventLine(ev);
+    evList.insertBefore(li, evList.firstChild);
+    if (away) evList.scrollTop += li.offsetHeight;
+    while (evList.children.length > EV_MAX) evList.removeChild(evList.lastChild);
+    $("event-count").textContent = `${evData.length}`;
+  }
+  sock.on("event", addEvent);
+  sock.on("events", (msg) => {
+    evList.innerHTML = "";
+    evData.length = 0;
+    (msg.items || []).forEach(addEvent);
   });
+
+  function copyText(text, onDone) {
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(text).then(onDone, () => {});
+      return;
+    }
+    // http://<IP> 로 열면 secure context 가 아니라 clipboard API 가 없다.
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    try { if (document.execCommand("copy")) onDone(); } catch (_) { /* 복사 못 함 */ }
+    document.body.removeChild(ta);
+  }
+  $("event-copy").addEventListener("click", () => {
+    const b = $("event-copy");
+    const text = evData.map((ev) =>
+      `${clock(ev.t)}\t${ev.rover_id || "-"}\t${ev.kind === "action" ? "[HUD] " : ""}${ev.text || ""}`
+    ).join("\n");
+    copyText(text, () => {
+      b.textContent = `COPIED ${evData.length}`;
+      b.classList.add("copied");
+      setTimeout(() => { b.textContent = "COPY"; b.classList.remove("copied"); }, 1200);
+    });
+  });
+
+  /* ── ACTIONS ─────────────────────────────────────────────────── */
+  const actionsOn = document.body.dataset.actions === "1";
+  const hint = $("act-hint");
+  const SPEEDS = [0.3, 0.6, 0.9];
+  let speedIdx = 1;
+  let manualOn = false;
+  const armed = {};      // 두 번 눌러야 하는 버튼의 대기 타이머
+
+  function btn(name) { return document.querySelector(`.act[data-act="${name}"]`); }
+  function setHint(text) { hint.textContent = text || ""; }
+
+  function paintButtons(rawState) {
+    const manual = rawState.startsWith("MANUAL/");
+    const bare = rawState.split("/").pop();
+    manualOn = manual;
+    $("lbl-mode").textContent = manual ? "MANUAL" : "AUTO";
+    btn("mode").classList.toggle("act-on", manual);
+    $("lbl-estop").textContent = bare === "ESTOP" ? "RESUME" : "E-STOP";
+    $("phase-badge").classList.toggle("blink", bare === "ESTOP");
+    btn("estop").classList.toggle("act-alert", bare === "ESTOP");
+    $("lbl-rtb").innerHTML = bare === "RETURN_TO_BASE" ? "CANCEL<br/>RTB" : "RTB";
+    btn("rtb").classList.toggle("act-on", bare === "RETURN_TO_BASE");
+    if (!actionsOn) setHint("보기 전용");
+    else if (bare === "ESTOP") setHint("정지 중 — RESUME 으로 해제");
+    else if (manual) setHint("W A S D 로 주행");
+    else setHint(activeRover ? `→ ${activeRover}` : "");
+  }
+
+  function send(action, value) {
+    const b = btn(action);
+    sock.emit("action", { rover_id: activeRover, action: action, value: value || "" }, (res) => {
+      if (!b) return;
+      b.classList.add("act-sent");
+      setTimeout(() => b.classList.remove("act-sent"), 400);
+      if (res && res.ok === false) setHint(res.text);
+    });
+  }
+
+  function onAction(b) {
+    const name = b.dataset.act;
+    if (b.dataset.confirm === "1" && !armed[name]) {
+      // 되돌리기 어려운 동작 — 3 초 안에 한 번 더 눌러야 실행한다.
+      b.classList.add("act-armed");
+      setHint("한 번 더 누르면 실행");
+      armed[name] = setTimeout(() => {
+        b.classList.remove("act-armed");
+        armed[name] = null;
+        setHint("");
+      }, 3000);
+      return;
+    }
+    if (armed[name]) {
+      clearTimeout(armed[name]);
+      armed[name] = null;
+      b.classList.remove("act-armed");
+      setHint("");
+    }
+    if (name === "cam") {
+      yoloOn = !yoloOn;
+      $("lbl-cam").innerHTML = yoloOn ? "YOLO<br/>ON" : "YOLO<br/>OFF";
+      b.classList.toggle("act-on", !yoloOn);
+      refreshCameraSrcs();
+      send("cam", yoloOn ? "YOLO on" : "YOLO off");
+    } else if (name === "speed") {
+      speedIdx = (speedIdx + 1) % SPEEDS.length;
+      $("lbl-speed").innerHTML = `SPD<br/>${SPEEDS[speedIdx].toFixed(1)}`;
+      send("speed", `${SPEEDS[speedIdx].toFixed(1)} m/s`);
+    } else {
+      send(name);
+    }
+  }
+
+  document.querySelectorAll(".action-grid .act").forEach((b) => {
+    if (!actionsOn) { b.disabled = true; return; }
+    b.addEventListener("click", (e) => { e.preventDefault(); onAction(b); b.blur(); });
+  });
+
+  /* ── 수동 주행 (MANUAL 일 때만): W/S 전후, A/D 좌우, 방향키도 같다 ──
+     누르고 있는 동안 10 Hz 로 보낸다. 손을 떼면 0 을 한 번 보내고 멈춘다
+     (mission_manager 도 0.5 s 동안 명령이 없으면 세운다). */
+  const KEYS = {
+    KeyW: [1, 0], ArrowUp: [1, 0], KeyS: [-1, 0], ArrowDown: [-1, 0],
+    KeyA: [0, 1], ArrowLeft: [0, 1], KeyD: [0, -1], ArrowRight: [0, -1],
+  };
+  const held = new Set();
+  let teleopTimer = null;
+
+  function teleopTick() {
+    let lin = 0, ang = 0;
+    held.forEach((k) => { lin += KEYS[k][0]; ang += KEYS[k][1]; });
+    const v = SPEEDS[speedIdx];
+    sock.emit("teleop", {
+      rover_id: activeRover,
+      lin: Math.sign(lin) * v,
+      ang: Math.sign(ang) * (lin < 0 ? -1 : 1) * 0.7,   // 후진 중에는 조향 방향을 뒤집는다
+    });
+    if (held.size === 0) { clearInterval(teleopTimer); teleopTimer = null; }
+  }
+  window.addEventListener("keydown", (e) => {
+    if (!actionsOn || !manualOn || !(e.code in KEYS)) return;
+    e.preventDefault();
+    held.add(e.code);
+    if (!teleopTimer) { teleopTick(); teleopTimer = setInterval(teleopTick, 100); }
+  });
+  window.addEventListener("keyup", (e) => { held.delete(e.code); });
+  window.addEventListener("blur", () => { held.clear(); });
+
+  /* ── 다른 기기에서 여는 주소 ─────────────────────────────────── */
+  fetch("/api/info").then((r) => r.json()).then((info) => {
+    const here = window.location.origin;
+    const lan = (info.lan || [])[0];
+    // 이미 다른 기기에서 보고 있으면 지금 주소를, 이 PC 에서 보고 있으면 LAN 주소를 보여 준다.
+    const isLocal = ["localhost", "127.0.0.1", "[::1]"].includes(window.location.hostname);
+    const share = isLocal ? lan : here;
+    const pill = $("url-pill");
+    if (!share || !pill) return;
+    pill.textContent = share.replace(/^https?:\/\//, "") + (info.key_required ? " 🔒" : "");
+    pill.style.display = "";
+    pill.addEventListener("click", () => copyText(share, () => {
+      pill.classList.add("copied");
+      setTimeout(() => pill.classList.remove("copied"), 900);
+    }));
+  }).catch(() => {});
 })();

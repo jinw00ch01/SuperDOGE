@@ -105,12 +105,17 @@ def _link6_to_base(p_link6: np.ndarray, q: np.ndarray) -> np.ndarray:
     return R @ p_link6 + p
 
 
+class _ArmCanceled(Exception):
+    """운영자가 동작을 취소함 (E-STOP). _publish_joint_state 가 던진다."""
+
+
 class ArmExecutorNode(Node):
     SUPPORTED_COMMANDS = {
         "pick_mineral",
         "place_to_cargo",
         "unload_to_base",
         "deploy_solar_panel",
+        "home",                 # 취소(E-STOP)로 멈춘 팔을 HOME 으로 되돌린다
     }
 
     def __init__(self) -> None:
@@ -264,6 +269,11 @@ class ArmExecutorNode(Node):
             cancel_callback=self._cancel_callback,
         )
 
+        # 취소(E-STOP) 처리: 실행 중인 goal 과, 멈춘 자리의 관절각.
+        self._active_goal = None
+        self._last_cmd_deg: Optional[List[float]] = None
+        self._frozen_deg: Optional[List[float]] = None
+
         self._initial_home_sent = False
         self.create_timer(1.0, self._send_initial_home_once)
 
@@ -347,9 +357,55 @@ class ArmExecutorNode(Node):
         return CancelResponse.ACCEPT
 
     def _execute_callback(self, goal_handle):
+        """goal 하나를 실행한다. 취소 요청이 오면 팔을 그 자리에 세운다.
+
+        모든 동작은 _publish_joint_state 로 관절 목표를 조금씩 보내서 움직인다. 취소가
+        요청되면 그 함수가 _ArmCanceled 를 던져, 어느 단계에 있든 다음 목표를 보내지
+        않고 여기로 빠져나온다 → 팔은 마지막으로 받은 목표 자세에 그대로 서 있다
+        (쥐고 있던 광물도 쥔 채). 다시 움직이려면 "home" 명령을 보낸다.
+        """
+        self._active_goal = goal_handle
+        try:
+            return self._run_command(goal_handle)
+        except _ArmCanceled:
+            self._frozen_deg = list(self._last_cmd_deg) if self._last_cmd_deg else None
+            where = ("[" + ",".join(f"{v:.0f}" for v in self._frozen_deg) + "]°"
+                     if self._frozen_deg else "?")
+            self.get_logger().warn(f"arm goal canceled — 팔을 그 자리에 세움 {where}")
+            goal_handle.canceled()
+            return ExecuteArmTask.Result(success=False,
+                                         message="canceled — arm stopped in place")
+        finally:
+            self._active_goal = None
+
+    def _execute_home(self, goal_handle):
+        """멈춰 있던 팔을 HOME 으로 되돌리고 집게를 연다 (E-STOP 해제 뒤)."""
+        start = self._frozen_deg
+        if start is None and self._current_arm_q_rad is not None:
+            start = [math.degrees(float(v)) for v in self._current_arm_q_rad[:6]]
+        if start is None:
+            start = list(HOME_DEG)
+        self._goto(start, HOME_DEG, goal_handle, "HOME_RECOVER", 0.0, 0.9, duration=3.0)
+        self._publish_joint_state(HOME_DEG)
+        self._frozen_deg = None
+        # 쥐고 있던 것이 있으면 놓는다 (HOME 은 적재함 밖이라 땅에 떨어진다 — 다시 집으면 된다).
+        self._publish_grasp("release")
+        goal_handle.succeed()
+        self.get_logger().info("arm home done")
+        return ExecuteArmTask.Result(success=True, message="home completed")
+
+    def _run_command(self, goal_handle):
         command = goal_handle.request.command.strip()
         self.get_logger().info(f"Executing arm command: {command}")
 
+        if command == "home":
+            return self._execute_home(goal_handle)
+        if self._frozen_deg is not None:
+            # 취소로 멈춘 자리에서 바로 다음 동작을 시작하면 목표가 튄다 — 먼저 HOME 으로.
+            start = self._frozen_deg
+            self._goto(start, HOME_DEG, goal_handle, "HOME_RECOVER", 0.0, 0.05, duration=3.0)
+            self._frozen_deg = None
+            self._publish_grasp("release")
         if command == "pick_mineral":
             if bool(self.get_parameter("enable_ik").value):
                 if bool(self.get_parameter("use_world_target_ik").value):
@@ -1163,10 +1219,6 @@ class ArmExecutorNode(Node):
 
         cur = list(trajectory[0])
         for seg_idx in range(total_steps):
-            if goal_handle.is_cancel_requested:
-                goal_handle.canceled()
-                self._publish_joint_state(HOME_DEG)
-                return ExecuteArmTask.Result(success=False, message="canceled")
             target = trajectory[seg_idx + 1]
             for k in range(1, n_interp + 1):
                 t = k / n_interp
@@ -1205,6 +1257,10 @@ class ArmExecutorNode(Node):
             time.sleep(dt)
 
     def _publish_joint_state(self, positions_deg: List[float]) -> None:
+        goal = self._active_goal
+        if goal is not None and goal.is_cancel_requested:
+            raise _ArmCanceled()             # 다음 목표를 보내지 않는다 = 그 자리에 선다
+        self._last_cmd_deg = [float(v) for v in positions_deg]
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.name = JOINT_NAMES

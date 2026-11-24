@@ -90,6 +90,8 @@ class HazardMapNode(Node):
         # 카메라가 못 본 무언가에 막힌 것으로 보고, 진행 방향 앞에 위험 원을 찍는다.
         # 접촉 센서가 없는 로버의 "범퍼" 대용 (바퀴 명령과 실제 이동의 비교).
         self.declare_parameter("cmd_topic", "/cmd_vel")
+        # 운영자가 지도를 비울 때 (HUD 의 MAP CLR). 잘못 찍힌 위험 칸이 길을 막을 때 쓴다.
+        self.declare_parameter("reset_topic", "/hazard_map/reset")
         self.declare_parameter("stall_sec", 4.0)
         self.declare_parameter("stall_cmd_mps", 0.15)    # 구간 평균 명령이 이보다 작으면 판단 안 함
         self.declare_parameter("stall_move_m", 0.15)
@@ -151,6 +153,9 @@ class HazardMapNode(Node):
         self._stall_ref = None                  # (시각, 위치, 방향 부호)
         self.create_subscription(Twist, str(self.get_parameter("cmd_topic").value),
                                  self._on_cmd, 10)
+        from std_msgs.msg import Empty
+        self.create_subscription(Empty, str(self.get_parameter("reset_topic").value),
+                                 self._on_reset, 10)
         self.get_logger().info(
             f"hazard_map_node ready — {size[0]:.0f}×{size[1]:.0f} m @ {self.hm.cell:.2f} m, "
             f"거리 {self.hm.min_range}~{self.hm.max_range} m, 경사 한계 "
@@ -164,6 +169,18 @@ class HazardMapNode(Node):
 
     def _on_cmd(self, msg) -> None:
         self._cmd_lin = float(msg.linear.x)
+
+    def _on_reset(self, _msg) -> None:
+        """지금까지 쌓은 판정을 버린다. 카메라가 다시 보는 대로 새로 채워진다."""
+        cells = int(self.hm.obstacle_mask().sum())
+        self.hm.evidence[:] = 0
+        self.hm.seen[:] = 0
+        bumps = len(self._bumps)
+        self._bumps.clear()
+        self._stall_ref = None
+        self.get_logger().warn(
+            f"operator reset: 위험 칸 {cells}개, 막힘 표시 {bumps}곳을 지움 — 지도를 다시 만든다")
+        self._publish(force=True)
 
     def _check_stall(self, t: float, pos: np.ndarray, quat: np.ndarray) -> None:
         """명령한 거리와 실제로 간 거리를 stall_sec 구간마다 비교한다.
@@ -288,8 +305,8 @@ class HazardMapNode(Node):
             self.n_used += 1
 
     # ── 출력 ────────────────────────────────────────────────────────────
-    def _publish(self) -> None:
-        if self.hm.frames == 0 and not self._bumps:
+    def _publish(self, force: bool = False) -> None:
+        if not force and self.hm.frames == 0 and not self._bumps:
             return
         for (x, y) in self._minerals:
             self.hm.clear_disk(x, y, self.clear_r)

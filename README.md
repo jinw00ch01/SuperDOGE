@@ -27,6 +27,7 @@ Ubuntu 24.04 · ROS 2 Jazzy · Isaac Sim 5.1 로 옮긴 뒤, 시연용 임시방
 | 손목 카메라 | 장착 위치·자세가 추정값이라 미사용 | USD 실측값으로 교체, pick 직전 수평 위치 보정에 사용 (손끝 오차 평균 4.0 → 1.4 cm) |
 | 장애물 지도 | 지형과 함께 만들어 둔 정답 지도 `obstacle_grid.npy` 로 A* | **지도 없이 출발** — 로버 깊이 카메라로 주행 중에 위험 지도를 만들고, 새 장애물이 경로를 막으면 다시 계획 (`map_source:=online`, 기본값) |
 | 구동 조절 (선택) | — | 강화학습(PPO)으로 배운 **구동 조절기** — 기울기·흔들림·헛돎을 보고 속도 명령을 깎음 (`drive_governor:=true`, 기본은 꺼짐: 실제 임무 스택 검증 전) |
+| Web HUD | `localhost:8088` 로만 사용, 영상은 다른 포트(8080)에서 직접. ACTIONS 버튼 9 개는 자리만 있고 동작 안 함. 초상화는 예전 그리퍼 그림 | **포트 하나로 다른 기기에서도 열림** (영상 중계 + 접속 키 + 보기 전용 스위치), **버튼 9 개 동작** (E-STOP·수동 주행·기지 복귀 등), 누른 것은 EVENT LOG·ROS 로그·파일에 기록, 초상화는 지금 로버(넓은 집게)를 시뮬레이터에서 찍은 것 + 자세계 |
 | 팔 기구학 (DH) | link_6 를 1.8 cm 높게, 6 mm 옆으로 계산 | USD 관절 프레임과 0.3 mm 이내 일치 |
 
 ### 화성 물리 (`isaac_sim/scripts/planet_physics.py`, `drive_limits.py`)
@@ -188,6 +189,72 @@ Web HUD 로 지켜보다 드러난 네 가지를 기록으로 원인을 확인�
   - 임무(terrain_00026, 기본 설정): 3/3 수집(파랑·노랑·파랑), 접근 3 회 모두 한 번에 도착, 장애물까지 최소 1.00 m, 전복 없음.
 - 한계: 임무 검증은 지형당 1~2 회입니다. 광물이 바위에 0.8 m 안으로 붙어 있으면 여전히 접근하지 못하고 제외합니다.
 - 광물이 여럿 보일 때의 우선순위는 원본 그대로입니다: 종류별 가치(노랑 50 > 초록 25 > 파랑 10)가 먼저, 신뢰도는 동점 처리용(×0.1), 거리는 보지 않음. 한 번 접근을 시작하면 그 광물에 고정됩니다.
+
+### Web HUD — 주소로 열기 · 버튼 · 기록 (2026-11-24, `mission_web_node.py`, `isaac_supervisor/web/`, `mission_manager_node.py`)
+
+`mvp_multi.launch.py` 로 띄웠을 때의 HUD 입니다. `mvp.launch.py`(단일 로버, namespace 없음)도 같은 HUD 노드를 쓰지만, 버튼·접속 키용 launch 인자와 토픽 연결은 `mvp_multi.launch.py` 에만 넣었고 시험도 그쪽으로만 했습니다.
+
+**화면 구성**
+
+| 줄 | 왼쪽 → 오른쪽 |
+|---|---|
+| 1 행 (화면 높이의 44 %) | ROVER CHASE · BODY — YOLO · ARM CAM |
+| 2 행 | COVERAGE MAP · 상태 수치 (PHASE, BATTERY, COLLECTED, POS, YAW, SPEED, TILT, CMD, TASK, ERR) · EVENT LOG · 초상화 + 자세계 · ACTIONS |
+
+- **EVENT LOG** 는 최신이 위입니다. 줄이 칸보다 많아지면 세로, 문장이 칸보다 길면 가로 스크롤 막대가 생깁니다 (문장은 자르지 않습니다). 예전 줄을 보려고 내려가 있는 동안에는 새 줄이 와도 보던 자리가 밀리지 않습니다. 제목 줄 오른쪽 **COPY** 를 누르면 지금까지의 기록(최대 400 줄)이 시간순 텍스트로 복사됩니다.
+- **초상화** 는 `isaac_sim/scripts/render_portrait.py` 가 시뮬레이터에서 찍은 지금 로버입니다 (아래). 그 위에 선택한 로버 이름과 상태가 겹쳐 나오고, 테두리 색이 상태를 따릅니다 (수동 = 노랑, 복구 = 빨강, E-STOP = 빨강 깜빡임). 아래 **자세계** 는 odom 의 자세에서 구한 roll·pitch·기울기이고, 기울기는 25° 부터 노랑, 40° 부터 빨강입니다 (60° 를 넘으면 넘어진 것).
+
+**다른 기기에서 열기**
+
+HUD 는 포트 하나(기본 8088)만 씁니다. 카메라 영상도 HUD 서버가 중계하므로 (`/stream?topic=…`) 그 포트만 닿으면 전부 보입니다. `web_video_server` 는 이 PC 안(127.0.0.1)에서만 듣습니다.
+
+```bash
+ros2 launch isaac_bringup mvp_multi.launch.py rovers:=rover_1 ... \
+     hud_key:=<접속 키>      # 주면 키 없이는 아무것도 안 열림 (기본: 없음)
+     hud_actions:=false      # 주면 버튼이 꺼진 보기 전용 (기본: true)
+     web_port:=8088
+```
+
+- **같은 공유기 안**: `http://<이 PC 의 IP>:8088`. 주소는 HUD 시작 로그와 화면 왼쪽 위 알약(누르면 복사)에 나옵니다. 방화벽(ufw)이 켜져 있으면 그 포트를 열어야 합니다 — 예: `sudo ufw allow from 192.168.0.0/24 to any port 8088 proto tcp` (대역은 자기 공유기에 맞게).
+- **접속 키**: `hud_key:=<키>` 로 띄우면 `http://…:8088/?key=<키>` 로 한 번 들어온 브라우저만 쿠키로 통과하고, 나머지는 화면·영상·상태·버튼 전부 403 입니다. 버튼이 로버를 움직이므로, 믿을 수 없는 네트워크에서는 키를 주거나 `hud_actions:=false` 로 띄우십시오.
+- **인터넷 주소**: `tools/hud_tunnel.sh [포트]` 가 HUD 포트 하나를 터널로 내보내고 `https://…` 주소를 찍습니다 (`cloudflared` 가 있으면 그것, 없으면 ssh 만으로 되는 localhost.run). 접속 키 없이 떠 있는 HUD 는 열어 주지 않습니다. 영상과 상태가 터널 사업자의 서버를 거쳐 나간다는 점은 알고 쓰십시오. Ctrl+C 로 닫으면 주소가 사라집니다.
+- 화면의 Socket.IO 스크립트는 CDN(`cdn.socket.io`)에서 받습니다. HUD 를 여는 기기가 인터넷에 닿지 않으면 화면은 뜨지만 상태가 갱신되지 않습니다.
+
+**ACTIONS** — 위쪽 탭에서 고른 로버에게 보냅니다 (E-STOP 만 전부에게).
+
+| 버튼 | 하는 일 | 로버에게 가는 것 |
+|---|---|---|
+| AUTO ⇄ MANUAL | 자율 ↔ 수동. 수동이면 W/A/S/D 또는 방향키로 주행 (10 Hz, 키를 떼면 정지) | `<ns>/mission/mode`, 주행은 `<ns>/teleop/cmd_vel` |
+| E-STOP ⇄ RESUME | **모든 로버 정지.** 주행 명령 0, 하던 팔 동작은 그 자리에서 멈춤. PHASE 가 `E-STOP`, TASK 가 `E-STOP`(팔을 세웠으면 `E-STOP · 팔 정지`)으로 바뀌고 해제할 때까지 그대로. RESUME: 팔을 HOME 으로 되돌린 뒤 (그동안 차체는 정지) 기지 복귀 중이었으면 복귀를, 아니면 탐색부터 다시 | `<ns>/mission/command` `ESTOP` / `RESUME` |
+| RTB | 지금 기지로 복귀. 복귀 중에 누르면 취소 (목표 달성·배터리 때문에 하는 복귀는 취소 안 됨) | `RTB` / `RTB_CANCEL` |
+| RESET (두 번 눌러야 실행) | 채집 수를 0 으로. 임무가 끝났으면 다시 시작 | `RESET` |
+| REPLAN | 지금 경로를 버리고 다시 계획 | `REPLAN` |
+| YOLO ON/OFF | 카메라 영상을 인식 표시가 있는 것 ↔ 원본으로 (이 브라우저만) | — |
+| SKIP | 접근 중인 목표를 한동안 건너뜀 | `SKIP` |
+| MAP CLR (두 번 눌러야 실행) | 주행 중 만든 위험 지도를 비움 | `<ns>/hazard_map/reset` |
+| SPD | 수동 주행 속도 0.3 → 0.6 → 0.9 m/s | — |
+
+로버가 거절한 명령은 이유가 EVENT LOG 에 나옵니다 (예: 채취 동작 중의 RTB, E-STOP 중의 RTB).
+
+**기록** — 버튼을 누르면 세 군데에 남습니다 (브라우저에서만 바뀌는 YOLO·SPD 도 포함).
+
+| 어디 | 형식 |
+|---|---|
+| HUD 의 EVENT LOG | `20:03:25 rover_1 ESTOP → ESTOP` (노란 줄 = 누른 것, 그 아래 로버의 응답) |
+| ROS 로그 (`mission_web_node`) | `[HUD] action=estop rover=rover_1 → ESTOP (from 172.30.1.20)` |
+| `~/.ros/log/hud_actions.jsonl` (`ROS_LOG_DIR` 가 있으면 그 아래. `action_log_path` 로 변경) | `{"time": "2026-11-24T19:47:57", "rover": "rover_1", "action": "estop", "sent": "ESTOP", "from": "127.0.0.1"}` |
+
+로버 쪽에서는 `mission_manager` 가 받은 명령과 결과를 자기 로그(`operator command ESTOP: …`)에 남기고 `<ns>/mission/event` (std_msgs/String) 로 알립니다. phase 전환도 같은 토픽으로 나가서 EVENT LOG 에 같이 보입니다.
+
+확인한 것 (terrain_00026, 로버 1 대): 채취 동작 중 E-STOP → 팔이 그 자리에서 멈춤 → RESUME → 5 초에 HOME 복귀 → 다음 광물로 접근해 임무 계속. 수동 주행 명령(0.6 m/s, 0.7 rad/s)이 바퀴까지 전달. 접속 키가 있을 때 키 없는 요청은 화면·정적 파일·영상·상태·Socket.IO 모두 거절. 다른 기기에서 실제로 여는 것(방화벽 포함)과 터널은 이 저장소에서 시험하지 않았습니다.
+
+### HUD 초상화 다시 찍기 (`isaac_sim/scripts/render_portrait.py`)
+
+```bash
+tools/isaac-pypi isaac_sim/scripts/render_portrait.py     # → isaac_supervisor/web/static/img/rover_portrait.png
+```
+
+시뮬레이터가 쓰는 것과 같은 조립을 거친 로버를 찍습니다: `vehicle_v3.usd` + 넓은 집게 + 캡슐 바퀴를 화성 중력에서 지면에 내려앉히고, 팔을 `--pose` 자세로 든 모습. 손으로 그리거나 합성한 그림이 아니므로 로버 모델이나 집게가 바뀌면 다시 돌리면 됩니다. 자리는 평평하고 바위·구조물에서 5 m 넘게 떨어진 곳을 고릅니다 (`--at X,Y` 로 지정 가능). 카메라 위치·보는 점·초점거리·크기는 옵션으로 바꿉니다 (파일 머리말).
 
 ### 강화학습 구동 조절기 (`isaac_sim/rl/`, `isaac_drive/drive_governor_node.py`) — 선택 (기본 꺼짐)
 
@@ -417,6 +484,8 @@ xdg-open http://localhost:8088
 > talking point + 향후 "Mars-ready rover" 작업의 baseline.
 
 ### 4. Mission Control UI (Web HUD)
+
+> SuperDOGE: `mvp_multi.launch.py` 의 HUD 는 화면 구성·버튼·접속 방법이 달라졌습니다 — 위 "Web HUD — 주소로 열기 · 버튼 · 기록" 을 보십시오. 아래는 원본 설명입니다.
 
 `mvp.launch.py` 가 띄우는 **mission_web_node** (Flask+SocketIO) + **web_video_server** 가
 SC2 풍 HUD 를 제공합니다.

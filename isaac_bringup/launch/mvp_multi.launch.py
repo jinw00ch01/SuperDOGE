@@ -106,6 +106,7 @@ def _rover_group(ns: str, terrain_dir: str, collection_goal: int,
                 "joint_topic":      f"{nsp}/joint_states_raw",
                 "detections_topic": f"{nsp}/perception/detections",
                 "map_topic":        f"{nsp}/hazard_map",
+                "reset_topic":      f"{nsp}/hazard_map/reset",
                 "cmd_topic":        f"{nsp}/cmd_vel",
             }],
         ))
@@ -212,6 +213,10 @@ def _rover_group(ns: str, terrain_dir: str, collection_goal: int,
                 "state_topic":        f"{nsp}/mission/state",
                 "mode_topic":         f"{nsp}/mission/mode",
                 "estop_topic":        f"{nsp}/mission/estop",
+                # HUD 의 ACTIONS 버튼 · 수동 주행 (mission_web_node 가 보낸다)
+                "command_topic":      f"{nsp}/mission/command",
+                "event_topic":        f"{nsp}/mission/event",
+                "teleop_cmd_topic":   f"{nsp}/teleop/cmd_vel",
                 "terrain_dir":        terrain_dir,
                 "map_source":         map_source,
                 "hazard_map_topic":   f"{nsp}/hazard_map",
@@ -261,6 +266,9 @@ def _launch_setup(context, *args, **kwargs):
     enable_dashboard = LaunchConfiguration("enable_dashboard").perform(context)
     enable_web_video = LaunchConfiguration("enable_web_video").perform(context)
     web_video_port = LaunchConfiguration("web_video_port").perform(context)
+    web_port = LaunchConfiguration("web_port").perform(context)
+    hud_key = LaunchConfiguration("hud_key").perform(context).strip()
+    hud_actions = LaunchConfiguration("hud_actions").perform(context).strip()
     reveal_radius = float(LaunchConfiguration("reveal_radius").perform(context))
     map_source = LaunchConfiguration("map_source").perform(context).strip().lower()
     slope_deg = float(LaunchConfiguration("hazard_slope_deg").perform(context))
@@ -288,6 +296,9 @@ def _launch_setup(context, *args, **kwargs):
             output="screen",
             additional_env={
                 "WEB_VIDEO_PORT": str(web_video_port),
+                "WEB_PORT": str(web_port),
+                "WEB_TOKEN": hud_key,
+                "WEB_ACTIONS": hud_actions,
             },
             parameters=[{
                 "rover_namespaces": rovers,
@@ -302,7 +313,8 @@ def _launch_setup(context, *args, **kwargs):
             output="screen",
             parameters=[{
                 "port": int(web_video_port),
-                "address": "0.0.0.0",
+                # 영상은 HUD 서버(web_port)가 /stream 으로 중계한다 — 이 포트는 밖에 열지 않는다.
+                "address": "127.0.0.1",
             }],
         ))
     return nodes
@@ -336,7 +348,17 @@ def generate_launch_description() -> LaunchDescription:
             description="web_video_server MJPEG 스트리머 활성."),
         DeclareLaunchArgument(
             "web_video_port", default_value="8090",
-            description="web_video_server HTTP 포트. Web HUD 이미지 src 가 이 포트."),
+            description="web_video_server HTTP 포트 (127.0.0.1 전용). HUD 서버가 /stream 으로 중계한다."),
+        DeclareLaunchArgument(
+            "web_port", default_value="8088",
+            description="Web HUD 포트. 화면·상태·카메라 영상이 모두 이 포트 하나로 나간다."),
+        DeclareLaunchArgument(
+            "hud_key", default_value="",
+            description="HUD 접속 키. 주면 http://<주소>:<web_port>/?key=<키> 로 들어온 브라우저만 "
+                        "볼 수 있다. 외부 주소(터널)로 열 때는 반드시 줄 것."),
+        DeclareLaunchArgument(
+            "hud_actions", default_value="true",
+            description="false 면 HUD 의 ACTIONS 버튼·수동 주행을 끈다 (보기 전용)."),
         DeclareLaunchArgument(
             "reveal_radius", default_value="5.0",
             description="coverage_node 의 fog reveal 반경 (m). 멀티 rover 시연 "

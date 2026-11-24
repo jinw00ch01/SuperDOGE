@@ -6,7 +6,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <link rel="stylesheet" href="{{ url_for('static', filename='css/dashboard.css') }}" />
 </head>
-<body>
+<body data-actions="{{ '1' if actions_on else '0' }}">
   <!-- ┌────────────────────────────────────────────────────────────┐
        │ TOP BAR  (timer / resources / connection)                 │
        └────────────────────────────────────────────────────────────┘ -->
@@ -14,6 +14,9 @@
     <div class="topbar-left">
       <span class="logo">▲ DOGECRAFT</span>
       <span id="conn-pill" class="pill pill-offline">OFFLINE</span>
+      <!-- 다른 기기에서 이 화면을 여는 주소 (같은 네트워크). 누르면 복사. -->
+      <button id="url-pill" class="pill pill-url" type="button" style="display:none"
+              title="다른 기기에서 여는 주소 — 누르면 복사"></button>
     </div>
     <div class="topbar-right">
       <div class="resource" title="Blue mineral 누적">
@@ -39,19 +42,9 @@
   <div id="rover-selector" class="rover-selector" style="display:none"></div>
 
   <!-- ┌────────────────────────────────────────────────────────────┐
-       │ MAIN VIEW  (3 cameras side-by-side)                       │
+       │ 1 행 — 카메라 셋 (chase | body+YOLO | arm). 높이는 화면의 40 % 까지 │
        └────────────────────────────────────────────────────────────┘ -->
   <main class="viewports">
-    <figure class="viewport viewport-overview">
-      <figcaption>Coverage Map <span class="vp-tag">/mission/minimap · all rovers</span></figcaption>
-      <div class="vp-frame vp-frame-canvas">
-        <canvas id="minimap" width="320" height="320"></canvas>
-        <div class="minimap-axes minimap-axes-vp">
-          <span class="axis-x">X →</span>
-          <span class="axis-y">Y ↑</span>
-        </div>
-      </div>
-    </figure>
     <figure class="viewport viewport-chase">
       <figcaption>Rover — Chase <span class="vp-tag">/camera/chase</span></figcaption>
       <div class="vp-frame">
@@ -66,52 +59,67 @@
         <div class="cam-down-overlay">body cam offline</div>
       </div>
     </figure>
+    <!-- 팔(M0609) 손목 카메라. 공구 z 축 방향(집게가 향하는 쪽)을 본다. -->
+    <figure class="viewport viewport-arm">
+      <figcaption>Arm Cam — M0609 tool Z
+        <span class="vp-tag">/perception/wrist_image_annotated</span></figcaption>
+      <div class="vp-frame">
+        <img id="cam-arm" src="{{ cam_arm }}" alt="arm wrist cam" />
+        <div class="cam-down-overlay">arm cam offline</div>
+      </div>
+    </figure>
   </main>
 
-  <!-- ┌──────────────────┬──────────────────────────┬──────────────┐
-       │  MINIMAP (LL)    │  STATUS / PORTRAIT (C)   │ 3x3 GRID (R) │
-       └──────────────────┴──────────────────────────┴──────────────┘ -->
+  <!-- ┌──────────────┬──────────┬───────────┬──────────┬──────────┐
+       │ COVERAGE MAP │ STATUS   │ EVENT LOG │ PORTRAIT │ ACTIONS  │   2 행
+       └──────────────┴──────────┴───────────┴──────────┴──────────┘ -->
   <section class="hud">
-    <!-- 좌하단 — 팔(M0609) 손목 카메라. 공구 z 축 방향(집게가 향하는 쪽)을 본다.
-         지도 없이 주행하므로 지형 전체를 내려다본 그림(terrain preview)은 두지 않는다. -->
-    <div class="hud-cell hud-minimap">
+    <!-- 주행 중 만든 지도 (모든 로버의 합집합) + 경로·목표·로버 위치 -->
+    <div class="hud-cell hud-map">
       <div class="hud-cell-title">
-        <span>ARM CAM — M0609 TOOL Z</span>
-        <span class="hud-cell-tag">/perception/wrist_image_annotated</span>
+        <span>COVERAGE MAP</span>
+        <span class="hud-cell-tag">all rovers</span>
       </div>
-      <div class="minimap-wrap">
-        <img id="cam-arm" src="{{ cam_arm }}" alt="arm wrist cam"
-             class="terrain-preview-img" />
-        <div class="cam-down-overlay">arm cam offline</div>
+      <div class="map-wrap">
+        <canvas id="minimap" width="480" height="480"></canvas>
+        <div class="minimap-axes">
+          <span class="axis-x">X →</span>
+          <span class="axis-y">Y ↑</span>
+        </div>
       </div>
     </div>
 
-    <!-- 중앙하단 — status info (bars + grid). hud strip 4-cell split. -->
+    <!-- 상태 수치 -->
     <div class="hud-cell hud-status">
       <div class="status-info">
         <div class="status-row">
           <span class="status-label">PHASE</span>
           <span id="phase-badge" class="phase-badge phase-EXPLORE">EXPLORE</span>
         </div>
-        <div class="status-row">
+        <div class="status-row status-row-bar">
           <span class="status-label">BATTERY</span>
           <div class="bar"><div id="batt-bar" class="bar-fill bar-ok" style="width:100%"></div></div>
           <span id="batt-pct" class="status-value">100%</span>
         </div>
-        <div class="status-row">
+        <div class="status-row status-row-bar">
           <span class="status-label">COLLECTED</span>
           <div class="bar"><div id="col-bar" class="bar-fill bar-col" style="width:0%"></div></div>
           <span id="col-text" class="status-value">0 / 5</span>
         </div>
-        <div class="status-pairs-row pairs-3">
+        <div class="status-pairs-row pairs-2 pairs-pos">
           <div class="status-pair"><span class="k">POS</span><span id="pos-xy" class="v">— , —</span></div>
           <div class="status-pair"><span class="k">YAW</span><span id="pos-yaw" class="v">— °</span></div>
-          <div class="status-pair"><span class="k">SPEED</span><span id="spd" class="v">— m/s</span></div>
         </div>
-        <div class="status-pairs-row pairs-3">
+        <div class="status-pairs-row pairs-2">
+          <div class="status-pair"><span class="k">SPEED</span><span id="spd" class="v">— m/s</span></div>
+          <div class="status-pair" title="차체가 수직에서 기운 각. 60° 를 넘으면 넘어진 것">
+            <span class="k">TILT</span><span id="tilt" class="v">— °</span></div>
+        </div>
+        <div class="status-pairs-row pairs-1">
           <div class="status-pair"><span class="k">CMD</span><span id="cmdv" class="v">—</span></div>
-          <div class="status-pair"><span class="k">TASK</span><span id="task" class="v">—</span></div>
-          <div></div>
+        </div>
+        <div class="status-pairs-row pairs-1">
+          <div class="status-pair status-task"><span class="k">TASK</span><span id="task" class="v">—</span></div>
         </div>
         <div class="status-pairs-row pairs-1">
           <div class="status-pair status-error"><span class="k">ERR</span><span id="err" class="v">—</span></div>
@@ -119,9 +127,20 @@
       </div>
     </div>
 
-    <!-- portrait 전용 셀 — 정사각 frame, cell 가장자리까지 가득 -->
+    <!-- 버튼을 누른 기록 + 로버가 알린 일 (phase 전환, 명령 결과). 최신이 위.
+         길어지면 스크롤 막대가 생긴다. COPY = 전체를 시간순 텍스트로 복사. -->
+    <div class="hud-cell hud-log">
+      <div class="hud-cell-title">
+        <span>EVENT LOG <span id="event-count" class="event-count"></span></span>
+        <button id="event-copy" class="mini-btn" type="button"
+                title="기록 전체를 복사 (시간순)">COPY</button>
+      </div>
+      <ol id="event-list" class="event-list"></ol>
+    </div>
+
+    <!-- 초상화 (isaac_sim/scripts/render_portrait.py 로 찍은 지금 로버) + 자세계 -->
     <div class="hud-cell hud-portrait">
-      <div class="portrait-frame">
+      <div id="portrait-frame" class="portrait-frame">
         <img class="portrait-img"
              src="{{ url_for('static', filename='img/rover_portrait.png') }}"
              alt="rover portrait"
@@ -131,30 +150,50 @@
           <span>ROVER</span>
           <span class="portrait-sub">RV-6W</span>
         </div>
+        <div class="portrait-top">
+          <span id="portrait-name" class="portrait-name">DOGE</span>
+          <span id="portrait-state" class="portrait-state">—</span>
+        </div>
+      </div>
+      <div class="attitude-panel">
+        <canvas id="attitude" class="attitude" width="144" height="144"
+                title="자세계 — 지평선이 기운 만큼 차체가 기울어 있다"></canvas>
+        <div class="attitude-nums">
+          <div><span class="k">ROLL</span><span id="att-roll" class="v">—</span></div>
+          <div><span class="k">PITCH</span><span id="att-pitch" class="v">—</span></div>
+          <div><span class="k">TILT</span><span id="att-tilt" class="v">—</span></div>
+        </div>
       </div>
     </div>
 
-    <!-- 우하단 — 3x3 action grid (placeholder: 디자인만, 클릭 X) -->
+    <!-- 3x3 action grid. 선택한 로버에게 보낸다 (E-STOP 만 전부에게).
+         누른 것은 EVENT LOG · ROS 로그 · hud_actions.jsonl 에 남는다. -->
     <div class="hud-cell hud-actions">
-      <div class="hud-cell-title">ACTIONS</div>
+      <div class="hud-cell-title"><span>ACTIONS</span>
+        <span id="act-hint" class="hud-cell-tag"></span></div>
       <div class="action-grid">
-        <button class="act" disabled title="AUTO / MANUAL 토글 (placeholder)">
-          <span class="act-icon">⇄</span><span class="act-label">AUTO<br/>MANUAL</span></button>
-        <button class="act act-warn" disabled title="비상정지 (placeholder)">
-          <span class="act-icon">!</span><span class="act-label">E-STOP</span></button>
-        <button class="act" disabled title="베이스 강제 복귀 (placeholder)">
-          <span class="act-icon">↩</span><span class="act-label">RTB</span></button>
+        <button class="act" data-act="mode" title="자율 ↔ 수동. 수동이면 W/A/S/D(또는 방향키)로 주행">
+          <span class="act-icon">⇄</span><span class="act-label" id="lbl-mode">AUTO</span></button>
+        <button class="act act-warn" data-act="estop" title="비상 정지 — 모든 로버. 다시 누르면 해제">
+          <span class="act-icon">!</span><span class="act-label" id="lbl-estop">E-STOP</span></button>
+        <button class="act" data-act="rtb" title="지금 기지로 복귀. 복귀 중에 누르면 취소">
+          <span class="act-icon">↩</span><span class="act-label" id="lbl-rtb">RTB</span></button>
 
-        <button class="act" disabled title="채집 카운터 리셋 (placeholder)">
-          <span class="act-icon">0→</span><span class="act-label">RESET</span></button>
-        <button class="act" disabled title="Coverage replan 요청 (placeholder)">
+        <button class="act" data-act="reset" data-confirm="1"
+                title="채집 수를 0 으로. 임무가 끝났으면 다시 시작 (두 번 눌러야 실행)">
+          <span class="act-icon">0→</span><span class="act-label" id="lbl-reset">RESET</span></button>
+        <button class="act" data-act="replan" title="지금 경로를 버리고 다시 계획">
           <span class="act-icon">↻</span><span class="act-label">REPLAN</span></button>
-        <button class="act" disabled title="카메라 view 토글 (placeholder)">
-          <span class="act-icon">⊞</span><span class="act-label">CAM</span></button>
+        <button class="act" data-act="cam" data-local="1" title="카메라 영상의 YOLO 표시 켜기/끄기">
+          <span class="act-icon">⊞</span><span class="act-label" id="lbl-cam">YOLO<br/>ON</span></button>
 
-        <button class="act act-empty" disabled><span class="act-icon">·</span></button>
-        <button class="act act-empty" disabled><span class="act-icon">·</span></button>
-        <button class="act act-empty" disabled><span class="act-icon">·</span></button>
+        <button class="act" data-act="skip" title="접근 중인 목표를 잠시 건너뛴다">
+          <span class="act-icon">⤼</span><span class="act-label">SKIP</span></button>
+        <button class="act" data-act="mapclr" data-confirm="1"
+                title="주행 중 만든 위험 지도를 비운다 (두 번 눌러야 실행)">
+          <span class="act-icon">▦</span><span class="act-label" id="lbl-mapclr">MAP<br/>CLR</span></button>
+        <button class="act" data-act="speed" data-local="1" title="수동 주행 속도">
+          <span class="act-icon">»</span><span class="act-label" id="lbl-speed">SPD<br/>0.6</span></button>
       </div>
     </div>
   </section>
