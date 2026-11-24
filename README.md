@@ -27,7 +27,7 @@ Ubuntu 24.04 · ROS 2 Jazzy · Isaac Sim 5.1 로 옮긴 뒤, 시연용 임시방
 | 손목 카메라 | 장착 위치·자세가 추정값이라 미사용 | USD 실측값으로 교체, pick 직전 수평 위치 보정에 사용 (손끝 오차 평균 4.0 → 1.4 cm) |
 | 장애물 지도 | 지형과 함께 만들어 둔 정답 지도 `obstacle_grid.npy` 로 A* | **지도 없이 출발** — 로버 깊이 카메라로 주행 중에 위험 지도를 만들고, 새 장애물이 경로를 막으면 다시 계획 (`map_source:=online`, 기본값) |
 | 구동 조절 (선택) | — | 강화학습(PPO)으로 배운 **구동 조절기** — 기울기·흔들림·헛돎을 보고 속도 명령을 깎음 (`drive_governor:=true`, 기본은 꺼짐: 실제 임무 스택 검증 전) |
-| Web HUD | `localhost:8088` 로만 사용, 영상은 다른 포트(8080)에서 직접. ACTIONS 버튼 9 개는 자리만 있고 동작 안 함. 초상화는 예전 그리퍼 그림 | **포트 하나로 다른 기기에서도 열림** (영상 중계 + 접속 키 + 보기 전용 스위치), **버튼 9 개 동작** (E-STOP·수동 주행·기지 복귀 등), 누른 것은 EVENT LOG·ROS 로그·파일에 기록, 초상화는 지금 로버(넓은 집게)를 시뮬레이터에서 찍은 것 + 자세계 |
+| Web HUD | `localhost:8088` 로만 사용, 영상은 다른 포트(8080)에서 직접. ACTIONS 버튼 9 개는 자리만 있고 동작 안 함. 초상화는 예전 그리퍼 그림 | **포트 하나로 다른 기기에서도 열림** — 같은 공유기 안의 주소, `hud_public:=true` 면 인터넷 주소(Cloudflare 터널)까지 (영상 중계 + 접속 키 + 보기 전용 스위치), **버튼 9 개 동작** (E-STOP·수동 주행·기지 복귀 등), 누른 것은 EVENT LOG·ROS 로그·파일에 기록, 초상화는 지금 로버(넓은 집게)를 시뮬레이터에서 찍은 것 + 자세계 |
 | 팔 기구학 (DH) | link_6 를 1.8 cm 높게, 6 mm 옆으로 계산 | USD 관절 프레임과 0.3 mm 이내 일치 |
 
 ### 화성 물리 (`isaac_sim/scripts/planet_physics.py`, `drive_limits.py`)
@@ -204,21 +204,43 @@ Web HUD 로 지켜보다 드러난 네 가지를 기록으로 원인을 확인�
 - **EVENT LOG** 는 최신이 위입니다. 줄이 칸보다 많아지면 세로, 문장이 칸보다 길면 가로 스크롤 막대가 생깁니다 (문장은 자르지 않습니다). 예전 줄을 보려고 내려가 있는 동안에는 새 줄이 와도 보던 자리가 밀리지 않습니다. 제목 줄 오른쪽 **COPY** 를 누르면 지금까지의 기록(최대 400 줄)이 시간순 텍스트로 복사됩니다.
 - **초상화** 는 `isaac_sim/scripts/render_portrait.py` 가 시뮬레이터에서 찍은 지금 로버입니다 (아래). 그 위에 선택한 로버 이름과 상태가 겹쳐 나오고, 테두리 색이 상태를 따릅니다 (수동 = 노랑, 복구 = 빨강, E-STOP = 빨강 깜빡임). 아래 **자세계** 는 odom 의 자세에서 구한 roll·pitch·기울기이고, 기울기는 25° 부터 노랑, 40° 부터 빨강입니다 (60° 를 넘으면 넘어진 것).
 
-**다른 기기에서 열기**
+**다른 기기에서 열기 (localhost 가 아닌 주소)**
 
 HUD 는 포트 하나(기본 8088)만 씁니다. 카메라 영상도 HUD 서버가 중계하므로 (`/stream?topic=…`) 그 포트만 닿으면 전부 보입니다. `web_video_server` 는 이 PC 안(127.0.0.1)에서만 듣습니다.
 
 ```bash
 ros2 launch isaac_bringup mvp_multi.launch.py rovers:=rover_1 ... \
-     hud_key:=<접속 키>      # 주면 키 없이는 아무것도 안 열림 (기본: 없음)
+     hud_public:=true        # 인터넷 주소(https://….trycloudflare.com)를 만든다 (기본: false)
+     hud_key:=<접속 키>      # 주면 키 없이는 아무것도 안 열림 (기본: 없음. hud_public 이면 자동으로 만듦)
      hud_actions:=false      # 주면 버튼이 꺼진 보기 전용 (기본: true)
      web_port:=8088
 ```
 
-- **같은 공유기 안**: `http://<이 PC 의 IP>:8088`. 주소는 HUD 시작 로그와 화면 왼쪽 위 알약(누르면 복사)에 나옵니다. 방화벽(ufw)이 켜져 있으면 그 포트를 열어야 합니다 — 예: `sudo ufw allow from 192.168.0.0/24 to any port 8088 proto tcp` (대역은 자기 공유기에 맞게).
-- **접속 키**: `hud_key:=<키>` 로 띄우면 `http://…:8088/?key=<키>` 로 한 번 들어온 브라우저만 쿠키로 통과하고, 나머지는 화면·영상·상태·버튼 전부 403 입니다. 버튼이 로버를 움직이므로, 믿을 수 없는 네트워크에서는 키를 주거나 `hud_actions:=false` 로 띄우십시오.
-- **인터넷 주소**: `tools/hud_tunnel.sh [포트]` 가 HUD 포트 하나를 터널로 내보내고 `https://…` 주소를 찍습니다 (`cloudflared` 가 있으면 그것, 없으면 ssh 만으로 되는 localhost.run). 접속 키 없이 떠 있는 HUD 는 열어 주지 않습니다. 영상과 상태가 터널 사업자의 서버를 거쳐 나간다는 점은 알고 쓰십시오. Ctrl+C 로 닫으면 주소가 사라집니다.
+주소는 HUD 시작 로그(`HUD 주소 — …`)와 화면 왼쪽 위 알약 두 개에 나옵니다. 알약을 누르면 접속 키가 붙은 주소가 복사되니 그대로 다른 기기에 넘기면 됩니다.
+
+| 어디서 | 주소 | 필요한 것 |
+|---|---|---|
+| 이 PC | `http://localhost:8088` | 없음 (접속 키가 걸려 있어도 이 PC 에서는 키 없이 열림) |
+| 같은 공유기 안의 기기 | `http://<이 PC 의 IP>:8088` | 방화벽(ufw)이 켜져 있으면 그 포트를 열어야 함 — 기본값이 "들어오는 연결 차단" 이라 안 열면 접속이 그냥 멈춥니다. `sudo ufw allow from 192.168.0.0/24 to any port 8088 proto tcp` (대역은 자기 공유기에 맞게) |
+| 인터넷 어디서나 | `https://<임시 이름>.trycloudflare.com` | `hud_public:=true` + `cloudflared` 실행 파일 (아래) |
+
+- **인터넷 주소** 는 HUD 노드가 `cloudflared` 터널을 직접 열어서 만듭니다 (`mission_web_node.PublicTunnel`). 밖에서 들어오는 연결을 여는 것이 아니라 이 PC 가 Cloudflare 로 나가는 연결을 만드는 방식이라 공유기·방화벽 설정이 필요 없습니다. 계정 없이 쓰는 임시 주소라 **띄울 때마다 바뀌고**, HUD 를 내리면 사라집니다. **영상과 상태가 Cloudflare 의 서버를 거쳐 나간다**는 점은 알고 쓰십시오.
+  `cloudflared` 설치: [공식 릴리스](https://github.com/cloudflare/cloudflared/releases)의 `cloudflared-linux-amd64` (약 40 MB) 를 `~/.local/bin/cloudflared` 로 두고 `chmod +x` (root 불필요). 없으면 HUD 는 그대로 뜨고 로그에 안내만 남깁니다.
+- **접속 키**: 키가 걸려 있으면 `…/?key=<키>` 로 한 번 들어온 브라우저만 쿠키로 통과하고, 나머지는 화면·영상·상태·버튼 전부 403 입니다. 인터넷 주소는 누구나 접속을 시도할 수 있으므로 키 없이는 내보내지 않습니다 — `hud_public:=true` 인데 `hud_key` 를 안 줬으면 HUD 가 키를 만들어 로그와 알약 주소에 붙입니다. 터널을 거쳐 온 요청은 127.0.0.1 에서 오지만 전달 헤더(`X-Forwarded-For`, `Cf-*`)와 Host 로 구분해서 키를 요구합니다. 버튼이 로버를 움직이므로, 보기만 시킬 거면 `hud_actions:=false` 를 같이 주십시오.
+- 이미 떠 있는 HUD(`hud_key` 를 준 것)를 내리지 않고 인터넷 주소만 만들려면 `tools/hud_tunnel.sh [포트]`.
 - 화면의 Socket.IO 스크립트는 CDN(`cdn.socket.io`)에서 받습니다. HUD 를 여는 기기가 인터넷에 닿지 않으면 화면은 뜨지만 상태가 갱신되지 않습니다.
+
+확인한 것 (2026-11-24, terrain_00026 로버 1 대, `hud_public:=true`):
+
+| | 결과 |
+|---|---|
+| 인터넷 주소로 브라우저에서 열기 | 0.5 초에 화면, 카메라 셋 모두 재생 (chase 0.8 MB/s · body 0.1 MB/s · arm 0.2 MB/s), 상태·지도·EVENT LOG 갱신, 40 초 동안 끊김 없음 |
+| 인터넷 주소에서 버튼 | REPLAN, E-STOP → PHASE·TASK 가 `E-STOP` → RESUME 후 임무 계속 |
+| 키 없이 / 틀린 키로 (인터넷 주소, 같은 네트워크 주소) | 403 |
+| 터널을 거쳐 `Host: localhost` 로 속여서 | 403 |
+| 이 PC 에서 `localhost` 로 | 키 없이 열림 |
+
+같은 공유기 안의 다른 기기에서 실제로 여는 것은 방화벽 규칙을 넣은 것까지만 했고, 다른 기기로 접속해 보지는 않았습니다. 참고로 ssh 만으로 되는 `localhost.run` 익명 터널도 시험했는데 속도가 20 → 2 kB/s 로 묶이고 (화면이 뜨는 데 8 초, 영상은 사실상 정지) 주소가 40 초 만에 바뀌어 쓰지 않습니다.
 
 **ACTIONS** — 위쪽 탭에서 고른 로버에게 보냅니다 (E-STOP 만 전부에게).
 
@@ -246,7 +268,7 @@ ros2 launch isaac_bringup mvp_multi.launch.py rovers:=rover_1 ... \
 
 로버 쪽에서는 `mission_manager` 가 받은 명령과 결과를 자기 로그(`operator command ESTOP: …`)에 남기고 `<ns>/mission/event` (std_msgs/String) 로 알립니다. phase 전환도 같은 토픽으로 나가서 EVENT LOG 에 같이 보입니다.
 
-확인한 것 (terrain_00026, 로버 1 대): 채취 동작 중 E-STOP → 팔이 그 자리에서 멈춤 → RESUME → 5 초에 HOME 복귀 → 다음 광물로 접근해 임무 계속. 수동 주행 명령(0.6 m/s, 0.7 rad/s)이 바퀴까지 전달. 접속 키가 있을 때 키 없는 요청은 화면·정적 파일·영상·상태·Socket.IO 모두 거절. 다른 기기에서 실제로 여는 것(방화벽 포함)과 터널은 이 저장소에서 시험하지 않았습니다.
+확인한 것 (terrain_00026, 로버 1 대): 채취 동작 중 E-STOP → 팔이 그 자리에서 멈춤 → RESUME → 5 초에 HOME 복귀 → 다음 광물로 접근해 임무 계속. 수동 주행 명령(0.6 m/s, 0.7 rad/s)이 바퀴까지 전달. 접속 키가 있을 때 키 없는 요청은 화면·정적 파일·영상·상태·Socket.IO 모두 거절.
 
 ### HUD 초상화 다시 찍기 (`isaac_sim/scripts/render_portrait.py`)
 

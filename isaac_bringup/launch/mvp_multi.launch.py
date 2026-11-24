@@ -299,6 +299,7 @@ def _launch_setup(context, *args, **kwargs):
                 "WEB_PORT": str(web_port),
                 "WEB_TOKEN": hud_key,
                 "WEB_ACTIONS": hud_actions,
+                "WEB_PUBLIC": LaunchConfiguration("hud_public").perform(context).strip(),
             },
             parameters=[{
                 "rover_namespaces": rovers,
@@ -359,6 +360,12 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument(
             "hud_actions", default_value="true",
             description="false 면 HUD 의 ACTIONS 버튼·수동 주행을 끈다 (보기 전용)."),
+        DeclareLaunchArgument(
+            "hud_public", default_value="false",
+            description="true 면 HUD 를 터널로 내보내 인터넷 주소(https://…)를 만든다. 주소는 "
+                        "시작 로그와 HUD 위쪽에 나온다. hud_key 를 안 줬으면 접속 키를 만들어 "
+                        "붙인다. cloudflared 가 깔려 있어야 한다 (PATH 또는 ~/.local/bin). "
+                        "영상·상태가 Cloudflare 의 서버를 거쳐 나간다."),
         DeclareLaunchArgument(
             "reveal_radius", default_value="5.0",
             description="coverage_node 의 fog reveal 반경 (m). 멀티 rover 시연 "

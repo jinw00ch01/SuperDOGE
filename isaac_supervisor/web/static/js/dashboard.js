@@ -695,20 +695,37 @@
   window.addEventListener("keyup", (e) => { held.delete(e.code); });
   window.addEventListener("blur", () => { held.clear(); });
 
-  /* ── 다른 기기에서 여는 주소 ─────────────────────────────────── */
-  fetch("/api/info").then((r) => r.json()).then((info) => {
-    const here = window.location.origin;
-    const lan = (info.lan || [])[0];
-    // 이미 다른 기기에서 보고 있으면 지금 주소를, 이 PC 에서 보고 있으면 LAN 주소를 보여 준다.
-    const isLocal = ["localhost", "127.0.0.1", "[::1]"].includes(window.location.hostname);
-    const share = isLocal ? lan : here;
-    const pill = $("url-pill");
-    if (!share || !pill) return;
-    pill.textContent = share.replace(/^https?:\/\//, "") + (info.key_required ? " 🔒" : "");
-    pill.style.display = "";
-    pill.addEventListener("click", () => copyText(share, () => {
-      pill.classList.add("copied");
-      setTimeout(() => pill.classList.remove("copied"), 900);
-    }));
-  }).catch(() => {});
+  /* ── 다른 기기에서 여는 주소 ───────────────────────────────────
+     왼쪽 알약 = 같은 네트워크 주소, 오른쪽 알약 = 인터넷 주소(hud_public:=true).
+     누르면 접속 키가 붙은 주소가 복사된다. 인터넷 주소는 터널이 열린 뒤에 생기므로
+     주기적으로 다시 묻는다. */
+  const shareUrl = {};
+  function paintUrl(id, label, url) {
+    const pill = $(id);
+    if (!pill) return;
+    pill.style.display = url ? "" : "none";
+    if (!url) return;
+    pill.textContent = label;
+    if (!(id in shareUrl)) {
+      pill.addEventListener("click", () => copyText(shareUrl[id], () => {
+        pill.classList.add("copied");
+        setTimeout(() => pill.classList.remove("copied"), 900);
+      }));
+    }
+    shareUrl[id] = url;
+  }
+  function refreshUrls() {
+    fetch("/api/info").then((r) => r.json()).then((info) => {
+      const bare = (u) => u.replace(/^https?:\/\//, "").replace(/\/\?key=.*$/, "");
+      const lock = info.key_required ? " 🔒" : "";
+      const lan = (info.share_lan || [])[0];
+      paintUrl("url-pill", lan ? bare(lan) + lock : "", lan);
+      const pub = info.share_public;
+      paintUrl("url-pill-pub",
+               pub ? "🌐 " + bare(pub) + lock : (info.public_on ? "🌐 여는 중…" : ""),
+               pub || (info.public_on ? window.location.origin : ""));
+    }).catch(() => {});
+  }
+  refreshUrls();
+  setInterval(refreshUrls, 10000);
 })();

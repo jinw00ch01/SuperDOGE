@@ -9,10 +9,12 @@
 web_video_server(127.0.0.1:WEB_VIDEO_PORT)의 MJPEG 를 이 서버가 /stream 으로 다시
 내보내므로, 브라우저는 이 서버 주소 하나만 알면 된다 → localhost 뿐 아니라
   · 같은 네트워크의 다른 기기:  http://<이 PC 의 IP>:8088  (시작할 때 로그에 찍힌다)
-  · 터널(포트 하나만 넘겨 주는 방식)로 만든 외부 주소
+  · 인터넷 주소: WEB_PUBLIC=1 이면 cloudflared 터널을 열어 https://….trycloudflare.com
+    주소를 받는다 (PublicTunnel). 주소는 로그와 화면 위쪽에 나온다.
 에서도 그대로 열린다. WEB_TOKEN(접속 키)을 주면 `?key=<키>` 로 한 번 들어온
-브라우저만 볼 수 있다 — 외부 주소로 열 때는 반드시 줄 것 (ACTIONS 버튼이 로버를
-움직인다). WEB_ACTIONS=0 이면 버튼이 꺼진 보기 전용이 된다.
+브라우저만 볼 수 있다 (이 PC 에서 localhost 로 여는 것은 키 없이 된다). 인터넷 주소는
+키 없이는 열지 않는다 — WEB_PUBLIC=1 인데 키가 없으면 하나 만들어 붙인다 (ACTIONS
+버튼이 로버를 움직인다). WEB_ACTIONS=0 이면 버튼이 꺼진 보기 전용이 된다.
 
 ACTIONS 버튼 (Socket.IO 'action' → ROS 토픽)
 --------------------------------------------
@@ -31,7 +33,7 @@ Endpoints:
   GET /         -> templates/index.html
   GET /static/* -> CSS/JS/이미지
   GET /stream   -> 카메라 MJPEG (web_video_server 중계)
-  GET /api/info -> 접속 주소·설정
+  GET /api/info -> 접속 주소·설정 (같은 네트워크 주소, hud_public 이면 인터넷 주소)
   Socket.IO     -> 'state' 'odom' 'minimap' 'cmd_vel' 'path' 'target' 'event'
                 <- 'action' 'teleop'
 
@@ -41,18 +43,23 @@ Run:
 """
 from __future__ import annotations
 
+import atexit
+import ctypes
 import hmac
 import json
 import math
 import os
 import re
+import secrets
+import shutil
+import signal
 import socket
 import subprocess
 import threading
 import time
 import urllib.request
 from collections import deque
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 # Async mode: we use "threading" (Flask-SocketIO's built-in werkzeug + thread
 # worker) rather than eventlet. eventlet.monkey_patch() rewires the standard
@@ -122,6 +129,86 @@ def lan_urls(port: int) -> List[str]:
         except Exception:
             pass
     return [f"http://{ip}:{port}" for ip in ips]
+
+
+class PublicTunnel:
+    """HUD 포트 하나를 터널로 내보내 인터넷 주소(https://….trycloudflare.com)를 받는다.
+
+    WEB_PUBLIC=1 일 때만. 밖에서 들어오는 연결을 여는 것이 아니라 이 PC 가 Cloudflare
+    로 나가는 연결을 만들고, 그쪽이 받은 요청을 이 연결로 돌려보낸다. 그래서 공유기
+    설정이나 방화벽 변경 없이 어디서든 열린다 — 대신 영상과 상태가 Cloudflare 의
+    서버를 거친다. 계정 없이 쓰는 임시 주소라 띄울 때마다 바뀐다.
+
+    cloudflared 실행 파일이 필요하다 (PATH 또는 ~/.local/bin). ssh 만으로 되는
+    localhost.run 도 시험했지만 익명 터널이 2~20 kB/s 로 묶이고 주소가 도중에 바뀌어
+    영상은커녕 화면도 제대로 뜨지 않았다 — 쓰지 않는다.
+    """
+
+    URL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
+    INSTALL_HINT = ("cloudflared 가 없어 인터넷 주소를 만들지 못함 — "
+                    "https://github.com/cloudflare/cloudflared/releases 의 "
+                    "cloudflared-linux-amd64 를 ~/.local/bin/cloudflared 로 두면 된다")
+
+    def __init__(self, port: int, on_url, log) -> None:
+        self.port = port
+        self.on_url = on_url
+        self.log = log
+        self.url = ""
+        self.provider = "cloudflared"
+        self._proc = None
+        self._stop = False
+        self.exe = shutil.which("cloudflared") or ""
+        local = os.path.expanduser("~/.local/bin/cloudflared")
+        if not self.exe and os.access(local, os.X_OK):
+            self.exe = local
+        if not self.exe:
+            log(self.INSTALL_HINT)
+            return
+        threading.Thread(target=self._run, daemon=True).start()
+        atexit.register(self.close)
+
+    def _command(self) -> List[str]:
+        return [self.exe, "tunnel", "--no-autoupdate",
+                "--url", f"http://127.0.0.1:{self.port}"]
+
+    @staticmethod
+    def _die_with_parent() -> None:
+        # HUD 노드가 죽으면(강제 종료 포함) 터널도 같이 닫힌다.
+        try:
+            ctypes.CDLL("libc.so.6").prctl(1, signal.SIGTERM)     # PR_SET_PDEATHSIG
+        except Exception:
+            pass
+
+    def _run(self) -> None:
+        wait = 5.0
+        while not self._stop:
+            try:
+                self._proc = subprocess.Popen(
+                    self._command(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT, text=True, preexec_fn=self._die_with_parent)
+            except Exception as exc:
+                self.log(f"터널을 열지 못함: {exc}")
+                return
+            started = time.time()
+            for line in self._proc.stdout:
+                m = self.URL_RE.search(line)
+                if m and m.group(0) != self.url:
+                    self.url = m.group(0)
+                    self.on_url(self.url, self.provider)
+            self._proc.wait()
+            if self._stop:
+                return
+            if self.url:
+                self.url = ""
+                self.on_url("", self.provider)
+            wait = 5.0 if time.time() - started > 60.0 else min(wait * 2.0, 120.0)
+            self.log(f"터널({self.provider})이 닫힘 — {wait:.0f} s 뒤 다시 연다")
+            time.sleep(wait)
+
+    def close(self) -> None:
+        self._stop = True
+        if self._proc is not None and self._proc.poll() is None:
+            self._proc.terminate()
 
 
 # 운영자 명령: HUD 버튼 이름 → mission/command 에 보낼 문자열 (토글은 상태를 보고 고른다)
@@ -584,9 +671,34 @@ def main(args: list[str] | None = None) -> None:
     token = os.environ.get("WEB_TOKEN", "").strip()
     actions_on = os.environ.get("WEB_ACTIONS", "1").strip().lower() not in (
         "0", "false", "no", "off")
+    public_on = os.environ.get("WEB_PUBLIC", "0").strip().lower() in ("1", "true", "yes", "on")
+    # 인터넷 주소는 누구나 접속을 시도할 수 있다 — 접속 키 없이는 내보내지 않는다.
+    token_made = public_on and not token
+    if token_made:
+        token = secrets.token_urlsafe(9)
+    key_q = f"/?key={token}" if token else ""
+    tunnel_box: Dict[str, Any] = {"t": None}
+
+    TUNNEL_HEADERS = ("X-Forwarded-For", "X-Forwarded-Host", "Forwarded",
+                      "Cf-Connecting-Ip", "Cf-Ray")
+
+    def from_this_pc() -> bool:
+        """이 PC 의 브라우저가 localhost 로 직접 연 요청인가.
+
+        터널로 들어온 요청도 127.0.0.1 에서 오므로 주소만으로는 구분할 수 없다. 터널은
+        Host 가 터널 도메인이고 전달 헤더(X-Forwarded-For, Cf-*)가 붙는다 — 둘 중
+        하나라도 있으면 밖에서 온 것으로 본다.
+        """
+        if request.remote_addr not in ("127.0.0.1", "::1"):
+            return False
+        if any(h in request.headers for h in TUNNEL_HEADERS):
+            return False
+        host = (request.host or "").rsplit(":", 1)[0] if not (request.host or "").startswith("[") \
+            else (request.host or "").split("]")[0] + "]"
+        return host in ("localhost", "127.0.0.1", "[::1]")
 
     def authorized() -> bool:
-        if not token:
+        if not token or from_this_pc():      # 이 PC 에서는 키 없이 (키가 없을 때와 같은 조건)
             return True
         got = request.cookies.get("hud_key", "")
         return hmac.compare_digest(got.encode(), token.encode())
@@ -666,9 +778,18 @@ def main(args: list[str] | None = None) -> None:
 
     @app.route("/api/info")
     def api_info():
+        tunnel = tunnel_box["t"]
+        public = tunnel.url if tunnel is not None else ""
         return jsonify({
             "local": f"http://localhost:{web_port}",
             "lan": lan_urls(web_port),
+            # 인터넷 주소 (hud_public:=true 일 때. 터널이 열리기 전에는 빈 문자열)
+            "public": public,
+            "public_on": public_on,
+            # 다른 기기에 그대로 넘겨줄 주소 — 접속 키가 붙어 있다. 이 응답은 이미
+            # 키를 가진 브라우저만 받는다.
+            "share_lan": [u + key_q for u in lan_urls(web_port)],
+            "share_public": (public + key_q) if public else "",
             "key_required": bool(token),
             "actions": actions_on,
             "rovers": list(ros_node.rover_namespaces),
@@ -730,9 +851,24 @@ def main(args: list[str] | None = None) -> None:
     ros_node.get_logger().info(
         f"web server listening on http://{host}:{port}  "
         f"(async={_ASYNC_MODE}, web_dir={web_dir})")
-    suffix = "/?key=<WEB_TOKEN>" if token else ""
+    # 직접 준 키는 로그에 다시 적지 않는다. 여기서 만든 키는 적어야 쓸 수 있다.
+    suffix = key_q if token_made else ("/?key=<hud_key>" if token else "")
+    local_note = " (이 PC 에서는 키 없이)" if token else ""
+
+    def on_public_url(url: str, provider: str) -> None:
+        if url:
+            ros_node.get_logger().info(
+                f"HUD 주소 — 인터넷: {url}{suffix}   ({provider} 터널. 영상·상태가 Cloudflare "
+                "서버를 거쳐 나간다. HUD 를 내리면 주소도 사라진다)")
+            ros_node.push_event("", "info", f"인터넷 주소 열림: {url}")
+        else:
+            ros_node.push_event("", "info", "인터넷 주소 닫힘 (터널이 끊김)")
+
+    if public_on:
+        tunnel_box["t"] = PublicTunnel(
+            web_port, on_public_url, lambda m: ros_node.get_logger().warn(m))
     ros_node.get_logger().info(
-        f"HUD 주소 — 이 PC: http://localhost:{port}{suffix}   같은 네트워크: "
+        f"HUD 주소 — 이 PC: http://localhost:{port}{local_note}   같은 네트워크: "
         + ("  ".join(u + suffix for u in lan_urls(port)) or "(주소를 못 찾음)")
         + f"   · 접속 키 {'필요' if token else '없음'} · 버튼 {'켜짐' if actions_on else '꺼짐(보기 전용)'}"
         + f" · 버튼 기록 {ros_node.action_log_path}")
