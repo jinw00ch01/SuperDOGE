@@ -25,6 +25,8 @@ _p.add_argument("--policy", default="")
 _p.add_argument("--controllers", default="raw,fixed,policy")
 _p.add_argument("--num-envs", type=int, default=16)
 _p.add_argument("--minutes", type=float, default=6.0, help="제어 방식 하나당 로버 1 대의 주행 시간")
+_p.add_argument("--wheels", default="capsule", choices=["capsule", "mesh"],
+                help="바퀴 충돌 형상. mesh = 로버 모델 그대로 (예전 결과 재현용)")
 _p.add_argument("--seed", type=int, default=100)
 _p.add_argument("--friction", type=float, default=1.0, help="지면 마찰 배율")
 _p.add_argument("--steep-goal-frac", type=float, default=0.0,
@@ -48,6 +50,7 @@ if args.balance:
     from balance_env import BalanceEnv as RoverDriveEnv  # noqa: E402,F811
 
 RoverDriveEnv.NAV_TURN_DECEL = args.nav_turn_decel
+RoverDriveEnv.WHEEL_SHAPE = args.wheels
 env = RoverDriveEnv(app, terrain=args.terrain, num_envs=args.num_envs, seed=args.seed)
 env.max_steps = 10 ** 9
 env.friction_range = (args.friction, args.friction)

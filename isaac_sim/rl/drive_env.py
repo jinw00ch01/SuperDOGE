@@ -57,6 +57,7 @@ sys.path.insert(0, os.path.join(ISAAC_SIM, "scripts"))
 sys.path.insert(0, os.path.join(os.path.dirname(ISAAC_SIM), "isaac_drive",
                                 "isaac_drive", "navigation"))
 from planet_physics import apply_planet_physics  # noqa: E402
+from wheel_colliders import round_wheel_colliders  # noqa: E402
 from drive_limits import limits_for_gravity      # noqa: E402
 import governor_policy as gp                     # noqa: E402
 
@@ -144,6 +145,13 @@ class SlewLimiter:
 
 class RoverDriveEnv:
     SELF_COLLISION = False
+    PHYSICS_HZ = 60.0             # 물리 스텝 주기 (시험용으로 하위 클래스·스크립트가 바꾼다)
+    CONTACT_REPORTS = False       # 접촉 보고 (접지력 진단 때만 켠다. 느려진다)
+    # 바퀴 충돌 형상. capsule (기본): 구동축에 중심을 맞춘 캡슐. mesh: 로버 모델 그대로
+    # (다각형 convex hull — 돌 때 땅에서 튀어 구동 접지력이 설정 마찰의 60~65% 만 나온다.
+    # probe_traction.py 로 잰 값). sphere · cylinder 는 비교 시험용.
+    WHEEL_SHAPE = "capsule"
+
     def __init__(self, app, terrain: str = "terrain_00026", num_envs: int = 16,
                  control_hz: float = 15.0, episode_sec: float = 20.0, seed: int = 0,
                  friction_range=(0.6, 1.1), planet: str = "mars",
@@ -151,8 +159,8 @@ class RoverDriveEnv:
         self.app = app
         self.n = int(num_envs)
         self.rng = np.random.default_rng(seed)
-        self.physics_dt = 1.0 / 60.0
-        self.decimation = max(1, int(round(60.0 / control_hz)))
+        self.physics_dt = 1.0 / self.PHYSICS_HZ
+        self.decimation = max(1, int(round(self.PHYSICS_HZ / control_hz)))
         self.dt = self.physics_dt * self.decimation
         self.max_steps = int(round(episode_sec / self.dt))
         self.friction_range = friction_range
@@ -161,7 +169,7 @@ class RoverDriveEnv:
         for key in ("/physics/updateToUsd", "/physics/updateVelocitiesToUsd",
                     "/physics/updateParticlesToUsd", "/physics/updateForceSensorsToUsd"):
             st.set_bool(key, False)
-        st.set_bool("/physics/disableContactProcessing", True)
+        st.set_bool("/physics/disableContactProcessing", not self.CONTACT_REPORTS)
 
         self.world = World(stage_units_in_meters=1.0, physics_dt=self.physics_dt,
                            rendering_dt=self.physics_dt)
@@ -195,6 +203,10 @@ class RoverDriveEnv:
         for prim in stage.Traverse():         # 광물 치우기
             if prim.GetName() == "Minerals":
                 prim.SetActive(False)
+        self.wheel_info = None
+        if self.WHEEL_SHAPE != "mesh":
+            self.wheel_info = round_wheel_colliders(stage, roots, shape=self.WHEEL_SHAPE)
+            print(f"[drive_env] 바퀴 충돌 형상 → {self.WHEEL_SHAPE}: {self.wheel_info}")
         self.physics_info = apply_planet_physics(
             stage, self.world, planet, meta=self.meta,
             scene_root="/World/MarsScene", rover_roots=roots)

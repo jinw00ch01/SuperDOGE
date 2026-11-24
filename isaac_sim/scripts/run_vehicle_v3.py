@@ -73,6 +73,10 @@ _p.add_argument("--drive-limits", default="auto",
                      "(earth 는 제한 없음 = 원래 동작). off: 제한 없음. "
                      "또는 'max_lin=0.8,acc_lin=0.5' 처럼 항목별 override "
                      "(항목: max_lin, max_ang, acc_lin, acc_ang).")
+_p.add_argument("--wheel-collider", choices=["round", "mesh"], default="round",
+                help="바퀴 충돌 형상. round = 구동축에 중심을 맞춘 캡슐 (기본). "
+                     "mesh = 로버 모델 그대로 (바퀴 mesh 의 convex hull). mesh 는 "
+                     "다각형이라 돌 때 땅에서 튀어 구동 접지력이 설정 마찰의 60~65%% 만 나온다")
 _p.add_argument("--structure-collision", choices=["mesh", "box"], default="mesh",
                 help="큰 구조물(배럭·골리앗 등)의 충돌 형상. box (원본): 보이지 않는 상자 — "
                      "모델보다 커서 카메라에 안 보이는 벽이 생긴다. mesh (기본): 보이는 "
@@ -129,6 +133,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 from planet_physics import MINERAL_MASS_KG, apply_mineral_mass, apply_planet_physics  # noqa: E402
+from wheel_colliders import round_wheel_colliders  # noqa: E402
 from contact_grasp import ContactGrasp  # noqa: E402
 from wide_gripper import FrictionGrasp, install_wide_gripper  # noqa: E402
 from drive_limits import apply_drive_limits, limits_for_gravity, parse_limits  # noqa: E402
@@ -1366,6 +1371,10 @@ def main() -> None:
     if _a.structure_collision == "mesh":
         print(f"[run_v3] 구조물 충돌: 보이는 모델 그대로 "
               f"({_structures_collide_as_seen(stage, '/World/MarsScene')}개, 투명 상자 끔)")
+    if _a.wheel_collider == "round":
+        _w = round_wheel_colliders(stage, rover_roots)
+        print(f"[run_v3] 바퀴 충돌 형상: 캡슐 {_w['wheels']}개 (반지름 {_w['radius']} m, "
+              f"원래 mesh 의 편심 {_w['eccentricity_mm']} mm)")
     physics_info = apply_planet_physics(
         stage, world, _a.physics, meta=terrain_meta,
         scene_root="/World/MarsScene", rover_roots=rover_roots)
