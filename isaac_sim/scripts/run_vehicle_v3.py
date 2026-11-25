@@ -77,6 +77,11 @@ _p.add_argument("--wheel-collider", choices=["round", "mesh"], default="round",
                 help="바퀴 충돌 형상. round = 구동축에 중심을 맞춘 캡슐 (기본). "
                      "mesh = 로버 모델 그대로 (바퀴 mesh 의 convex hull). mesh 는 "
                      "다각형이라 돌 때 땅에서 튀어 구동 접지력이 설정 마찰의 60~65%% 만 나온다")
+_p.add_argument("--wheel-grip", type=float, default=1.0,
+                help="바퀴-지면 마찰 배율 (지면 마찰 × 이 값). 1.0 = 지면 마찰 그대로. "
+                     "화성 레골리스 0.58/0.52 에서 등판 한계는 atan(0.52 × 배율): "
+                     "1.0 → 27.5°, 1.25 → 33°, 1.5 → 38°. 올리면 더 가파른 곳을 오르지만 "
+                     "앞이 들려 뒤로 넘어가는 일도 는다 (README '바퀴 접지력')")
 _p.add_argument("--link-speed-cap", choices=["off", "model"], default="off",
                 help="로버 link 의 선속도 상한. model = 로버 모델 그대로 (1.5 m/s 에서 속도를 "
                      "잘라 냄 — 주행뿐 아니라 넘어질 때 떨어지는 속도까지). off (기본) = 해제")
@@ -1353,7 +1358,8 @@ def main() -> None:
         print(f"[run_v3] link 속도 상한 해제: {_c['links']}개 ({_c['before']} → {_c['after']} m/s)")
     physics_info = apply_planet_physics(
         stage, world, _a.physics, meta=terrain_meta,
-        scene_root="/World/MarsScene", rover_roots=rover_roots)
+        scene_root="/World/MarsScene", rover_roots=rover_roots,
+        wheel_grip=_a.wheel_grip)
     if _a.mineral_mass == "auto":
         mineral_mass = MINERAL_MASS_KG if _a.physics != "earth" else None
     else:

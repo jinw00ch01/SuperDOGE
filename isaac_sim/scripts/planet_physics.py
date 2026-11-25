@@ -174,7 +174,7 @@ def _zone_subsets(stage, mesh_prim, zones, materials) -> dict:
 
 def apply_planet_physics(stage, world, planet: str, meta: dict | None = None,
                          scene_root: str = "/World/MarsScene",
-                         rover_roots=()) -> dict:
+                         rover_roots=(), wheel_grip: float = 1.0) -> dict:
     """중력과 접촉 재질을 적용하고 적용 내역을 dict 로 돌려준다.
 
     world.reset() / play() 전에, 로버를 stage 에 올린 뒤에 호출할 것.
@@ -202,14 +202,20 @@ def apply_planet_physics(stage, world, planet: str, meta: dict | None = None,
         print(f"[physics] ⚠ physics_context.set_gravity 실패: {exc}")
 
     # ── 재질 ────────────────────────────────────────────────────────────
-    # 지면·바위는 combine=min, 바퀴는 mu=1.0 → 바퀴-지면 유효 마찰 = 지면 값.
+    # 지면·바위는 combine=min, 바퀴는 combine=multiply 에 mu=wheel_grip
+    #   → 바퀴-지면 유효 마찰 = 지면 값 × wheel_grip  (구역별 차이는 그대로 남는다).
+    # 바퀴가 아닌 것(광물·차체)과 지면 사이는 여전히 지면 값이다.
     # (PhysX 는 두 재질 중 우선순위 높은 combine mode 를 쓴다:
     #  average < min < multiply < max.)
+    # wheel_grip 은 "돌기(grouser)가 흙을 파고드는 만큼 매끈한 바퀴보다 더 민다" 를
+    # 한 숫자로 줄인 것이다. 1.0 = 지면 마찰 그대로 (2026-11-25 이전 동작).
+    wheel_grip = float(wheel_grip)
     zones = list((meta or {}).get("physics_zones") or [])
     mats = {
         "regolith": _make_material(stage, "Regolith", combine="min", **cfg["regolith"]),
         "rock": _make_material(stage, "Rock", combine="min", **cfg["rock"]),
-        "wheel": _make_material(stage, "WheelGrouser", 1.0, 1.0, combine="average"),
+        "wheel": _make_material(stage, "WheelGrouser", wheel_grip, wheel_grip,
+                                combine="multiply"),
     }
     table = {"regolith": dict(cfg["regolith"]), "rock": dict(cfg["rock"])}
     for z in zones:
@@ -247,16 +253,16 @@ def apply_planet_physics(stage, world, planet: str, meta: dict | None = None,
                     bind_physics(sub, mats["wheel"])
                     n_wheels += 1
 
-    info = {"planet": planet, "gravity": g, "materials": table,
+    info = {"planet": planet, "gravity": g, "materials": table, "wheel_grip": wheel_grip,
             "zones": zone_faces, "terrain_meshes": len(meshes),
             "rocks": n_rocks, "wheel_colliders": n_wheels}
-    climb = {k: round(math.degrees(math.atan(v["static_friction"])), 1)
+    climb = {k: round(math.degrees(math.atan(v["dynamic_friction"] * wheel_grip)), 1)
              for k, v in table.items() if k != "rock"}
     print(f"[physics] {planet}: gravity {g} m/s² (scene {len(scenes)}개), "
           f"지형 mesh {len(meshes)}, 바위 {n_rocks}, 바퀴 collider {n_wheels}")
     print(f"[physics] 마찰(static/dynamic): "
           + ", ".join(f"{k} {v['static_friction']:.2f}/{v['dynamic_friction']:.2f}"
                       for k, v in table.items()))
-    print(f"[physics] 구역별 face 수: {zone_faces or '구역 없음'} · "
-          f"등판 한계 atan(mu): {climb}")
+    print(f"[physics] 구역별 face 수: {zone_faces or '구역 없음'} · 바퀴 접지력 배율 "
+          f"×{wheel_grip:g} · 등판 한계 atan(동마찰 × 배율): {climb}")
     return info

@@ -36,6 +36,8 @@ _p.add_argument("--slip-caps", default="0",
 _p.add_argument("--wheels", default="capsule",
                 choices=["mesh", "capsule", "sphere", "cylinder"])
 _p.add_argument("--seed", type=int, default=0)
+_p.add_argument("--wheel-grip", type=float, default=1.0,
+                help="바퀴 재질의 마찰 배율 (run_vehicle_v3 --wheel-grip 과 같은 경로)")
 args, _ = _p.parse_known_args()
 
 from isaacsim import SimulationApp  # noqa: E402
@@ -49,6 +51,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from drive_env import REST_HEIGHT, RoverDriveEnv  # noqa: E402
 
 RoverDriveEnv.WHEEL_SHAPE = args.wheels
+RoverDriveEnv.WHEEL_GRIP = args.wheel_grip
 env = RoverDriveEnv(app, terrain=args.terrain, num_envs=args.num_envs, seed=args.seed)
 env.friction_range = (args.friction, args.friction)
 env.randomize_friction()
