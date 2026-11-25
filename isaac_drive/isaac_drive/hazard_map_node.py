@@ -92,6 +92,8 @@ class HazardMapNode(Node):
         self.declare_parameter("cmd_topic", "/cmd_vel")
         # 운영자가 지도를 비울 때 (HUD 의 MAP CLR). 잘못 찍힌 위험 칸이 길을 막을 때 쓴다.
         self.declare_parameter("reset_topic", "/hazard_map/reset")
+        self.declare_parameter("clear_marks_topic", "/hazard_map/clear_marks")
+        self.declare_parameter("mark_topic", "/hazard_map/mark")
         self.declare_parameter("stall_sec", 4.0)
         self.declare_parameter("stall_cmd_mps", 0.15)    # 구간 평균 명령이 이보다 작으면 판단 안 함
         self.declare_parameter("stall_move_m", 0.15)
@@ -156,6 +158,11 @@ class HazardMapNode(Node):
         from std_msgs.msg import Empty
         self.create_subscription(Empty, str(self.get_parameter("reset_topic").value),
                                  self._on_reset, 10)
+        from geometry_msgs.msg import PointStamped
+        self.create_subscription(Empty, str(self.get_parameter("clear_marks_topic").value),
+                                 self._on_clear_marks, 10)
+        self.create_subscription(PointStamped, str(self.get_parameter("mark_topic").value),
+                                 self._on_mark, 10)
         self.get_logger().info(
             f"hazard_map_node ready — {size[0]:.0f}×{size[1]:.0f} m @ {self.hm.cell:.2f} m, "
             f"거리 {self.hm.min_range}~{self.hm.max_range} m, 경사 한계 "
@@ -180,6 +187,32 @@ class HazardMapNode(Node):
         self._stall_ref = None
         self.get_logger().warn(
             f"operator reset: 위험 칸 {cells}개, 막힘 표시 {bumps}곳을 지움 — 지도를 다시 만든다")
+        self._publish(force=True)
+
+    def _on_clear_marks(self, _msg) -> None:
+        """몸으로 찍은 표시(막힘·기울기 반사)만 지운다. 카메라로 본 위험 칸은 그대로 둔다.
+
+        탐색 노드가 "갈 수 있는 곳이 하나도 없다" 고 할 때 부른다 — 표시는 한 번의
+        실패로 찍히고 다시 확인되지 않으므로, 로버를 가둘 바에는 지우고 다시 겪는 편이 낫다.
+        """
+        n = len(self._bumps)
+        self._bumps.clear()
+        self._stall_ref = None
+        self.get_logger().warn(f"막힘·기울기 표시 {n}곳을 지움 (탐색 노드 요청: 갈 곳이 없음)")
+        self._publish(force=True)
+
+    def _on_mark(self, msg) -> None:
+        """다른 노드가 알려 준 위험 지점 (mission_manager 의 기울기 반사: 앞이 들린 자리의 앞).
+
+        막힘 표시와 똑같이 다룬다 — 카메라가 못 본 낮은 턱·짧은 급경사를 몸으로 알아낸 것.
+        """
+        bx, by = float(msg.point.x), float(msg.point.y)
+        if any(math.hypot(bx - x0, by - y0) < 0.3 for (x0, y0) in self._bumps):
+            return
+        self._bumps.append((bx, by))
+        self.get_logger().warn(
+            f"기울기 반사가 알려 준 자리 ({bx:.2f},{by:.2f}) 을 위험으로 표시 "
+            f"(누적 {len(self._bumps)}곳)")
         self._publish(force=True)
 
     def _check_stall(self, t: float, pos: np.ndarray, quat: np.ndarray) -> None:

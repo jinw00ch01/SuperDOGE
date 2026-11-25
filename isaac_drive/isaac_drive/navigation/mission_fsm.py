@@ -38,6 +38,15 @@ class Mission:
         self.anchor_queue = []       # 남은 anchor 의 world xy 리스트
         self.state = "PLAN_SECTOR"
         self._last_log = -1
+        # 주행 중에 만든 지도에서는 "지금은 길이 없는" anchor 가 생긴다 (몸으로 찍은
+        # 위험 표시에 둘러싸였을 때 등). 그런 anchor 를 버리기만 하면 모든 구역이
+        # reveal 0% 인 채 '완료' 가 되고 로버는 그 자리에 서 버린다 (logs/guard_t15_force2:
+        # 구덩이 안에서 anchor 45 개 전부 도달 불가 → reveal 13% 에서 완료).
+        # 도달 불가로 버린 것이 있으면 완료하지 않고 처음부터 다시 돈다.
+        self.unreachable = 0         # 이번 바퀴에서 도달 불가로 버린 anchor 수
+        self.restarts = 0            # 다시 돈 횟수
+        self.max_restarts = 3
+        self.escape_requested = False   # coverage_node 가 보고 위험 표시를 지운다
 
     def is_done(self):
         return self.state == "DONE"
@@ -160,6 +169,7 @@ class Mission:
 
         if cells is None:
             print(f"[mission] anchor ({target[0]:+.1f},{target[1]:+.1f}) 도달 불가, 스킵")
+            self.unreachable += 1
             self.state = "PLAN_PATH"     # 다음 anchor 즉시 시도
             return
 
@@ -198,6 +208,18 @@ class Mission:
     def _switch_to_next_sector(self):
         self.visit_idx += 1
         if self.visit_idx >= len(self.visit_order):
+            if (self.unreachable > 0 and self.restarts < self.max_restarts
+                    and self.fog.overall_ratio() < 0.9):
+                self.restarts += 1
+                print(f"[mission] 길이 없어 버린 anchor 가 {self.unreachable}개 "
+                      f"(reveal {self.fog.overall_ratio() * 100:.0f}%) — 완료하지 않고 "
+                      f"처음부터 다시 ({self.restarts}/{self.max_restarts})")
+                self.unreachable = 0
+                self.visit_idx = 0
+                self.current_sector = self.visit_order[0]
+                self.state = "PLAN_SECTOR"
+                self.escape_requested = True
+                return
             print("[mission] 모든 구역 완료!")
             self.state = "DONE"
             return

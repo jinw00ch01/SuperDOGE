@@ -144,6 +144,31 @@ def confirm_hits(seen: list, items, now_ns: int, need: int, radius_m: float,
     return out
 
 
+class _CmdTap:
+    """cmd_vel publisher 를 감싸 마지막으로 보낸 진행 방향을 기억한다 (기울기 반사가 쓴다)."""
+
+    def __init__(self, pub) -> None:
+        self._pub = pub
+        self.last_dir = 1.0
+
+    def publish(self, msg: Twist) -> None:
+        if abs(msg.linear.x) > 0.05:
+            self.last_dir = 1.0 if msg.linear.x > 0.0 else -1.0
+        self._pub.publish(msg)
+
+
+def nose_up_and_roll_deg(q) -> Tuple[float, float]:
+    """자세 quaternion → (앞이 들린 각, 옆으로 기운 각) [deg].
+
+    차체 x 축(앞)과 y 축(왼쪽)이 수평면에서 얼마나 올라가 있는지다. 평지 0,
+    앞바퀴가 턱에 올라타면 앞이 들린 각이 +.
+    """
+    x, y, z, w = q.x, q.y, q.z, q.w
+    nose = math.degrees(math.asin(max(-1.0, min(1.0, 2.0 * (x * z - w * y)))))
+    roll = math.degrees(math.asin(max(-1.0, min(1.0, 2.0 * (y * z + w * x)))))
+    return nose, roll
+
+
 class MissionManagerNode(Node):
     def __init__(self) -> None:
         super().__init__("mission_manager_node")
@@ -190,6 +215,25 @@ class MissionManagerNode(Node):
         self.declare_parameter("command_topic", "/mission/command")
         # 운영자 명령과 phase 전환을 사람이 읽는 한 줄로 내보낸다 (HUD 의 EVENT LOG).
         self.declare_parameter("event_topic", "/mission/event")
+        # 기울기 반사 — 앞이 들리거나 옆으로 크게 기울면 밀어붙이지 않고 물러난다.
+        # 급경사 지형에서 넘어지는 경우의 거의 전부가 "짧고 가파른 턱을 최대 명령으로
+        # 밀다가 차체는 서 있는 채 앞이 40~55° 까지 들려 뒤로 넘어가는" 것이었다.
+        # (terrain_00015, 16 대 × 15 분: 반사 없이 8 회 → 30°/32° 반사로 2 회)
+        self.declare_parameter("tilt_guard", True)
+        self.declare_parameter("tilt_guard_pitch_deg", 30.0)    # 앞이 들린 각
+        self.declare_parameter("tilt_guard_roll_deg", 32.0)     # 옆으로 기운 각
+        self.declare_parameter("tilt_guard_back_mps", 0.5)
+        # 물러나기는 거리로 끝낸다: 구동 제한(화성 0.72 m/s²) 때문에 0.9 m/s 로 가던 중이면
+        # 후진 명령을 내도 1.3 초·0.5 m 는 앞으로 더 간다 (시간으로 끊으면 물러나지 못한다).
+        self.declare_parameter("tilt_guard_back_m", 0.5)        # 가장 멀리 나간 자리에서 이만큼
+        self.declare_parameter("tilt_guard_back_sec", 4.0)      # 그래도 이 시간이면 끝 (시뮬레이션 시각)
+        self.declare_parameter("tilt_guard_mark_ahead_m", 0.9)  # 그 자리 앞을 위험으로 표시
+        # 물러났는데도 기울기가 그대로면 곧바로 또 발동한다 (가파른 비탈을 다 내려올 때까지
+        # 물러나는 것 — 의도한 동작). 다만 끝없이 후진만 하지 않게 연달아 이 횟수까지만.
+        # 그 뒤에는 기울기가 문턱 − 3° 아래로 내려가거나 지금보다 5° 더 기울 때까지 쉰다.
+        self.declare_parameter("tilt_guard_chain_max", 3)
+        self.declare_parameter("tilt_guard_skip_after", 3)      # 같은 목표로 가다 이만큼 걸리면 건너뜀
+        self.declare_parameter("hazard_mark_topic", "/hazard_map/mark")
         # self_right_node 가 넘어진 로버를 세우는 동안 True 를 보낸다 → 바퀴 정지.
         self.declare_parameter("righting_active_topic", "righting/active")
         self.declare_parameter("righting_status_topic", "righting/status")
@@ -259,6 +303,17 @@ class MissionManagerNode(Node):
         self.righting_active = False
         self._righting_stamp_ns = 0
         self.righting_status = ""           # self_right_node 가 보내는 진행 상황 (HUD 의 TASK)
+        self._guard_until = None            # 물러나기가 끝나는 odom 시각 (s). None = 평소
+        self._guard_start = 0.0
+        self._guard_p0 = (0.0, 0.0)         # 발동한 자리
+        self._guard_fwd = (1.0, 0.0)        # 가려던 방향 (수평 단위 벡터)
+        self._guard_far = 0.0               # 발동 뒤 가려던 쪽으로 가장 멀리 나간 거리
+        self._guard_dir = -1.0              # 물러나는 방향 (-1 = 후진)
+        self._guard_why = ""
+        self._guard_count = 0               # 누적 횟수
+        self._guard_chain = 0               # 기울기가 풀리지 않은 채 연달아 발동한 횟수
+        self._guard_peak = 0.0              # 그 동안 가장 크게 넘은 정도 (문턱 대비, 도)
+        self._guard_target = None           # (x, y, 횟수) 같은 목표로 가다 걸린 횟수
         self._phase_before_recovery = "EXPLORE"
         # Mineral collection / battery
         self.collected_count: int = 0
@@ -349,8 +404,11 @@ class MissionManagerNode(Node):
             self.arm_client = ActionClient(
                 self, ExecuteArmTask, str(self.get_parameter("arm_action_name").value))
 
-        self.cmd_pub = self.create_publisher(
-            Twist, str(self.get_parameter("cmd_vel_topic").value), 10)
+        self.cmd_pub = _CmdTap(self.create_publisher(
+            Twist, str(self.get_parameter("cmd_vel_topic").value), 10))
+        self._guard_pub = self.cmd_pub._pub
+        self.hazard_mark_pub = self.create_publisher(
+            PointStamped, str(self.get_parameter("hazard_mark_topic").value), 10)
         self.phase_pub = self.create_publisher(
             String, str(self.get_parameter("phase_topic").value), 10)
         self.state_pub = self.create_publisher(
@@ -813,6 +871,112 @@ class MissionManagerNode(Node):
         self.last_det_stamp_ns = 0
         return f"목표 {tgt.class_name} ({x:.1f}, {y:.1f}) 를 {ignore_sec:.0f} s 동안 건너뜀"
 
+    # ── 기울기 반사 ─────────────────────────────────────────────────────
+    def _tilt_guard(self) -> bool:
+        """앞이 들리거나 옆으로 크게 기울면 잠깐 물러난다. True = 이번 tick 의 명령을 냈다.
+
+        시간은 odom 의 시각(시뮬레이션 시각)으로 잰다 — 시뮬레이터가 실시간보다 느려도
+        물러나는 거리가 같다.
+        """
+        odom = self.last_odom
+        if odom is None or not bool(self.get_parameter("tilt_guard").value):
+            self._guard_until = None
+            return False
+        t = odom.header.stamp.sec + odom.header.stamp.nanosec * 1e-9
+        if self._guard_until is not None:
+            p = odom.pose.pose.position
+            along = ((p.x - self._guard_p0[0]) * self._guard_fwd[0]
+                     + (p.y - self._guard_p0[1]) * self._guard_fwd[1])     # 가려던 쪽이 +
+            self._guard_far = max(self._guard_far, along)
+            retreated = self._guard_far - along
+            if self._guard_start <= t < self._guard_until \
+                    and retreated < float(self.get_parameter("tilt_guard_back_m").value):
+                back = Twist()
+                back.linear.x = self._guard_dir * float(
+                    self.get_parameter("tilt_guard_back_mps").value)
+                self._guard_pub.publish(back)        # last_dir 를 바꾸지 않게 안쪽 publisher 로
+                return True
+            self._guard_until = None                 # 다 물러났다 (또는 시간 초과·시각 되감김)
+            self._after_guard(f"앞으로 {self._guard_far:.2f} m 더 간 뒤 {retreated:.2f} m 물러남, "
+                              f"{t - self._guard_start:.1f} s")
+            self.cmd_pub.publish(Twist())
+            return True
+        if self.phase == "PICK_READY":               # 서서 팔을 쓰는 중
+            return False
+        nose, roll = nose_up_and_roll_deg(odom.pose.pose.orientation)
+        lim_p = float(self.get_parameter("tilt_guard_pitch_deg").value)
+        lim_r = float(self.get_parameter("tilt_guard_roll_deg").value)
+        over = max(nose - lim_p, abs(roll) - lim_r)          # 문턱을 넘은 정도 (도)
+        if over < -3.0:
+            self._guard_chain, self._guard_peak = 0, 0.0     # 기울기가 풀렸다 → 다시 장전
+        if over > 0.0 and self._guard_chain >= int(self.get_parameter("tilt_guard_chain_max").value):
+            if over < self._guard_peak + 5.0:
+                return False            # 이미 연달아 물러났다 — 더 나빠지지 않는 한 계획기에 맡긴다
+        if nose > lim_p:
+            # 앞이 들렸다 = 내리막은 뒤쪽. 어느 쪽으로 가던 중이든 뒤로 내려온다.
+            self._guard_dir, self._guard_why = -1.0, f"앞이 {nose:.0f}° 들림"
+        elif abs(roll) > lim_r:
+            # 옆으로 기울었다 → 온 길로 되돌아간다.
+            self._guard_dir = -self.cmd_pub.last_dir
+            self._guard_why = f"옆으로 {abs(roll):.0f}° 기움"
+        else:
+            return False
+        self._guard_start = t
+        self._guard_until = t + float(self.get_parameter("tilt_guard_back_sec").value)
+        self._guard_count += 1
+        self._guard_chain += 1
+        self._guard_peak = max(self._guard_peak, over)
+        if self._guard_chain == int(self.get_parameter("tilt_guard_chain_max").value):
+            self.get_logger().warn(
+                f"tilt guard: 연달아 {self._guard_chain}번 물러남 — 기울기가 풀리거나 "
+                "5° 더 기울 때까지 반사를 쉬고 계획기에 맡긴다")
+        # 가려던 쪽(물러나는 방향의 반대)의 바로 앞을 위험으로 표시 → 계획기가 돌아간다.
+        q = odom.pose.pose.orientation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        self._guard_p0 = (float(odom.pose.pose.position.x), float(odom.pose.pose.position.y))
+        self._guard_fwd = (-self._guard_dir * math.cos(yaw), -self._guard_dir * math.sin(yaw))
+        self._guard_far = 0.0
+        d = -self._guard_dir * float(self.get_parameter("tilt_guard_mark_ahead_m").value)
+        mark = PointStamped()
+        mark.header.stamp = odom.header.stamp
+        mark.header.frame_id = "world"
+        mark.point.x = float(odom.pose.pose.position.x + d * math.cos(yaw))
+        mark.point.y = float(odom.pose.pose.position.y + d * math.sin(yaw))
+        self.hazard_mark_pub.publish(mark)
+        self._guard_mark = (mark.point.x, mark.point.y)
+        self.get_logger().warn(
+            f"tilt guard #{self._guard_count}: {self._guard_why} "
+            f"(nose {nose:+.0f}°, roll {roll:+.0f}°, phase {self.phase}) at "
+            f"({odom.pose.pose.position.x:.2f},{odom.pose.pose.position.y:.2f}) → "
+            f"{'후진' if self._guard_dir < 0 else '전진'}으로 물러남, "
+            f"({mark.point.x:.2f},{mark.point.y:.2f}) 위험 표시")
+        self._event(f"기울기 반사: {self._guard_why} → 물러나서 다른 길로")
+        back = Twist()
+        back.linear.x = self._guard_dir * float(self.get_parameter("tilt_guard_back_mps").value)
+        self._guard_pub.publish(back)
+        return True
+
+    def _after_guard(self, moved: str = "") -> None:
+        """다 물러난 뒤: 경로를 버리고 다시 계획. 같은 목표에서 거듭 걸리면 그 목표를 건너뛴다."""
+        note = self._cmd_replan()
+        now_ns = self.get_clock().now().nanoseconds
+        if self.phase == "EXPLORE":
+            # coverage 가 새 경로를 낼 때까지 예전 명령을 따라가지 않는다.
+            self.last_coverage_cmd = None
+            self.last_coverage_cmd_ns = 0
+            self.explore_entry_ns = now_ns
+        tgt = self.lock_target or self.target
+        if tgt is not None and self.phase == "APPROACH":
+            x, y = float(tgt.world_position.x), float(tgt.world_position.y)
+            prev = self._guard_target
+            n = prev[2] + 1 if prev and math.hypot(prev[0] - x, prev[1] - y) < 1.0 else 1
+            self._guard_target = (x, y, n)
+            if n >= int(self.get_parameter("tilt_guard_skip_after").value):
+                self._guard_target = None
+                note = self._cmd_skip() + f" (기울기 반사 {n}회)"
+                self._event(note)
+        self.get_logger().info(f"tilt guard: 물러남 끝 ({moved}) — {note}")
+
     def _on_battery(self, msg: BatteryState) -> None:
         self.battery_percent = float(msg.percentage)
         self.battery_low = bool(msg.is_low)
@@ -824,6 +988,8 @@ class MissionManagerNode(Node):
 
     def _tick(self) -> None:
         # 1. Hard overrides (highest priority): ESTOP / MANUAL / MISSION_COMPLETE.
+        if self.estop or self.righting_active or self.mode == "MANUAL" or self.arm_in_flight:
+            self._guard_until = None        # 반사 도중이었으면 버린다 (나중에 이어서 물러나지 않게)
         if self.estop:
             self.cmd_pub.publish(Twist())
             return
@@ -856,6 +1022,10 @@ class MissionManagerNode(Node):
         # During arm action, hold rover stopped and freeze FSM transitions.
         if self.arm_in_flight:
             self.cmd_pub.publish(Twist())
+            return
+
+        # 기울기 반사: 물러나는 동안에는 계획·접근 명령을 내지 않는다.
+        if self._tilt_guard():
             return
 
         # 2. Mission termination gates (AUTO only): collection goal / battery.
@@ -1559,6 +1729,7 @@ class MissionManagerNode(Node):
                          else (self.righting_status or "self-righting") if self.phase == "RECOVERY"
                          else "arm → home" if self.arm_in_flight and self._arm_stopped
                          else "picking" if self.arm_in_flight
+                         else f"기울기 반사 — {self._guard_why}" if self._guard_until is not None
                          else "manual" if self.mode == "MANUAL"
                          else self.phase.lower())
         s.last_error = self.last_error

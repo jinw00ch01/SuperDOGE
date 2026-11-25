@@ -40,7 +40,10 @@ _p.add_argument("--nav-turn-decel", type=float, default=0.4,
 _p.add_argument("--guard-pitch", type=float, default=30.0,
                 help="guard 제어기: 앞이 이만큼(도) 들리면 밀기를 멈추고 물러난다")
 _p.add_argument("--guard-roll", type=float, default=32.0)
-_p.add_argument("--guard-back", default="0.5,1.5", help="guard: 후진 속도(m/s), 시간(s)")
+_p.add_argument("--guard-back", default="0.5,4.0", help="guard: 후진 속도(m/s), 최대 시간(s)")
+_p.add_argument("--guard-back-dist", type=float, default=0.5,
+                help="guard: 가장 멀리 나간 자리에서 이만큼(m) 물러나면 끝. 0 = 시간만으로 "
+                     "(예전 방식: --guard-back 0.5,1.5 --guard-back-dist 0)")
 _p.add_argument("--out", default="")
 args, _ = _p.parse_known_args()
 
@@ -90,6 +93,9 @@ for name in names:
     limiter = env.baseline_limiter()
     g_left = np.zeros(env.n, dtype=np.int64)        # guard: 남은 후진 스텝
     g_count = 0
+    g_p0 = np.zeros((env.n, 2))                     # guard: 발동한 자리
+    g_u = np.zeros((env.n, 2))                      # guard: 그때의 앞 방향 (수평 단위 벡터)
+    g_far = np.zeros(env.n)                         # guard: 발동 뒤 앞으로 가장 멀리 나간 거리
     G_BACK_V, G_BACK_T = [float(x) for x in args.guard_back.split(",")]
     if name.startswith("fixed:"):
         spec = name.split(":", 1)[1]
@@ -119,9 +125,19 @@ for name in names:
                                                   | (np.abs(roll) > args.guard_roll))
                 g_left[trig] = int(G_BACK_T / env.dt)
                 g_count += int(trig.sum())
+                pos_xy = env._state["pos"][:, :2]
+                fwd = R0[:, :2, 0] / np.maximum(np.linalg.norm(R0[:, :2, 0], axis=1, keepdims=True), 1e-6)
+                g_p0[trig], g_u[trig], g_far[trig] = pos_xy[trig], fwd[trig], 0.0
                 backing = g_left > 0
                 v_des = np.where(backing, -G_BACK_V, v_des)
                 w_des = np.where(backing, 0.0, w_des)
+                if args.guard_back_dist > 0.0:
+                    # 구동 제한(가속 0.72 m/s²) 때문에 후진 명령을 내도 한동안은 앞으로 간다.
+                    # 시간이 아니라 실제로 물러난 거리로 끝낸다.
+                    along = np.einsum("ij,ij->i", pos_xy - g_p0, g_u)
+                    g_far = np.where(backing, np.maximum(g_far, along), g_far)
+                    done_back = backing & (g_far - along >= args.guard_back_dist)
+                    g_left[done_back] = 1
                 for i in np.nonzero(g_left == 1)[0]:
                     if env.mode[i] == 1:
                         env._next_goal(int(i))            # 실제 스택에서는 "위험 표시 + 다시 계획"

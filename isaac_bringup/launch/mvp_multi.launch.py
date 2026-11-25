@@ -45,7 +45,8 @@ def _default_terrain_root() -> str:
 def _rover_group(ns: str, terrain_dir: str, collection_goal: int,
                  arrive_r: float, fringe_r: float, reveal_radius: float,
                  map_source: str = "online", governor: str = "",
-                 self_right: bool = False, slope_deg: float = 25.0):
+                 self_right: bool = False, slope_deg: float = 25.0,
+                 tilt_guard: bool = True):
     """단일 rover 의 5 노드 묶음 — 토픽 모두 /<ns>/... prefix.
 
     terrain_dir 는 T1 Isaac Sim 의 --terrain 인자와 동일한 terrain 폴더 경로.
@@ -107,6 +108,8 @@ def _rover_group(ns: str, terrain_dir: str, collection_goal: int,
                 "detections_topic": f"{nsp}/perception/detections",
                 "map_topic":        f"{nsp}/hazard_map",
                 "reset_topic":      f"{nsp}/hazard_map/reset",
+                "clear_marks_topic": f"{nsp}/hazard_map/clear_marks",
+                "mark_topic":       f"{nsp}/hazard_map/mark",
                 "cmd_topic":        f"{nsp}/cmd_vel",
             }],
         ))
@@ -163,6 +166,7 @@ def _rover_group(ns: str, terrain_dir: str, collection_goal: int,
                 "terrain_dir": terrain_dir,
                 "map_source": map_source,
                 "hazard_map_topic": f"{nsp}/hazard_map",
+                "clear_marks_topic": f"{nsp}/hazard_map/clear_marks",
                 # matplotlib Starcraft Map viewer 비활성 — Web HUD 의
                 # COVERAGE MAP canvas 가 두 rover 추적 가능해진 시점부터
                 # 더이상 필요 없음. enable_minimap_topics 만 True 로
@@ -216,6 +220,8 @@ def _rover_group(ns: str, terrain_dir: str, collection_goal: int,
                 # HUD 의 ACTIONS 버튼 · 수동 주행 (mission_web_node 가 보낸다)
                 "command_topic":      f"{nsp}/mission/command",
                 "event_topic":        f"{nsp}/mission/event",
+                "hazard_mark_topic":  f"{nsp}/hazard_map/mark",
+                "tilt_guard":         tilt_guard,
                 "teleop_cmd_topic":   f"{nsp}/teleop/cmd_vel",
                 "terrain_dir":        terrain_dir,
                 "map_source":         map_source,
@@ -244,6 +250,8 @@ def _rover_group(ns: str, terrain_dir: str, collection_goal: int,
                 "joint_command_topic":    f"{nsp}/arm/joint_command",
                 "joint_state_topic":      f"{nsp}/joint_states_raw",
                 "wrist_detections_topic": f"{nsp}/perception/wrist_detections",
+                "wrist_depth_topic":      f"{nsp}/camera/wrist/depth",
+                "wrist_info_topic":       f"{nsp}/camera/wrist/camera_info",
                 "odom_topic":             f"{nsp}/ground_truth/odom",
                 "grasp_command_topic":    f"{nsp}/grasp/command",
                 "grasp_status_topic":     f"{nsp}/grasp/status",
@@ -275,6 +283,8 @@ def _launch_setup(context, *args, **kwargs):
     governor = LaunchConfiguration("drive_governor").perform(context).strip().lower()
     governor = ("balance" if governor == "balance"
                 else "governor" if governor in ("true", "1", "yes") else "")
+    tilt_guard = LaunchConfiguration("tilt_guard").perform(context).strip().lower() in (
+        "1", "true", "yes", "on")
     self_right = LaunchConfiguration("self_right").perform(context).strip().lower() in (
         "true", "1", "yes")
     print(f"[mvp_multi] terrain_dir={terrain_dir}  rovers={rovers}  "
@@ -284,7 +294,7 @@ def _launch_setup(context, *args, **kwargs):
     for ns in rovers:
         nodes.extend(_rover_group(ns, terrain_dir, collection_goal,
                                   arrive_r, fringe_r, reveal_radius, map_source,
-                                  governor, self_right, slope_deg))
+                                  governor, self_right, slope_deg, tilt_guard))
 
     # Web HUD — 단일 인스턴스가 모든 rover namespace 추적 (옵션 X 단계 2).
     # mission_web_node 의 rover_namespaces param 으로 ns 리스트 전달.
@@ -360,6 +370,10 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument(
             "hud_actions", default_value="true",
             description="false 면 HUD 의 ACTIONS 버튼·수동 주행을 끈다 (보기 전용)."),
+        DeclareLaunchArgument(
+            "tilt_guard", default_value="true",
+            description="기울기 반사 — 앞이 30° 넘게 들리거나 옆으로 32° 넘게 기울면 밀어붙이지 "
+                        "않고 0.5 m 물러난 뒤 그 앞을 위험으로 표시하고 다른 길을 찾는다."),
         DeclareLaunchArgument(
             "hud_public", default_value="false",
             description="true 면 HUD 를 터널로 내보내 인터넷 주소(https://…)를 만든다. 주소는 "

@@ -203,6 +203,12 @@ class CoverageNode(Node):
 
         # ── 출력 publisher ──
         self.cmd_pub = self.create_publisher(Twist, cmd_vel_topic, 10)
+        # 탐색이 막혔을 때(모든 anchor 가 도달 불가) 몸으로 찍은 위험 표시를 지워 달라고 한다.
+        self.declare_parameter("clear_marks_topic", "/hazard_map/clear_marks")
+        self.clear_marks_pub = self.create_publisher(
+            _Empty, str(self.get_parameter("clear_marks_topic").value), 10)
+        self._hold_until_tick = 0
+        self._empty_type = _Empty
         self.action_pub = self.create_publisher(
             SelectedDriveAction, "/selected_drive_action", 10)
         self.state_pub = self.create_publisher(MissionState, "/mission_state", 10)
@@ -308,7 +314,17 @@ class CoverageNode(Node):
         x, y, yaw = self.pose.get_pose_2d()
         self.fog.reveal_around(x, y)
 
-        if self.mission.is_done():
+        if self.mission.escape_requested:
+            # 둘러싸여 갈 곳이 없었다 → 막힘·기울기 표시를 지우고 지도가 갱신될 때까지 잠깐 선다.
+            self.mission.escape_requested = False
+            self.clear_marks_pub.publish(self._empty_type())
+            self._hold_until_tick = self._tick_index + 60          # 30 Hz 기준 2 초
+            self.get_logger().warn(
+                "탐색이 막힘 (남은 anchor 전부 도달 불가) — 몸으로 찍은 위험 표시를 지우고 "
+                f"처음부터 다시 계획 ({self.mission.restarts}/{self.mission.max_restarts})")
+        if self._tick_index < self._hold_until_tick:
+            lin, ang = 0.0, 0.0
+        elif self.mission.is_done():
             lin, ang = 0.0, 0.0
             if not self._done_announced:
                 self.get_logger().info(
