@@ -276,14 +276,12 @@ class FrictionGrasp:
                 return
             _, name, c_world, Rm, size = best
             rel = Rf.T @ (c_world - centre)
-            ext = [float(sum(abs(float(Rf[:, k] @ Rm[:, i])) * size[i] for i in range(3)))
-                   for k in range(3)]
+            # 광물의 크기는 찍지 않는다: 여기서 얻는 것은 축에 맞춘 상자라, 자산 안에서
+            # mesh 가 돌아가 있으면 실제보다 크게 나온다 (20 cm 정육면체가 30x28x34).
             tilt = float(np.degrees(np.arccos(max(-1.0, min(1.0, float(Rm[2, 2]))))))
-            print(f"[grasp] {ns} {tag}: {name} 크기 {size[0] * 100:.0f}x{size[1] * 100:.0f}x"
-                  f"{size[2] * 100:.0f} cm (기울기 {tilt:.0f}°), 손가락 중심 → 광물 중심 = "
+            print(f"[grasp] {ns} {tag}: {name} (기울기 {tilt:.0f}°), 손가락 중심 → 광물 중심 = "
                   f"닫는 방향 {rel[0] * 100:+.1f} / 폭 방향 {rel[1] * 100:+.1f} / "
-                  f"길이 방향 {rel[2] * 100:+.1f} cm, 닫는 방향으로 본 광물 폭 "
-                  f"{ext[0] * 100:.1f} cm (간격 {gap * 100:.1f} cm), 광물 중심 world "
+                  f"길이 방향 {rel[2] * 100:+.1f} cm (간격 {gap * 100:.1f} cm), 광물 중심 world "
                   f"({c_world[0]:.3f},{c_world[1]:.3f},{c_world[2]:.3f})")
         except Exception as e:                      # 진단이 파지를 망치면 안 된다
             print(f"[grasp] {ns} {tag}: 진단 실패 ({e})")

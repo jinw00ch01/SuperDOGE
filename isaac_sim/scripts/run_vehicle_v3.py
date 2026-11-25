@@ -82,6 +82,11 @@ _p.add_argument("--wheel-grip", type=float, default=1.0,
                      "화성 레골리스 0.58/0.52 에서 등판 한계는 atan(0.52 × 배율): "
                      "1.0 → 27.5°, 1.25 → 33°, 1.5 → 38°. 올리면 더 가파른 곳을 오르지만 "
                      "앞이 들려 뒤로 넘어가는 일도 는다 (README '바퀴 접지력')")
+_p.add_argument("--terrain-scanner", choices=["on", "off"], default="on",
+                help="로버 위 기둥의 360° 거리 스캐너 (/<ns>/terrain_scan, PointCloud2). "
+                     "깊이 카메라(지면 위 19 cm, 정면 60°)가 못 보는 옆·뒤와 낮은 곳의 "
+                     "높낮이를 잰다. 광선은 물리 충돌 형상에 쏜다 (GPU 부담 없음)")
+_p.add_argument("--scanner-hz", type=float, default=2.0, help="지형 스캐너 주기 (시뮬레이션 시각 기준)")
 _p.add_argument("--link-speed-cap", choices=["off", "model"], default="off",
                 help="로버 link 의 선속도 상한. model = 로버 모델 그대로 (1.5 m/s 에서 속도를 "
                      "잘라 냄 — 주행뿐 아니라 넘어질 때 떨어지는 속도까지). off (기본) = 해제")
@@ -1441,6 +1446,18 @@ def main() -> None:
         grasp_bridge = None
         grasp_executor = None
 
+    terrain_scanner = None
+    if _a.terrain_scanner == "on" and grasp_bridge is not None:
+        try:
+            from terrain_scanner import TerrainScanner
+            terrain_scanner = TerrainScanner(
+                stage, grasp_bridge.node, bridge_namespaces, rover_roots,
+                period=1.0 / max(0.1, float(_a.scanner_hz)))
+        except Exception as exc:
+            print(f"[run_v3] 지형 스캐너 초기화 실패 ({exc}) — 스캐너 없이 진행")
+            terrain_scanner = None
+    scan_wall = 0.0
+
     step = 0
     chase_state: dict = {}
     # GPU/RTF 부담 측정용 — 600 step 사이 wall-clock 도 함께 출력.
@@ -1463,6 +1480,14 @@ def main() -> None:
                     time.sleep(wait)
                 elif wait < -0.1:
                     next_step_wall = time.perf_counter()
+            if terrain_scanner is not None:
+                _t0 = time.perf_counter()
+                try:
+                    terrain_scanner.step(float(world.current_time))
+                except Exception as exc:
+                    print(f"[run_v3] 지형 스캐너 오류 ({exc}) — 끔")
+                    terrain_scanner = None
+                scan_wall += time.perf_counter() - _t0
             # rclpy bridge poll + pending release 처리. main thread 에서
             # 직접 stage 조작 (안전).
             if grasp_executor is not None and grasp_bridge is not None:
@@ -1517,6 +1542,11 @@ def main() -> None:
                 print(f"[run_v3] running... step {step}  "
                       f"({rate:.1f} step/s, 600-step wall={dt:.2f}s, "
                       f"RTF={rate * physics_dt:.2f})")
+                if terrain_scanner is not None:
+                    print(f"[run_v3] 지형 스캐너: 최근 (맞은 점, 자기 몸, 광선) "
+                          f"{terrain_scanner.last_stats}, 이 구간 계산 시간 "
+                          f"{scan_wall:.2f} s ({100.0 * scan_wall / max(dt, 1e-6):.1f} %)")
+                    scan_wall = 0.0
             step += 1
     except KeyboardInterrupt:
         pass

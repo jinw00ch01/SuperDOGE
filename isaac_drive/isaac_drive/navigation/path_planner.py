@@ -13,7 +13,14 @@ _NEIGHBORS = [(-1, -1), (-1, 0), (-1, 1),
               ( 1, -1), ( 1, 0), ( 1, 1)]
 
 
-def astar(grid, start, goal):
+# 기울기 비용 1.0 (위험 문턱 바로 아래) 인 칸을 지나는 길이는 이 배수만큼 길게 친다.
+# 4 → 25° 비탈 1 m 는 평지 5 m 와 같다: 돌아가는 길이 5 배 안쪽이면 돌아간다.
+SLOPE_COST_GAIN = 4.0
+
+
+def astar(grid, start, goal, cost=None, cost_gain: float = SLOPE_COST_GAIN):
+    """cost: grid 와 같은 모양의 0…1 값 (없으면 거리만). 칸에 들어가는 걸음의 길이에
+    (1 + cost_gain × cost) 를 곱한다 — 가파른 칸을 지날 수는 있지만 비싸다."""
     rows, cols = grid.shape
     si, sj = start
     gi, gj = goal
@@ -51,6 +58,8 @@ def astar(grid, start, goal):
                 if grid[ci + di, cj] == 1 or grid[ci, cj + dj] == 1:
                     continue
             step_cost = math.hypot(di, dj)
+            if cost is not None:
+                step_cost *= 1.0 + cost_gain * float(cost[ni, nj])
             tg = g_score[cur] + step_cost
             n = (ni, nj)
             if n not in g_score or tg < g_score[n]:
@@ -62,7 +71,7 @@ def astar(grid, start, goal):
     return None
 
 
-def simplify_path(grid, path, max_skip=20):
+def simplify_path(grid, path, max_skip=20, cost=None, cost_slack: float = 0.15):
     """Line-of-sight 단순화: 가능하면 멀리있는 셀로 점프.
 
     A* 출력은 셀 단위라 너무 빽빽함. 직선으로 막힘 없이 도달 가능한
@@ -76,7 +85,12 @@ def simplify_path(grid, path, max_skip=20):
         # path[i] 에서 직선 line-of-sight 가능한 가장 먼 점 찾기
         j_far = min(i + max_skip, len(path) - 1)
         while j_far > i + 1:
-            if _line_of_sight(grid, path[i], path[j_far]):
+            # cost 가 있으면: 지름길이 원래 경로보다 가파른 칸을 지나면 안 된다
+            # (A* 가 비탈을 돌아가게 짠 길을 직선으로 펴서 다시 비탈로 보내지 않게).
+            limit = None
+            if cost is not None:
+                limit = max(float(cost[c]) for c in path[i:j_far + 1]) + cost_slack
+            if _line_of_sight(grid, path[i], path[j_far], cost, limit):
                 break
             j_far -= 1
         simplified.append(path[j_far])
@@ -84,7 +98,7 @@ def simplify_path(grid, path, max_skip=20):
     return simplified
 
 
-def _line_of_sight(grid, a, b):
+def _line_of_sight(grid, a, b, cost=None, cost_limit=None):
     """Bresenham 으로 a→b 사이에 막힌 셀 있는지."""
     i0, j0 = a
     i1, j1 = b
@@ -96,6 +110,8 @@ def _line_of_sight(grid, a, b):
     ci, cj = i0, j0
     while True:
         if grid[ci, cj] == 1:
+            return False
+        if cost_limit is not None and cost[ci, cj] > cost_limit:
             return False
         if ci == i1 and cj == j1:
             return True

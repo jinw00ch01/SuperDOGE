@@ -72,6 +72,9 @@ class OnlineObstacleLayer:
         self.raw = self._known.copy()            # 부풀리기 전 (planner 해상도)
         self._ext = np.zeros((rows, cols), dtype=bool)   # raw 중 "못 본 칸" 이라 막은 것
         self.check_grid = np.zeros((rows, cols), dtype=np.uint8)
+        # 기울기 비용 0…1 (지형 스캐너의 높이 지도에서 옴). 위험 지도 값 1…50 이 그것이다.
+        # ogrid 에 달아 두면 계획기가 astar(..., cost=ogrid.cost) 로 쓴다. 없으면 None.
+        self.ogrid.cost = None
         self.updates = 0
         self._rebuild()
 
@@ -89,6 +92,16 @@ class OnlineObstacleLayer:
         """nav_msgs/OccupancyGrid → 격자 갱신. return: planner 해상도의 raw 위험 mask."""
         w, h, res = msg.info.width, msg.info.height, float(msg.info.resolution)
         data = np.asarray(msg.data, dtype=np.int8).reshape(h, w)
+        soft = (data > 0) & (data <= 50)
+        if soft.any():
+            f = max(1, int(round(self.ogrid.cell_size / res)))
+            c = np.where(soft, data, 0).astype(np.float32) / 50.0
+            R2, C2 = c.shape[0] // f, c.shape[1] // f
+            c = c[:R2 * f, :C2 * f].reshape(R2, f, C2, f).max(axis=(1, 3))
+            cost = np.zeros((self.ogrid.rows, self.ogrid.cols), dtype=np.float32)
+            r, k = min(cost.shape[0], c.shape[0]), min(cost.shape[1], c.shape[1])
+            cost[:r, :k] = c[:r, :k]
+            self.ogrid.cost = cost
         return self.update(data > 50, res, unknown=data < 0)
 
     def update(self, hazard: np.ndarray, cell: float, unknown=None) -> np.ndarray:

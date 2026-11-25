@@ -136,6 +136,7 @@
   function renderStatusFor(rid) {
     const r = byRover[rid];
     if (!r) return;
+    if (r.terrain !== r._terrainPainted) { r._terrainPainted = r.terrain; paintTerrain(rid); }
     if (r.state) {
       const s = r.state;
       paintPhase(s.state || "EXPLORE");
@@ -424,6 +425,54 @@
       ctx.restore();
     }
   }
+
+  /* ── 주변 높낮이 (지형 스캐너 → 높이 지도). 위쪽 = 로버의 앞 ──────── */
+  const tcv = $("terrain");
+  const tctx = tcv ? tcv.getContext("2d") : null;
+  function heightColor(h) {          // h: 발밑 기준 높이 (m)
+    const t = Math.max(-1, Math.min(1, h / 1.0));
+    if (t >= 0) {                    // 회색 → 주황 → 빨강
+      const r = Math.round(70 + 185 * t), g = Math.round(78 + 60 * t - 100 * t * t), b = Math.round(86 - 60 * t);
+      return `rgb(${r},${Math.max(g, 30)},${Math.max(b, 20)})`;
+    }
+    const u = -t;                    // 회색 → 파랑
+    return `rgb(${Math.round(70 - 50 * u)},${Math.round(78 + 20 * u)},${Math.round(86 + 160 * u)})`;
+  }
+  function fmtH(v) { return (v === null || v === undefined) ? "—" : (v >= 0 ? "+" : "") + v.toFixed(2); }
+  function paintTerrain(rid) {
+    if (!tctx) return;
+    const t = ensureRover(rid).terrain;
+    const W = tcv.width, H = tcv.height;
+    tctx.fillStyle = "#0b1118"; tctx.fillRect(0, 0, W, H);
+    if (!t || !t.patch) {
+      $("terrain-fb").textContent = "스캐너 없음"; $("terrain-lr").textContent = ""; $("terrain-hl").textContent = "";
+      return;
+    }
+    const p = t.patch, n = p.n, cell = p.cell, s = W / (n * cell);      // px / m
+    const c = Math.cos(t.yaw), si = Math.sin(t.yaw), px = cell * s * 1.5;
+    for (let a = 0; a < n; a++) {
+      for (let b = 0; b < n; b++) {
+        const h = p.h[a * n + b];
+        if (h === null) continue;
+        const dx = p.x0 + (b + 0.5) * cell - t.x, dy = p.y0 + (a + 0.5) * cell - t.y;
+        const fwd = dx * c + dy * si, left = -dx * si + dy * c;
+        tctx.fillStyle = p.hz[a * n + b] === "1" ? "#ff3df2" : heightColor(h * 0.05);
+        tctx.fillRect(W / 2 - left * s - px / 2, H / 2 - fwd * s - px / 2, px, px);
+      }
+    }
+    tctx.strokeStyle = "rgba(255,255,255,0.25)"; tctx.lineWidth = 1;      // 2 m, 4 m 원
+    for (const r of [2, 4]) { tctx.beginPath(); tctx.arc(W / 2, H / 2, r * s, 0, 2 * Math.PI); tctx.stroke(); }
+    tctx.fillStyle = "#ffffff";                                           // 로버 (앞이 위)
+    tctx.beginPath(); tctx.moveTo(W / 2, H / 2 - 7); tctx.lineTo(W / 2 - 5, H / 2 + 5); tctx.lineTo(W / 2 + 5, H / 2 + 5); tctx.closePath(); tctx.fill();
+    $("terrain-fb").textContent = `앞 ${fmtH(t.front)} · 뒤 ${fmtH(t.back)}`;
+    $("terrain-lr").textContent = `좌 ${fmtH(t.left)} · 우 ${fmtH(t.right)}`;
+    $("terrain-hl").textContent = `4 m 안 ${fmtH(t.lo)} … ${fmtH(t.hi)}`;
+  }
+  sock.on("terrain", (t) => {
+    const rid = t.rover_id || "";
+    ensureRover(rid).terrain = t;
+    if (rid === activeRover) paintTerrain(rid);
+  });
 
   sock.on("minimap", (m) => {
     const rid = m.rover_id || "";

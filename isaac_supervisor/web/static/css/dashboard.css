@@ -510,3 +510,12 @@ body {
   color: #fff;
   box-shadow: 0 0 8px rgba(108, 217, 255, 0.4);
 }
+
+/* 주변 높낮이 (지형 스캐너) */
+.terrain-row { display: grid; grid-template-columns: 132px 1fr; gap: 10px; align-items: center; margin-top: 4px; }
+.terrain-row canvas { width: 132px; height: 132px; border: 1px solid #23405a; border-radius: 4px; background: #0b1118; }
+.terrain-text { font-size: 12px; min-width: 0; }
+.terrain-text .k { color: #6cd9ff; letter-spacing: 1px; margin-bottom: 4px; }
+.terrain-text .v { color: #e8eef7; font-variant-numeric: tabular-nums; line-height: 1.6; white-space: nowrap; }
+.terrain-text .terrain-dim { color: #9fb3c8; }
+.terrain-sub { display: block; color: #6f8499; letter-spacing: 0; font-size: 0.85em; }

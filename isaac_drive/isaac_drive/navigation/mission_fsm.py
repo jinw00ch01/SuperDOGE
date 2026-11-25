@@ -151,6 +151,15 @@ class Mission:
 
         start_ij = self.ogrid.world_to_cell(cx, cy, clip=True)
         goal_ij = self.ogrid.world_to_cell(target[0], target[1], clip=True)
+        cost = getattr(self.ogrid, "cost", None)       # 기울기 비용 (지형 스캐너가 있을 때)
+        if not self.ogrid.is_free(*goal_ij):
+            # anchor 자리가 막혀 있다 (바위 옆 등). 버리지 않고 가장 가까운 빈 칸까지만
+            # 간다 — 거기서도 anchor 둘레는 밝혀진다. 지형 스캐너를 쓰면 멀리서도 막힌
+            # 곳을 알게 되어, 그냥 버리면 구역이 reveal 30% 대에서 끝났다 (anchor 196개 버림).
+            near = self._nearest_free_cell(goal_ij, max_radius_m=2.0)
+            if near is not None:
+                goal_ij = near
+                target = self.ogrid.cell_to_world(*near)
 
         if not self.ogrid.is_free(*start_ij):
             # 로버가 inflate 영역 안에 있음 (시작셀 막혔다고 표시됨). 일시 free 처리.
@@ -159,13 +168,13 @@ class Mission:
             escape = self._nearest_free_cell(start_ij)
             cells = None
             if escape is not None:
-                tail = astar(self.ogrid.grid, escape, goal_ij)
+                tail = astar(self.ogrid.grid, escape, goal_ij, cost=cost)
                 if tail is not None:
                     cells = [start_ij] + tail
             if cells is None:
-                cells = astar(self._free_start_grid(start_ij), start_ij, goal_ij)
+                cells = astar(self._free_start_grid(start_ij), start_ij, goal_ij, cost=cost)
         else:
-            cells = astar(self.ogrid.grid, start_ij, goal_ij)
+            cells = astar(self.ogrid.grid, start_ij, goal_ij, cost=cost)
 
         if cells is None:
             print(f"[mission] anchor ({target[0]:+.1f},{target[1]:+.1f}) 도달 불가, 스킵")
@@ -173,7 +182,7 @@ class Mission:
             self.state = "PLAN_PATH"     # 다음 anchor 즉시 시도
             return
 
-        cells = simplify_path(self.ogrid.grid, cells, max_skip=20)
+        cells = simplify_path(self.ogrid.grid, cells, max_skip=20, cost=cost)
         path = [self.ogrid.cell_to_world(i, j) for (i, j) in cells]
         # 마지막은 정확한 anchor 좌표로 교체 (셀 양자화 오차 제거)
         if path:

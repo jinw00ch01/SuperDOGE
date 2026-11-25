@@ -296,6 +296,7 @@ class MissionWebRosNode(Node):
         self._last_state: Dict[str, dict] = {}
         self._last_odom: Dict[str, dict] = {}
         self._last_minimap: Dict[str, dict] = {}
+        self._last_terrain: Dict[str, dict] = {}     # 주변 높낮이 (hazard_map_node 의 요약)
         self._last_path: Dict[str, dict] = {}
         # explore path (coverage) 와 supervisor path (A* APPROACH/RTB) 를
         # 분리 캐싱. 같은 slot 공유 시 두 source 가 번갈아 덮어쓰며 미니맵
@@ -382,6 +383,9 @@ class MissionWebRosNode(Node):
         self.create_subscription(
             String, self._topic(ns, "mission/event"),
             partial(self._on_event, ns), 20)
+        self.create_subscription(
+            String, self._topic(ns, "elevation/summary"),
+            partial(self._on_terrain, ns), 5)
 
     # ── 기록 ────────────────────────────────────────────────────────────
     def push_event(self, ns: str, kind: str, text: str, **extra) -> dict:
@@ -480,6 +484,7 @@ class MissionWebRosNode(Node):
             "state":   dict(self._last_state),
             "odom":    dict(self._last_odom),
             "minimap": dict(self._last_minimap),
+            "terrain": dict(self._last_terrain),
             "path":    dict(self._last_path),
             "target":  dict(self._last_target),
             "events":  list(self._events),
@@ -657,6 +662,15 @@ class MissionWebRosNode(Node):
                 break
         self._last_target_explore[ns] = target
         self._emit_active_target(ns)
+
+    def _on_terrain(self, ns: str, msg: String) -> None:
+        """로버 둘레의 높낮이 (지형 스캐너 → 높이 지도 요약). JSON 그대로 넘긴다."""
+        try:
+            payload = json.loads(msg.data)
+        except ValueError:
+            return
+        self._last_terrain[ns] = payload
+        self._emit("terrain", ns, payload)
 
     def _on_minimap(self, ns: str, msg: OccupancyGrid) -> None:
         # OccupancyGrid -> compact dict the browser can paint on a canvas.
@@ -886,7 +900,7 @@ def main(args: list[str] | None = None) -> None:
         # Per-rover cache 를 ns 별로 re-emit. payload 마다 rover_id 박혀있음
         # (사실 캐시 시점 emit 의 payload 와 동일). 늦게 들어온 client 도
         # 모든 rover 의 latest state 받음.
-        for event_key in ("state", "odom", "minimap", "path", "target"):
+        for event_key in ("state", "odom", "minimap", "terrain", "path", "target"):
             for ns, payload in snap[event_key].items():
                 if payload is None:
                     continue

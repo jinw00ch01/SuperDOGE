@@ -46,7 +46,7 @@ def _rover_group(ns: str, terrain_dir: str, collection_goal: int,
                  arrive_r: float, fringe_r: float, reveal_radius: float,
                  map_source: str = "online", governor: str = "",
                  self_right: bool = False, slope_deg: float = 25.0,
-                 tilt_guard: bool = True):
+                 tilt_guard: bool = True, terrain_scan: bool = True):
     """단일 rover 의 5 노드 묶음 — 토픽 모두 /<ns>/... prefix.
 
     terrain_dir 는 T1 Isaac Sim 의 --terrain 인자와 동일한 terrain 폴더 경로.
@@ -109,6 +109,8 @@ def _rover_group(ns: str, terrain_dir: str, collection_goal: int,
                 "map_topic":        f"{nsp}/hazard_map",
                 "reset_topic":      f"{nsp}/hazard_map/reset",
                 "clear_marks_topic": f"{nsp}/hazard_map/clear_marks",
+                "scan_topic":       f"{nsp}/terrain_scan" if terrain_scan else "",
+                "elevation_topic":  f"{nsp}/elevation/summary",
                 "mark_topic":       f"{nsp}/hazard_map/mark",
                 "cmd_topic":        f"{nsp}/cmd_vel",
             }],
@@ -287,6 +289,8 @@ def _launch_setup(context, *args, **kwargs):
         "1", "true", "yes", "on")
     self_right = LaunchConfiguration("self_right").perform(context).strip().lower() in (
         "true", "1", "yes")
+    terrain_scan = LaunchConfiguration("terrain_scan").perform(context).strip().lower() in (
+        "1", "true", "yes", "on")
     print(f"[mvp_multi] terrain_dir={terrain_dir}  rovers={rovers}  "
           f"collection_goal={collection_goal} (per rover)  map_source={map_source}  "
           f"drive_governor={governor}")
@@ -294,7 +298,8 @@ def _launch_setup(context, *args, **kwargs):
     for ns in rovers:
         nodes.extend(_rover_group(ns, terrain_dir, collection_goal,
                                   arrive_r, fringe_r, reveal_radius, map_source,
-                                  governor, self_right, slope_deg, tilt_guard))
+                                  governor, self_right, slope_deg, tilt_guard,
+                                  terrain_scan))
 
     # Web HUD — 단일 인스턴스가 모든 rover namespace 추적 (옵션 X 단계 2).
     # mission_web_node 의 rover_namespaces param 으로 ns 리스트 전달.
@@ -370,6 +375,11 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument(
             "hud_actions", default_value="true",
             description="false 면 HUD 의 ACTIONS 버튼·수동 주행을 끈다 (보기 전용)."),
+        DeclareLaunchArgument(
+            "terrain_scan", default_value="true",
+            description="지형 스캐너(로버 위 360° 거리 센서, /<ns>/terrain_scan)의 점으로 높이 "
+                        "지도를 만들어 급경사·턱을 위험 지도에 합치고 HUD 에 주변 높낮이를 보낸다. "
+                        "시뮬레이터를 --terrain-scanner off 로 띄웠으면 아무 일도 하지 않는다."),
         DeclareLaunchArgument(
             "tilt_guard", default_value="true",
             description="기울기 반사 — 앞이 30° 넘게 들리거나 옆으로 32° 넘게 기울면 밀어붙이지 "

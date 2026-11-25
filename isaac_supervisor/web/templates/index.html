@@ -121,6 +121,17 @@
         <div class="status-pairs-row pairs-1">
           <div class="status-pair"><span class="k">CMD</span><span id="cmdv" class="v">—</span></div>
         </div>
+        <!-- 주변 높낮이: 로버 위 360° 거리 스캐너로 만든 높이 지도. 위쪽이 로버의 앞.
+             색 = 발밑보다 높음(주황·빨강) / 낮음(파랑), 자홍 = 급경사·턱. -->
+        <div class="terrain-row" title="지형 스캐너로 잰 주변 높낮이 (로버 중심 12 m, 위쪽이 앞). 주황 = 발밑보다 높음, 파랑 = 낮음, 자홍 = 급경사·턱">
+          <canvas id="terrain" width="132" height="132"></canvas>
+          <div class="terrain-text">
+            <div class="k">TERRAIN <span class="terrain-sub">2 m 떨어진 곳, 발밑 기준</span></div>
+            <div id="terrain-fb" class="v">앞 — · 뒤 —</div>
+            <div id="terrain-lr" class="v">좌 — · 우 —</div>
+            <div id="terrain-hl" class="v terrain-dim">4 m 안 최고 — · 최저 —</div>
+          </div>
+        </div>
         <div class="status-pairs-row pairs-1">
           <div class="status-pair status-task"><span class="k">TASK</span><span id="task" class="v">—</span></div>
         </div>

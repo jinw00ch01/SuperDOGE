@@ -1432,7 +1432,8 @@ class MissionManagerNode(Node):
             goal = self._nearest_free(goal, active_grid)
 
         # 1차 시도 — 표준 grid 로.
-        path = astar(active_grid, start, goal) if start and goal else None
+        cost = getattr(self.ogrid, "cost", None)       # 기울기 비용 (지형 스캐너가 있을 때)
+        path = astar(active_grid, start, goal, cost=cost) if start and goal else None
 
         # 2차 시도 — 실패 시 시작 cell 주변 5×5 일시 free 처리 후 재시도.
         if not path and start and goal:
@@ -1443,7 +1444,7 @@ class MissionManagerNode(Node):
                     ii, jj = si + di, sj + dj
                     if self.ogrid.in_bounds(ii, jj):
                         relaxed[ii, jj] = 0
-            path = astar(relaxed, start, goal)
+            path = astar(relaxed, start, goal, cost=cost)
             if path:
                 self.get_logger().warn(
                     f"A* recovered with relaxed start cell "
@@ -1459,7 +1460,7 @@ class MissionManagerNode(Node):
             self.last_plan_target = (tx, ty)
             return
 
-        path = simplify_path(active_grid, path)
+        path = simplify_path(active_grid, path, cost=cost)
         self.waypoints = [self.ogrid.cell_to_world(i, j) for (i, j) in path]
         self.wp_idx = 1 if len(self.waypoints) > 1 else 0
         self.last_plan_target = (tx, ty)

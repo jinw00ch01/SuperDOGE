@@ -34,6 +34,7 @@ from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
                        ReliabilityPolicy)
 from sensor_msgs.msg import CameraInfo, Image, JointState
 
+from isaac_drive.navigation.elevation_map import ElevationMap
 from isaac_drive.navigation.hazard_map import HazardMap
 
 SENSOR_QOS = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -100,6 +101,16 @@ class HazardMapNode(Node):
         self.declare_parameter("stall_mark_ahead_m", 0.9)
         self.declare_parameter("stall_mark_radius_m", 0.45)
         self.declare_parameter("mineral_min_confidence", 0.5)
+        # 지형 스캐너(360° 거리 센서) → 높이 지도. scan_topic 이 비면 쓰지 않는다.
+        self.declare_parameter("scan_topic", "")
+        self.declare_parameter("scan_hazard", True)      # 높이 지도의 급경사·턱을 위험 지도에 합침
+        self.declare_parameter("scan_step_m", 0.10)
+        # 기울기 비용: 이 각도부터 위험 문턱(slope_deg)까지를 지도 값 1…50 으로 보낸다.
+        # 받는 쪽은 > 50 만 위험으로 치고, 1…50 은 "갈 수 있지만 비싼 칸" 으로 쓴다.
+        self.declare_parameter("slope_cost_from_deg", 10.0)
+        self.declare_parameter("elevation_topic", "/elevation/summary")
+        self.declare_parameter("elevation_patch_m", 12.0)      # HUD 에 보내는 로버 둘레 한 변
+        self.declare_parameter("elevation_patch_cell_m", 0.2)
         # 먼 검출은 위치가 부정확해서 엉뚱한 곳(바위)을 지울 수 있다.
         self.declare_parameter("mineral_max_range_m", 4.0)
 
@@ -118,6 +129,11 @@ class HazardMapNode(Node):
             slope_deg=float(self.get_parameter("slope_deg").value),
             step_m=float(self.get_parameter("step_m").value),
             rough_m=float(self.get_parameter("rough_m").value))
+        self.em = ElevationMap(
+            map_size=size, cell_size=float(self.get_parameter("cell_size").value),
+            slope_deg=float(self.get_parameter("slope_deg").value),
+            step_m=float(self.get_parameter("scan_step_m").value))
+        self.n_scans = 0
         self.latency = float(self.get_parameter("image_latency_sec").value)
         self.stride = max(1, int(self.get_parameter("pixel_stride").value))
         self.min_period = 1.0 / max(0.5, float(self.get_parameter("integrate_hz").value))
@@ -159,6 +175,15 @@ class HazardMapNode(Node):
         self.create_subscription(Empty, str(self.get_parameter("reset_topic").value),
                                  self._on_reset, 10)
         from geometry_msgs.msg import PointStamped
+        scan_topic = str(self.get_parameter("scan_topic").value)
+        if scan_topic:
+            from sensor_msgs.msg import PointCloud2
+            from std_msgs.msg import String
+            self.create_subscription(PointCloud2, scan_topic, self._on_scan, 5)
+            self.elev_pub = self.create_publisher(
+                String, str(self.get_parameter("elevation_topic").value), 5)
+            self.create_timer(0.5, self._publish_elevation)
+            self.get_logger().info(f"지형 스캐너 사용: {scan_topic} → 높이 지도")
         self.create_subscription(Empty, str(self.get_parameter("clear_marks_topic").value),
                                  self._on_clear_marks, 10)
         self.create_subscription(PointStamped, str(self.get_parameter("mark_topic").value),
@@ -182,6 +207,7 @@ class HazardMapNode(Node):
         cells = int(self.hm.obstacle_mask().sum())
         self.hm.evidence[:] = 0
         self.hm.seen[:] = 0
+        self.em.clear()
         bumps = len(self._bumps)
         self._bumps.clear()
         self._stall_ref = None
@@ -310,6 +336,77 @@ class HazardMapNode(Node):
             q1 = -q1
         return (1 - a) * p0 + a * p1, _quat_to_matrix((1 - a) * q0 + a * q1)
 
+    def _on_scan(self, msg) -> None:
+        """지형 스캐너의 점(몸체 좌표)을 그 시각의 자세로 높이 지도에 쌓는다."""
+        pose = self._pose_at(_stamp_sec(msg.header))
+        if pose is None or msg.width * msg.height == 0:
+            return
+        raw = np.frombuffer(msg.data, dtype=np.uint8).reshape(-1, msg.point_step)
+        pts = np.ascontiguousarray(raw[:, :12]).view(np.float32).reshape(-1, 3)
+        self.em.integrate(pts, pose[0], pose[1])
+        self.n_scans += 1
+
+    def _elevation_hazard(self) -> np.ndarray:
+        """높이 지도에서 나온 위험 칸 (광물 둘레는 뺀다 — 광물은 가서 집을 대상)."""
+        haz = self.em.hazard_mask().copy()
+        if self._minerals and haz.any():
+            r = self.clear_r / self.em.cell
+            ii, jj = np.where(haz)
+            keep = np.ones(len(ii), bool)
+            for (x, y) in self._minerals:
+                ci, cj = self.em.world_to_cell(x, y)
+                keep &= (ii - int(ci)) ** 2 + (jj - int(cj)) ** 2 > r * r
+            haz[ii[~keep], jj[~keep]] = False
+        return haz
+
+    def _publish_elevation(self) -> None:
+        """로버 둘레의 높낮이 요약 (HUD·기록용, JSON 문자열)."""
+        if self.n_scans == 0 or not self._odom:
+            return
+        _t, p, q = self._odom[-1]
+        x, y, z, w = q
+        yaw = math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+        ground = self.em.height_at(float(p[0]), float(p[1]), 0.6)
+        if ground is None:
+            ground = float(p[2]) - 0.5              # 받침대 높이
+        out = self.em.around(float(p[0]), float(p[1]), yaw, ground)
+        out.update({"x": round(float(p[0]), 2), "y": round(float(p[1]), 2),
+                    "yaw": round(yaw, 3), "ground": round(ground, 2)})
+        # 로버 둘레 격자: 높이(발밑 기준, 5 cm 단위 정수) · 위험 여부. 안 본 칸은 null.
+        size = float(self.get_parameter("elevation_patch_m").value)
+        step = max(1, int(round(float(self.get_parameter("elevation_patch_cell_m").value)
+                                / self.em.cell)))
+        half = int(round(size / 2.0 / self.em.cell))
+        ci, cj = self.em.world_to_cell(float(p[0]), float(p[1]))
+        ci, cj = int(ci), int(cj)
+        n = (2 * half) // step
+        zz = np.full((n, n), np.nan, np.float32)
+        hz = np.zeros((n, n), bool)
+        haz = self._elevation_hazard()
+        i0, j0 = ci - half, cj - half
+        for a in range(n):
+            i = i0 + a * step
+            if i < 0 or i + step > self.em.rows:
+                continue
+            for b in range(n):
+                j = j0 + b * step
+                if j < 0 or j + step > self.em.cols:
+                    continue
+                blk = self.em.z[i:i + step, j:j + step]
+                if np.isfinite(blk).any():
+                    zz[a, b] = np.nanmean(blk)
+                    hz[a, b] = bool(haz[i:i + step, j:j + step].any())
+        rel = np.round((zz - ground) / 0.05)
+        out["patch"] = {
+            "n": n, "cell": round(step * self.em.cell, 3),
+            "x0": round(i0 * 0 + (j0 * self.em.cell - self.em.map_w / 2.0), 2),
+            "y0": round(i0 * self.em.cell - self.em.map_h / 2.0, 2),
+            "h": [None if not np.isfinite(v) else int(v) for v in rel.reshape(-1)],
+            "hz": "".join("1" if v else "0" for v in hz.reshape(-1)),
+        }
+        from std_msgs.msg import String
+        self.elev_pub.publish(String(data=json.dumps(out, separators=(",", ":"))))
+
     def _on_depth(self, msg: Image) -> None:
         t = _stamp_sec(msg.header)
         if t - self._last_t < self.min_period or self.K is None:
@@ -339,13 +436,24 @@ class HazardMapNode(Node):
 
     # ── 출력 ────────────────────────────────────────────────────────────
     def _publish(self, force: bool = False) -> None:
-        if not force and self.hm.frames == 0 and not self._bumps:
+        if not force and self.hm.frames == 0 and not self._bumps and self.n_scans == 0:
             return
         for (x, y) in self._minerals:
             self.hm.clear_disk(x, y, self.clear_r)
         cells = np.full((self.hm.rows, self.hm.cols), -1, dtype=np.int8)
         cells[self.hm.observed_mask()] = 0
         cells[self.hm.obstacle_mask()] = 100
+        if self.n_scans and bool(self.get_parameter("scan_hazard").value):
+            # 높이 지도: 카메라가 못 본 옆·뒤와 먼 곳까지 채운다. 위험은 합집합.
+            known = self.em.known_mask()
+            cells[(cells == -1) & known] = 0
+            lo = float(self.get_parameter("slope_cost_from_deg").value)
+            hi = float(self.get_parameter("slope_deg").value)
+            if hi > lo:
+                soft = np.clip((self.em.slope_deg() - lo) / (hi - lo), 0.0, 1.0) * 50.0
+                free = known & (cells == 0)
+                cells[free] = np.round(soft[free]).astype(np.int8)
+            cells[self._elevation_hazard()] = 100
         if self._bumps:
             r = float(self.get_parameter("stall_mark_radius_m").value) / self.hm.cell
             ii, jj = np.mgrid[0:self.hm.rows, 0:self.hm.cols]
@@ -371,6 +479,11 @@ class HazardMapNode(Node):
             f"자세 없음 {self.n_skip_pose}), 본 면적 {obs.mean() * 100:.1f}% "
             f"({obs.sum() * self.hm.cell ** 2:.0f} m²), 위험 칸 {int(haz.sum())}, "
             f"광물 {len(self._minerals)}개 제외")
+        if self.n_scans:
+            known = self.em.known_mask()
+            self.get_logger().info(
+                f"높이 지도: 스캔 {self.n_scans}장, 높이를 아는 면적 {(self.em.n > 0).mean() * 100:.1f}% "
+                f"(기울기까지 {known.mean() * 100:.1f}%), 급경사·턱 {int(self.em.hazard_mask().sum())} 칸")
 
 
 def main(args: list[str] | None = None) -> None:
