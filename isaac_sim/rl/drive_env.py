@@ -134,12 +134,32 @@ class SlewLimiter:
         self.lin[idx] = 0.0
         self.ang[idx] = 0.0
 
+    LEGACY = False      # True = 2026-11-25 이전 방식 (가속 제한 뒤의 값으로 반경 판정)
+
     def __call__(self, v_des, w_des):
         L = self.lim
         v = np.clip(v_des, -L["max_lin"], L["max_lin"])
         w = np.clip(w_des, -L["max_ang"], L["max_ang"])
-        self.lin += np.clip(v - self.lin, -L["acc_lin"] * self.dt, L["acc_lin"] * self.dt)
-        self.ang += np.clip(w - self.ang, -L["acc_ang"] * self.dt, L["acc_ang"] * self.dt)
+        dv, dw = L["acc_lin"] * self.dt, L["acc_ang"] * self.dt
+        if self.LEGACY:
+            self.lin += np.clip(v - self.lin, -dv, dv)
+            self.ang += np.clip(w - self.ang, -dw, dw)
+            return self.lin.copy(), self.ang.copy()
+        # drive_limits._ack_limit 과 같은 규칙: 제자리 회전/곡선은 명령의 반경으로 정하고,
+        # 곡선에서는 명령의 곡률을 지킨 채 속도만 가속 제한한다.
+        r_min = TRACK * 0.8 * 1.001
+        spin_intent = (np.abs(w) > 1e-6) & (np.abs(v) < np.abs(w) * r_min)
+        self.lin += np.clip(np.where(spin_intent, 0.0, v) - self.lin, -dv, dv)
+        spinning = spin_intent & (np.abs(self.lin) < 0.15)
+        self.lin = np.where(spinning, 0.0, self.lin)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            curv = np.where(np.abs(v) > 1e-6, w / np.where(np.abs(v) > 1e-6, v, 1.0), 0.0)
+        goal = np.where(spinning, w,
+                        np.where(spin_intent, np.copysign(np.abs(self.lin) / r_min, w),
+                                 curv * self.lin))
+        self.ang += np.clip(goal - self.ang, -dw, dw)
+        cap = np.abs(self.lin) / r_min
+        self.ang = np.where(spinning, self.ang, np.clip(self.ang, -cap, cap))
         return self.lin.copy(), self.ang.copy()
 
 
@@ -151,6 +171,7 @@ class RoverDriveEnv:
     # (다각형 convex hull — 돌 때 땅에서 튀어 구동 접지력이 설정 마찰의 60~65% 만 나온다.
     # probe_traction.py 로 잰 값). sphere · cylinder 는 비교 시험용.
     WHEEL_SHAPE = "capsule"
+    WHEEL_GRIP = 1.0             # 바퀴-지면 마찰 배율 (run_vehicle_v3 --wheel-grip 과 같은 것)
     # 로버 모델의 link 선속도 상한(1.5 m/s)을 푼다. False 면 모델 그대로.
     LIFT_SPEED_CAP = True
 
@@ -213,7 +234,8 @@ class RoverDriveEnv:
             print(f"[drive_env] link 속도 상한 해제: {lift_link_speed_cap(stage, roots)}")
         self.physics_info = apply_planet_physics(
             stage, self.world, planet, meta=self.meta,
-            scene_root="/World/MarsScene", rover_roots=roots)
+            scene_root="/World/MarsScene", rover_roots=roots,
+            wheel_grip=self.WHEEL_GRIP)
         self.gravity = float(self.physics_info["gravity"] or 9.81)
         self._base_friction = {
             name: (v["static_friction"], v["dynamic_friction"])

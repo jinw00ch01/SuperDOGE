@@ -116,7 +116,23 @@ def _ack_slew(current, target, step):
 
 
 def _ack_limit(db, lin_cmd, ang_cmd):
-    """명령을 최고 속도로 자르고, 직전 출력에서 가속 한계만큼만 움직인다."""
+    """명령을 최고 속도로 자르고, 직전 출력에서 가속 한계만큼만 움직인다.
+
+    제자리 회전인지 곡선 주행인지는 **명령**의 회전 반경으로 정한다 (가속 제한을
+    거친 값이 아니라). 예전에는 가속 제한을 거친 lin/ang 로 반경을 다시 계산했는데,
+    정지 상태에서 "전진 3 m/s + 회전" 명령을 받으면 lin 이 0 에서 천천히 오르는
+    동안 반경이 최소 반경보다 작게 나와 **의도하지 않은 제자리 회전**이 됐다
+    (바퀴 45°, 명령의 약 1.9 배 속도로 돎). 상위 노드는 방향 오차가 45° 아래로
+    들어와 전진하려는 것인데 로버는 계속 돌아 목표 방향을 반대편으로 45° 넘게
+    지나치고, 다시 제자리 회전 → 전진 → … 을 4~5 초 주기로 되풀이했다
+    (오르막에서 앞으로 못 가고 좌우로만 두리번거리던 현상, logs/fix1 t=79~107).
+
+      곡선 주행 : 명령의 곡률(ang/lin)을 지키고 속도만 가속 제한 — 반경은 늘 명령대로
+      제자리 회전: 명령 반경이 최소 반경보다 작을 때만. 굴러가던 속도가 0.15 m/s
+                   아래로 줄 때까지는 최소 반경 곡선으로 돌면서 감속한다
+    제자리 회전은 lin = 0, 곡선은 반경 >= 최소 반경으로 돌려주므로 compute() 의
+    반경 판정이 그대로 맞는다.
+    """
     try:
         key = str(db.node.get_prim_path())
     except Exception:
@@ -127,16 +143,31 @@ def _ack_limit(db, lin_cmd, ang_cmd):
     now = _ack_now()
     st = _ACK_STATES.get(key)
     if st is None or now < st["t"]:
-        st = {"t": now, "lin": 0.0, "ang": 0.0}
+        st = {"t": now, "lin": 0.0, "ang": 0.0, "out": (0.0, 0.0)}
         _ACK_STATES[key] = st
     dt = now - st["t"]
     if dt <= 0.0:
-        return st["lin"], st["ang"]
+        return st["out"]
     dt = min(dt, 0.1)
     st["t"] = now
-    st["lin"] = _ack_slew(st["lin"], lin_cmd, lim["acc_lin"] * dt)
-    st["ang"] = _ack_slew(st["ang"], ang_cmd, lim["acc_ang"] * dt)
-    return st["lin"], st["ang"]
+    r_min = _ACK_MIDDLE_WHEEL_DISTANCE * 0.8 * 1.001
+    spin_intent = abs(ang_cmd) > 1e-6 and abs(lin_cmd) < abs(ang_cmd) * r_min
+    if spin_intent:
+        st["lin"] = _ack_slew(st["lin"], 0.0, lim["acc_lin"] * dt)
+        if abs(st["lin"]) < 0.15:
+            st["lin"] = 0.0
+            st["ang"] = _ack_slew(st["ang"], ang_cmd, lim["acc_ang"] * dt)
+            st["out"] = (0.0, st["ang"])
+            return st["out"]
+        ang_goal = math.copysign(abs(st["lin"]) / r_min, ang_cmd)
+    else:
+        st["lin"] = _ack_slew(st["lin"], lin_cmd, lim["acc_lin"] * dt)
+        ang_goal = (ang_cmd / lin_cmd) * st["lin"] if abs(lin_cmd) > 1e-6 else 0.0
+    st["ang"] = _ack_slew(st["ang"], ang_goal, lim["acc_ang"] * dt)
+    cap = abs(st["lin"]) / r_min
+    st["ang"] = max(-cap, min(cap, st["ang"]))
+    st["out"] = (st["lin"], st["ang"])
+    return st["out"]
 
 
 def setup(db):

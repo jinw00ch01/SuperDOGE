@@ -14,7 +14,8 @@ class Navigator:
     def __init__(self, rover,
                  waypoint_tol=0.4, final_tol=0.3,
                  kp_ang=2.0, max_lin=3.0, max_ang=1.5,
-                 point_turn_deg=45, turn_decel=0.4, spin_gain=1.9):
+                 point_turn_deg=45, turn_decel=0.4, spin_gain=1.9,
+                 point_turn_exit_deg=15):
         self.rover = rover
         self.waypoint_tol  = float(waypoint_tol)
         self.final_tol     = float(final_tol)
@@ -22,6 +23,11 @@ class Navigator:
         self.max_lin       = float(max_lin)
         self.max_ang       = float(max_ang)
         self.point_turn_th = np.deg2rad(point_turn_deg)
+        # 제자리 회전을 시작하면 방향 오차가 이 값 아래로 줄 때까지 계속 돈다.
+        # 시작 기준(45°)과 같으면 45° 근처에서 "돌기 ↔ 전진" 을 번갈아 하게 되고,
+        # 돌던 기세로 목표 방향을 지나치면 반대로 다시 돌게 된다 (좌우로 두리번거림).
+        self.point_turn_exit = np.deg2rad(min(point_turn_exit_deg, point_turn_deg))
+        self._turning = False
         # 제자리 회전을 멈출 때 쓸 수 있다고 보는 감속도 (rad/s², 보수적으로) 와
         # 제자리 회전 때 실제 회전 속도 / 명령 비 (vehicle_v3 는 약 1.9 배로 돈다).
         self.turn_decel = float(turn_decel)
@@ -32,6 +38,7 @@ class Navigator:
     def set_path(self, path):
         self.path = list(path) if path else []
         self.idx = 0
+        self._turning = False
 
     def is_done(self):
         return self.idx >= len(self.path)
@@ -68,6 +75,10 @@ class Navigator:
 
         ang_vel = float(np.clip(self.kp_ang * err, -self.max_ang, self.max_ang))
         if abs(err) > self.point_turn_th:
+            self._turning = True
+        elif abs(err) < self.point_turn_exit:
+            self._turning = False
+        if self._turning:
             lin_vel = 0.0
             # 제자리 회전: 남은 각도 안에서 멈출 수 있는 속도까지만 낸다.
             # 시뮬레이터는 각가속도를 제한하고(화성 0.99 rad/s²) 명령보다 빨리 돌기
