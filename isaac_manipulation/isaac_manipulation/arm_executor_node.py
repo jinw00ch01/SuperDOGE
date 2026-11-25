@@ -33,7 +33,7 @@ from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
-from sensor_msgs.msg import JointState
+from sensor_msgs.msg import CameraInfo, Image, JointState
 from std_msgs.msg import String
 
 from .kinematics import M0609_DH, dls_ik, fk
@@ -188,6 +188,16 @@ class ArmExecutorNode(Node):
         # 손목 카메라에 안 잡히는 일이 잦아서(3 번 중 3 번) 예전처럼 그대로 진행한다.
         self.declare_parameter("wrist_presence_classes", ["blue_mineral", "yellow_mineral"])
         self.declare_parameter("wrist_correction_gate_m", 0.15)   # 이보다 먼 검출은 다른 물체로 봄
+        # 손목 카메라의 깊이 영상으로 "땅 위로 솟은 덩어리" 를 직접 잰다 (YOLO 를 거치지
+        # 않음). 초록 가스(20 cm 상자)는 위에서 보면 YOLO 가 못 알아보고, 대신 집게
+        # 손가락을 가스로 잘못 본다 — 그래서 위치 보정 없이 집다가 손가락이 상자 위에
+        # 얹혔다. YOLO 보정이 안 될 때 이 측정으로 중심·윗면·놓인 방향을 얻는다.
+        self.declare_parameter("wrist_shape_measure", True)
+        self.declare_parameter("wrist_align_yaw", True)           # 집게를 상자 면에 맞춰 돌린다
+        self.declare_parameter("wrist_depth_topic", "/camera/wrist/depth")
+        self.declare_parameter("wrist_info_topic", "/camera/wrist/camera_info")
+        # 집게를 벌렸을 때 안쪽 면 간격 (isaac_sim/scripts/wide_gripper.py 의 GAP_OPEN).
+        self.declare_parameter("gripper_open_gap_m", 0.33)
         self.declare_parameter("wrist_settle_sec", 1.0)
         self.declare_parameter("grasp_command_topic", "/grasp/command")
         # Step delay between grasp publish and arm continuing — gives
@@ -245,6 +255,15 @@ class ArmExecutorNode(Node):
         self._wrist_lock = threading.Lock()
         self._wrist_dets: List[Detection] = []
         self._wrist_stamp_ns: int = 0
+        self._wrist_depth: Optional[Image] = None
+        self._wrist_depth_ns: int = 0
+        self._wrist_K: Optional[np.ndarray] = None
+        self.create_subscription(
+            Image, str(self.get_parameter("wrist_depth_topic").value),
+            self._on_wrist_depth, SENSOR_QOS)
+        self.create_subscription(
+            CameraInfo, str(self.get_parameter("wrist_info_topic").value),
+            self._on_wrist_info, SENSOR_QOS)
         # Current arm joint positions (rad) from /joint_states_raw. None until
         # first message arrives — we fall back to HOME_DEG for IK base then.
         self._current_arm_q_rad: Optional[np.ndarray] = None
@@ -290,6 +309,15 @@ class ArmExecutorNode(Node):
         with self._wrist_lock:
             self._wrist_dets = list(msg.detections)
             self._wrist_stamp_ns = self.get_clock().now().nanoseconds
+
+    def _on_wrist_depth(self, msg: Image) -> None:
+        with self._wrist_lock:
+            self._wrist_depth = msg
+            self._wrist_depth_ns = self.get_clock().now().nanoseconds
+
+    def _on_wrist_info(self, msg: CameraInfo) -> None:
+        if self._wrist_K is None and msg.k[0] > 0.0:
+            self._wrist_K = np.array(msg.k, dtype=np.float64).reshape(3, 3)
 
     def _on_joint_states(self, msg: JointState) -> None:
         """Extract M0609 6 arm joints from rover's full joint state."""
@@ -733,6 +761,14 @@ class ArmExecutorNode(Node):
                         continue
                     p_base = T[:3, :3] @ (R_oc @ xyz + mount) + T[:3, 3]
                     off = float(np.linalg.norm((p_base - expected)[:2]))
+                    # 카메라가 본 표면 점이 집게 자신이면 버린다 (어두운 손가락을
+                    # 초록 가스로 보는 일이 있다 — 2026-11-25 실측, conf 0.5~0.7).
+                    dist0 = float(np.linalg.norm(xyz))
+                    r0 = min(0.5 * float(d.bbox_size_m.z), 0.9 * dist0)
+                    if self._is_own_gripper(R_oc @ (xyz * (1.0 - r0 / dist0)) + mount):
+                        rejected.append(f"{d.class_name} conf={d.confidence:.2f} "
+                                        f"집게 손가락을 광물로 봄")
+                        continue
                     if self._wrist_nearest_m is None or off < self._wrist_nearest_m:
                         self._wrist_nearest_m = off
                     if off < gate and (best is None or off < best[0]):
@@ -742,18 +778,143 @@ class ArmExecutorNode(Node):
                         s_base = T[:3, :3] @ (R_oc @ surf + mount) + T[:3, 3]
                         best = (off, p_base, s_base)
                     elif off >= gate:
+                        dv = (p_base - expected) * 100.0
                         rejected.append(f"{d.class_name} conf={d.confidence:.2f} "
-                                        f"예상 위치에서 {off * 100:.0f} cm")
+                                        f"예상 위치에서 {off * 100:.0f} cm "
+                                        f"(받침대 기준 {dv[0]:+.0f},{dv[1]:+.0f},{dv[2]:+.0f} cm, "
+                                        f"카메라에서 {float(np.linalg.norm(xyz)) * 100:.0f} cm, "
+                                        f"지름 추정 {float(d.bbox_size_m.z) * 100:.0f} cm)")
                 if best is not None:
                     samples.append(np.concatenate([best[1], best[2]]))
             time.sleep(0.05)
         if len(samples) < 3:
             self.get_logger().info(
                 f"wrist measure: 쓸 수 있는 검출 {len(samples)}장 — 버린 것: "
-                f"{rejected[-4:] if rejected else '검출 자체가 없음'}")
+                f"{rejected[-2:] if rejected else '검출 자체가 없음'}")
             return None
         med = np.median(np.array(samples), axis=0)
         return med[:3], med[3:]
+
+    def _is_own_gripper(self, p_link6: np.ndarray) -> bool:
+        """link_6 좌표의 점이 넓은 집게(손가락·palm) 자리인가."""
+        palm = float(self.get_parameter("friction_palm_offset_m").value)
+        tip = palm + float(self.get_parameter("friction_finger_length_m").value)
+        half_gap = 0.5 * float(self.get_parameter("gripper_open_gap_m").value)
+        if p_link6[2] < palm + 0.01:
+            return True
+        return bool(p_link6[2] < tip + 0.03 and abs(p_link6[0]) > half_gap - 0.03)
+
+    def _wrist_measure_shape(self, expected: np.ndarray):
+        """손목 카메라 깊이 영상에서 목표 자리의 '땅 위로 솟은 덩어리' 를 잰다.
+
+        물체 종류를 가리지 않는다 (YOLO 결과를 쓰지 않음). 받침대 좌표로
+          center (x, y) — 위에서 본 바닥 모양에 가장 꼭 맞는 직사각형의 중심
+          top_z         — 윗면 높이
+          size (a, b)   — 직사각형 두 변의 길이
+          angle         — 변 a 의 방향 (rad, 받침대 좌표)
+        를 dict 로 돌려준다. 못 재면 None.
+        """
+        log = self.get_logger()
+        with self._wrist_lock:
+            msg, stamp = self._wrist_depth, self._wrist_depth_ns
+        K, q = self._wrist_K, self._current_arm_q_rad
+        if msg is None or K is None or q is None:
+            log.info("wrist shape: 깊이 영상·camera_info·관절각 중 없는 것이 있음")
+            return None
+        if self.get_clock().now().nanoseconds - stamp > int(1.0e9):
+            log.info("wrist shape: 깊이 영상이 1 초 넘게 오래됨")
+            return None
+        if msg.encoding == "32FC1":
+            depth = np.frombuffer(bytes(msg.data), dtype=np.float32)
+        elif msg.encoding == "16UC1":
+            depth = np.frombuffer(bytes(msg.data), dtype=np.uint16).astype(np.float32) * 1e-3
+        else:
+            log.info(f"wrist shape: 모르는 깊이 형식 {msg.encoding}")
+            return None
+        depth = depth.reshape(msg.height, msg.width)[::2, ::2]
+        v, u = np.mgrid[0:msg.height:2, 0:msg.width:2]
+        ok = np.isfinite(depth) & (depth > 0.05) & (depth < 1.2)
+        z = depth[ok].astype(np.float64)
+        pts = np.stack([(u[ok] - K[0, 2]) * z / K[0, 0], (v[ok] - K[1, 2]) * z / K[1, 1], z], axis=1)
+        mount = np.array([float(x) for x in self.get_parameter("wrist_mount_xyz_link6").value])
+        R_oc = np.array(list(self.get_parameter("wrist_R_optical_to_link6").value),
+                        dtype=np.float64).reshape(3, 3)
+        p6 = pts @ R_oc.T + mount
+        palm = float(self.get_parameter("friction_palm_offset_m").value)
+        tip = palm + float(self.get_parameter("friction_finger_length_m").value)
+        half_gap = 0.5 * float(self.get_parameter("gripper_open_gap_m").value)
+        own = (p6[:, 2] < palm + 0.01) | ((p6[:, 2] < tip + 0.03)
+                                           & (np.abs(p6[:, 0]) > half_gap - 0.03))
+        T = fk(q)
+        P = p6[~own] @ T[:3, :3].T + T[:3, 3]
+        d = P[:, :2] - expected[:2]
+        r = np.hypot(d[:, 0], d[:, 1])
+        # 땅: 목표에서 22~40 cm 떨어진 고리의 점들에 평면을 맞춘다 (비탈·차체 기울기 포함).
+        ring = (r > 0.22) & (r < 0.40)
+        if int(ring.sum()) < 80:
+            log.info(f"wrist shape: 둘레의 땅이 거의 안 보임 ({int(ring.sum())}점)")
+            return None
+        A = np.c_[d[ring], np.ones(int(ring.sum()))]
+        coef = np.linalg.lstsq(A, P[ring, 2], rcond=None)[0]
+        for _ in range(2):                       # 돌·다른 광물은 빼고 다시 맞춘다
+            res = P[ring, 2] - A @ coef
+            keep = np.abs(res - np.median(res)) < 0.03
+            if int(keep.sum()) < 40:
+                break
+            coef = np.linalg.lstsq(A[keep], P[ring, 2][keep], rcond=None)[0]
+        h = P[:, 2] - (d @ coef[:2] + coef[2])
+        obj = (h > 0.05) & (r < 0.30)
+        if int(obj.sum()) < 150:
+            log.info(f"wrist shape: 땅 위로 5 cm 넘게 솟은 점이 {int(obj.sum())}개뿐 — 물체 없음")
+            return None
+        # 1 cm 격자에서 이어진 덩어리 중 목표에 가장 가까운 큰 것 하나만.
+        cell = 0.01
+        n = int(round(0.60 / cell))
+        ij = np.clip(((d[obj] + 0.30) / cell).astype(int), 0, n - 1)
+        grid = np.zeros((n, n), dtype=bool)
+        grid[ij[:, 0], ij[:, 1]] = True
+        from scipy import ndimage
+        grid = ndimage.binary_closing(grid, iterations=2)
+        lab, n_lab = ndimage.label(grid)
+        if n_lab == 0:
+            return None
+        sizes = ndimage.sum(grid, lab, index=range(1, n_lab + 1))
+        cms = ndimage.center_of_mass(grid, lab, index=range(1, n_lab + 1))
+        best, best_score = 0, None
+        for k in range(n_lab):
+            if sizes[k] < 60:                    # 60 cm² 미만은 잡음
+                continue
+            dist = math.hypot(cms[k][0] * cell - 0.30, cms[k][1] * cell - 0.30)
+            if best_score is None or dist < best_score:
+                best, best_score = k + 1, dist
+        if best == 0:
+            return None
+        sel = lab[ij[:, 0], ij[:, 1]] == best
+        xy = d[obj][sel]
+        top_z = float(np.percentile(P[obj][sel][:, 2], 95))
+        # 가장 꼭 맞는 직사각형: 1° 씩 돌려 가며 넓이가 가장 작은 방향.
+        best_fit = None
+        for deg in range(0, 90, 1):
+            a = math.radians(deg)
+            ca, sa = math.cos(a), math.sin(a)
+            pu = xy[:, 0] * ca + xy[:, 1] * sa
+            pv = -xy[:, 0] * sa + xy[:, 1] * ca
+            u0, u1 = np.percentile(pu, [1, 99])
+            v0, v1 = np.percentile(pv, [1, 99])
+            area = (u1 - u0) * (v1 - v0)
+            if best_fit is None or area < best_fit[0]:
+                best_fit = (area, a, u0, u1, v0, v1)
+        _, a, u0, u1, v0, v1 = best_fit
+        cu, cv = (u0 + u1) / 2, (v0 + v1) / 2
+        centre = expected[:2] + np.array([cu * math.cos(a) - cv * math.sin(a),
+                                          cu * math.sin(a) + cv * math.cos(a)])
+        size = (float(u1 - u0), float(v1 - v0))
+        if not (0.06 <= min(size) and max(size) <= 0.40):
+            log.info(f"wrist shape: 덩어리 크기 {size[0] * 100:.0f}x{size[1] * 100:.0f} cm — "
+                     f"광물로 보기 어려움")
+            return None
+        return {"center": centre, "top_z": top_z, "size": size, "angle": a,
+                "points": int(sel.sum())}
 
     def _execute_pick_contact(self, goal_handle):
         """광물 바로 위에서 수직으로 내려가 집는 pick. grasp_mode 에 따라 둘로 갈린다.
@@ -814,7 +975,9 @@ class ArmExecutorNode(Node):
         # 공구 축(link_6 z)이 받침대 기준 수직 아래, 손가락 벌림 축은 광물 방향에
         # 수직 — HOME 자세를 광물 방위각만큼 돌린 자세.
         q_home = np.radians(HOME_DEG)
-        R_tool = _yaw_rot_z(math.atan2(center[1], center[0])) @ fk(q_home)[:3, :3]
+        R_home = fk(q_home)[:3, :3]
+        tool_yaw = math.atan2(center[1], center[0])
+        R_tool = _yaw_rot_z(tool_yaw) @ R_home
 
         def solve(above: float, seed: np.ndarray):
             target = center + np.array([0.0, 0.0, above + tip])
@@ -880,9 +1043,63 @@ class ArmExecutorNode(Node):
         if float(np.linalg.norm(fresh - center)) > 0.005:
             retarget(fresh, "odom 재계산")
         top_seen = None          # 손목 카메라가 잰 윗면 높이 (받침대 z)
+        use_shape = friction and bool(self.get_parameter("wrist_shape_measure").value)
+        gap = float(self.get_parameter("gripper_open_gap_m").value)
         if bool(self.get_parameter("use_wrist_correction").value):
-            for attempt in range(2):
-                measured = self._wrist_measure(center)
+            shape_mode = False       # YOLO 대신 깊이 영상으로 재는 중
+            for attempt in range(3):
+                if attempt == 2 and not shape_mode:
+                    break                                  # YOLO 보정은 두 번까지
+                measured = None if shape_mode else self._wrist_measure(center)
+                shape = None
+                if measured is None and use_shape:
+                    # YOLO 가 위에서 본 모습을 못 알아봄 → 깊이 영상으로 덩어리를 직접 잰다.
+                    shape = self._wrist_measure_shape(center)
+                    if shape is not None and float(np.linalg.norm(
+                            shape["center"] - center[:2])) > 2.0 * float(
+                            self.get_parameter("wrist_correction_gate_m").value):
+                        self.get_logger().info(
+                            "wrist shape: 덩어리가 예상 위치에서 "
+                            f"{np.linalg.norm(shape['center'] - center[:2]) * 100:.0f} cm — 버림")
+                        shape = None
+                if shape is not None:
+                    shape_mode = True
+                    top_seen = float(shape["top_z"])
+                    shift = shape["center"] - center[:2]
+                    # 집게를 닫는 방향(link_6 x)을 직사각형의 가까운 변 방향에 맞춘다.
+                    close_dir = math.atan2(R_tool[1, 0], R_tool[0, 0])
+                    turn = (shape["angle"] - close_dir + math.pi / 4) % (math.pi / 2) - math.pi / 4
+                    a_len, b_len = shape["size"]
+                    k = int(round((close_dir + turn - shape["angle"]) / (math.pi / 2))) % 2
+                    width = a_len if k == 0 else b_len       # 닫는 방향으로 본 폭
+                    other = b_len if k == 0 else a_len
+                    if width > gap - 0.03 and other < width - 0.02:
+                        turn += math.pi / 2 if turn < 0 else -math.pi / 2
+                        width = other
+                    if not bool(self.get_parameter("wrist_align_yaw").value):
+                        turn = 0.0
+                    self.get_logger().info(
+                        f"contact pick: 깊이 영상 측정 #{attempt + 1} — 덩어리 "
+                        f"{a_len * 100:.0f}x{b_len * 100:.0f} cm ({shape['points']}점), "
+                        f"dx={shift[0] * 100:+.1f} cm dy={shift[1] * 100:+.1f} cm, "
+                        f"윗면은 인식 중심 +{(top_seen - center[2]) * 100:.1f} cm, "
+                        f"집게 {math.degrees(turn):+.0f}° 돌림 (닫는 방향 폭 "
+                        f"{width * 100:.0f} cm / 벌림 {gap * 100:.0f} cm)")
+                    # 방향 추정은 ±6° 쯤 흔들린다 (실측) — 그 안이면 다시 돌리지 않는다.
+                    if abs(turn) < math.radians(8.0):
+                        turn = 0.0
+                    if float(np.linalg.norm(shift)) < 0.005 and turn == 0.0:
+                        break
+                    saved_R, saved_yaw = R_tool, tool_yaw
+                    tool_yaw += turn
+                    R_tool = _yaw_rot_z(tool_yaw) @ R_home
+                    trial = center.copy()
+                    trial[:2] = shape["center"]
+                    if not retarget(trial, "깊이 영상 보정"):
+                        R_tool, tool_yaw = saved_R, saved_yaw     # 돌린 자세는 안 닿음
+                        if not retarget(trial, "깊이 영상 보정(돌리지 않고)"):
+                            break
+                    continue
                 if measured is None:
                     # 보정 범위(gate) 밖이라도 근처에 광물이 보였으면 있는 것이다
                     # (가스처럼 큰 것은 중심 추정이 15 cm 넘게 어긋난다) → 그대로 진행.

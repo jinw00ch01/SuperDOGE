@@ -37,11 +37,13 @@ import carb
 import numpy as np
 from pxr import Gf, PhysxSchema, Sdf, Usd, UsdGeom, UsdPhysics, UsdShade
 
-PALM_SIZE = (0.32, 0.03, 0.03)       # y 폭을 좁게 — 손목 카메라(y=0.045) 시야를 가리지 않도록
+PALM_SIZE = (0.38, 0.03, 0.03)       # y 폭을 좁게 — 손목 카메라(y=0.045) 시야를 가리지 않도록
 PALM_Z = 0.082                      # palm 중심 (link_6 z)
 FINGER_SIZE = (0.012, 0.06, 0.17)
 FINGER_Z = 0.097 + FINGER_SIZE[2] / 2
-GAP_OPEN = 0.27                     # 안쪽 면 간격
+# 안쪽 면 간격. 초록 가스(20 cm 상자)는 비스듬히 놓이면 닫는 방향 폭이 28.3 cm 까지
+# 된다 — 0.27 로는 손가락이 상자 위에 얹혔다 (9 번 중 1 번만 집음).
+GAP_OPEN = 0.33
 GAP_CLOSED = 0.03
 FINGER_TRAVEL = (GAP_OPEN - GAP_CLOSED) / 2
 FINGER_FORCE = 40.0                 # N, 손가락 하나가 미는 최대 힘
@@ -191,6 +193,7 @@ class FrictionGrasp:
         self._closed = {ns: False for ns in self._g}
         self._gap_hist = {ns: [] for ns in self._g}   # held() 호출 때마다의 간격
         self.last_held = {ns: "" for ns in self._g}  # 마지막 held() 결과 (진단용)
+        self._minerals = None                        # [(path, 이름, bbox 중심(local), 크기)]
         print(f"[grasp] 마찰 파지 준비: {sorted(self._g)}")
 
     def _set(self, ns: str, closed: bool) -> None:
@@ -201,6 +204,7 @@ class FrictionGrasp:
                 "drive:linear:physics:targetPosition").Set(float(target))
         if closed != self._closed[ns]:
             print(f"[grasp] {ns} 집게 {'닫기' if closed else '열기'}")
+            self._where(ns, "닫는 순간" if closed else "여는 순간")
             self._gap_hist[ns] = []
         self._closed[ns] = closed
 
@@ -216,6 +220,73 @@ class FrictionGrasp:
         self._set(ns, False)
         if held:
             self._stow(ns, held)
+
+    def _mineral_table(self):
+        """광물마다 (rigid body path, 이름, mesh bbox 중심 — 자기 좌표, 크기). 한 번만 만든다."""
+        if self._minerals is None:
+            out = []
+            cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(),
+                                      [UsdGeom.Tokens.default_, UsdGeom.Tokens.render])
+            for prim in self._stage.Traverse():
+                if prim.GetName() != "Minerals":
+                    continue
+                for m in prim.GetChildren():
+                    try:
+                        # 광물 좌표(rigid body 원점 기준)에서의 축 정렬 상자. world 상자를
+                        # 광물의 world 변환으로 되돌리면 자식의 회전·배율이 다 들어간다
+                        # (ComputeUntransformedBound 는 기울어져 놓인 뒤의 값을 줘서
+                        #  20 cm 상자가 29x22x31 로 나왔다).
+                        inv = UsdGeom.Xformable(m).ComputeLocalToWorldTransform(
+                            Usd.TimeCode.Default()).GetInverse()
+                        box = cache.ComputeWorldBound(m)
+                        box.Transform(inv)
+                        rng = box.ComputeAlignedRange()
+                        lo, hi = np.array(rng.GetMin()), np.array(rng.GetMax())
+                        out.append((str(m.GetPath()), m.GetName(), (lo + hi) / 2, hi - lo))
+                    except Exception:
+                        pass
+            self._minerals = out
+        return self._minerals
+
+    def _where(self, ns: str, tag: str) -> None:
+        """진단: 집게와 가장 가까운 광물의 실제 위치 관계를 한 줄로 남긴다.
+
+        집게 좌표 = (닫는 방향, 손가락 폭 방향, 손가락 길이 방향). '닫는 방향 폭' 이
+        벌림(0.27 m)보다 크면 손가락이 광물 위에 얹힌다.
+        """
+        try:
+            g = self._g[ns]
+            a, b = self._pose(g["finger_l"]), self._pose(g["finger_r"])
+            if a is None or b is None:
+                return
+            centre, Rf = (a[0] + b[0]) / 2, a[1]
+            gap = float(np.linalg.norm(a[0] - b[0])) - FINGER_SIZE[0]
+            best = None
+            for path, name, c_local, size in self._mineral_table():
+                pose = self._pose(path)
+                if pose is None:
+                    continue
+                c_world = pose[0] + pose[1] @ c_local
+                d = float(np.linalg.norm(c_world - centre))
+                if d < 0.8 and (best is None or d < best[0]):
+                    best = (d, name, c_world, pose[1], size)
+            if best is None:
+                print(f"[grasp] {ns} {tag}: 손가락 중심 ({centre[0]:.3f},{centre[1]:.3f},"
+                      f"{centre[2]:.3f}) 간격 {gap * 100:.1f} cm — 0.8 m 안에 광물 없음")
+                return
+            _, name, c_world, Rm, size = best
+            rel = Rf.T @ (c_world - centre)
+            ext = [float(sum(abs(float(Rf[:, k] @ Rm[:, i])) * size[i] for i in range(3)))
+                   for k in range(3)]
+            tilt = float(np.degrees(np.arccos(max(-1.0, min(1.0, float(Rm[2, 2]))))))
+            print(f"[grasp] {ns} {tag}: {name} 크기 {size[0] * 100:.0f}x{size[1] * 100:.0f}x"
+                  f"{size[2] * 100:.0f} cm (기울기 {tilt:.0f}°), 손가락 중심 → 광물 중심 = "
+                  f"닫는 방향 {rel[0] * 100:+.1f} / 폭 방향 {rel[1] * 100:+.1f} / "
+                  f"길이 방향 {rel[2] * 100:+.1f} cm, 닫는 방향으로 본 광물 폭 "
+                  f"{ext[0] * 100:.1f} cm (간격 {gap * 100:.1f} cm), 광물 중심 world "
+                  f"({c_world[0]:.3f},{c_world[1]:.3f},{c_world[2]:.3f})")
+        except Exception as e:                      # 진단이 파지를 망치면 안 된다
+            print(f"[grasp] {ns} {tag}: 진단 실패 ({e})")
 
     def _pose(self, path: str):
         t = self._physx.get_rigidbody_transformation(path)
