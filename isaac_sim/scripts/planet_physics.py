@@ -241,6 +241,7 @@ def apply_planet_physics(stage, world, planet: str, meta: dict | None = None,
             n_rocks += 1
 
     n_wheels = 0
+    wheel_prims = []
     for root in rover_roots:
         rp = stage.GetPrimAtPath(root)
         if not rp or not rp.IsValid():
@@ -251,15 +252,35 @@ def apply_planet_physics(stage, world, planet: str, meta: dict | None = None,
             for sub in Usd.PrimRange(prim):
                 if sub.HasAPI(UsdPhysics.CollisionAPI):
                     bind_physics(sub, mats["wheel"])
+                    wheel_prims.append(sub)
                     n_wheels += 1
+    # 묶은 재질이 정말 그 collider 의 physics 재질로 해석되는지 되읽는다. 로버 모델의
+    # 바퀴 mesh 에는 그림용 재질(Rubber_Textured 등)이 이미 묶여 있고, 모델이 바뀌어
+    # 조상 prim 에 strongerThanDescendants 바인딩이 생기면 여기서 묶은 것이 진다.
+    # 충돌이 켜진 collider 만 센다 (둥근 바퀴를 쓰면 원래 mesh 접지면은 꺼져 있다).
+    wheel_path = mats["wheel"].GetPath()
+    n_live = n_resolved = 0
+    for sub in wheel_prims:
+        if sub.GetAttribute("physics:collisionEnabled").Get() is False:
+            continue
+        n_live += 1
+        bound, _rel = UsdShade.MaterialBindingAPI(sub).ComputeBoundMaterial("physics")
+        if bound and bound.GetPath() == wheel_path:
+            n_resolved += 1
+        else:
+            print(f"[physics] ⚠ 바퀴 collider {sub.GetPath()} 의 physics 재질이 "
+                  f"{bound.GetPath() if bound else '없음'} 로 해석됨 — --wheel-grip 이 "
+                  f"이 collider 에는 적용되지 않는다")
 
     info = {"planet": planet, "gravity": g, "materials": table, "wheel_grip": wheel_grip,
             "zones": zone_faces, "terrain_meshes": len(meshes),
-            "rocks": n_rocks, "wheel_colliders": n_wheels}
+            "rocks": n_rocks, "wheel_colliders": n_wheels,
+            "wheel_colliders_live": n_live, "wheel_colliders_resolved": n_resolved}
     climb = {k: round(math.degrees(math.atan(v["dynamic_friction"] * wheel_grip)), 1)
              for k, v in table.items() if k != "rock"}
     print(f"[physics] {planet}: gravity {g} m/s² (scene {len(scenes)}개), "
-          f"지형 mesh {len(meshes)}, 바위 {n_rocks}, 바퀴 collider {n_wheels}")
+          f"지형 mesh {len(meshes)}, 바위 {n_rocks}, 바퀴 collider {n_wheels} "
+          f"(충돌 켜진 {n_live}개 중 {n_resolved}개가 바퀴 재질로 해석됨)")
     print(f"[physics] 마찰(static/dynamic): "
           + ", ".join(f"{k} {v['static_friction']:.2f}/{v['dynamic_friction']:.2f}"
                       for k, v in table.items()))

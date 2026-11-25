@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import math
 import os
+from collections import deque
 from typing import List, Optional, Tuple
 
 import rclpy
@@ -232,6 +233,12 @@ class MissionManagerNode(Node):
         # 물러나는 것 — 의도한 동작). 다만 끝없이 후진만 하지 않게 연달아 이 횟수까지만.
         # 그 뒤에는 기울기가 문턱 − 3° 아래로 내려가거나 지금보다 5° 더 기울 때까지 쉰다.
         self.declare_parameter("tilt_guard_chain_max", 3)
+        # 앞이 들렸어도 아직 앞으로 잘 나아가고 있으면 (최근 1 s 동안 차체 앞 방향으로
+        # 이 속도 이상) 물러나지 않고 계속 오른다 — 수동 직진은 30° 를 넘겨도 끝까지
+        # 올라가는데 자율만 반사로 되돌아오는 경우를 가르기 위한 선택. 0 = 끔 (예전 동작).
+        # 이때도 앞이 hard 각을 넘으면 그대로 물러난다.
+        self.declare_parameter("tilt_guard_moving_mps", 0.0)
+        self.declare_parameter("tilt_guard_hard_pitch_deg", 40.0)
         self.declare_parameter("tilt_guard_skip_after", 3)      # 같은 목표로 가다 이만큼 걸리면 건너뜀
         self.declare_parameter("hazard_mark_topic", "/hazard_map/mark")
         # self_right_node 가 넘어진 로버를 세우는 동안 True 를 보낸다 → 바퀴 정지.
@@ -244,6 +251,10 @@ class MissionManagerNode(Node):
         # 주행 중에 만드는 지도. prebuilt: obstacle_grid.npy (원본, 정답 지도).
         self.declare_parameter("map_source", "online")
         self.declare_parameter("hazard_map_topic", "/hazard_map")
+        # 경사 비용 (coverage_node 와 같은 뜻). weight 0 = 끔.
+        self.declare_parameter("slope_cost_weight", 0.0)
+        self.declare_parameter("slope_cost_from_deg", 15.0)
+        self.declare_parameter("slope_cost_to_deg", 25.0)
         self.declare_parameter("path_cell_size", 0.2)
         # rover 실제 차폭 (m0609 팔 + 후방 바스켓 포함) ≈ 1.5m.
         # 이력: 0.7m 는 가장자리 충돌 잦아 1.0m 로 올렸으나, 1.0m 는 좁은 통로
@@ -314,6 +325,8 @@ class MissionManagerNode(Node):
         self._guard_chain = 0               # 기울기가 풀리지 않은 채 연달아 발동한 횟수
         self._guard_peak = 0.0              # 그 동안 가장 크게 넘은 정도 (문턱 대비, 도)
         self._guard_target = None           # (x, y, 횟수) 같은 목표로 가다 걸린 횟수
+        self._odom_hist: deque = deque(maxlen=200)   # (t, x, y) — 앞으로 나아가는 속도 계산용
+        self._guard_skipped = 0             # 나아가는 중이라 반사를 미룬 tick 수
         self._phase_before_recovery = "EXPLORE"
         # Mineral collection / battery
         self.collected_count: int = 0
@@ -379,7 +392,11 @@ class MissionManagerNode(Node):
                 robot_radius=float(self.get_parameter("path_robot_radius").value),
             )
             if map_source == "online":
-                self.map_layer = OnlineObstacleLayer(self.ogrid, basecamp_keepout(_meta))
+                self.map_layer = OnlineObstacleLayer(
+                    self.ogrid, basecamp_keepout(_meta),
+                    slope_cost=(float(self.get_parameter("slope_cost_weight").value),
+                                float(self.get_parameter("slope_cost_from_deg").value),
+                                float(self.get_parameter("slope_cost_to_deg").value)))
                 from nav_msgs.msg import OccupancyGrid
                 from rclpy.qos import (DurabilityPolicy, HistoryPolicy,
                                        QoSProfile, ReliabilityPolicy)
@@ -637,6 +654,28 @@ class MissionManagerNode(Node):
 
     def _on_odom(self, msg: Odometry) -> None:
         self.last_odom = msg
+        t = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        if self._odom_hist and t < self._odom_hist[-1][0]:
+            self._odom_hist.clear()                  # 시각 되감김 (리셋)
+        self._odom_hist.append((t, float(msg.pose.pose.position.x),
+                                float(msg.pose.pose.position.y)))
+        while self._odom_hist and t - self._odom_hist[0][0] > 1.5:
+            self._odom_hist.popleft()
+
+    def _forward_speed(self, yaw: float, window: float = 1.0) -> Optional[float]:
+        """최근 window 초 동안 차체 앞 방향(수평)으로 나아간 평균 속도 (m/s). 기록이 모자라면 None."""
+        if len(self._odom_hist) < 2:
+            return None
+        t1, x1, y1 = self._odom_hist[-1]
+        old = None
+        for rec in self._odom_hist:
+            if t1 - rec[0] <= window:
+                old = rec
+                break
+        if old is None or t1 - old[0] < 0.5 * window:
+            return None
+        dt = t1 - old[0]
+        return ((x1 - old[1]) * math.cos(yaw) + (y1 - old[2]) * math.sin(yaw)) / dt
 
     def _on_teleop_cmd(self, msg: Twist) -> None:
         self.last_teleop_cmd = msg
@@ -912,6 +951,19 @@ class MissionManagerNode(Node):
         if over > 0.0 and self._guard_chain >= int(self.get_parameter("tilt_guard_chain_max").value):
             if over < self._guard_peak + 5.0:
                 return False            # 이미 연달아 물러났다 — 더 나빠지지 않는 한 계획기에 맡긴다
+        q = odom.pose.pose.orientation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        moving = float(self.get_parameter("tilt_guard_moving_mps").value)
+        if moving > 0.0 and lim_p < nose <= float(
+                self.get_parameter("tilt_guard_hard_pitch_deg").value) \
+                and abs(roll) <= lim_r:
+            v_fwd = self._forward_speed(yaw)
+            if v_fwd is not None and v_fwd >= moving:
+                self._guard_skipped += 1
+                if self._guard_skipped % 20 == 1:
+                    self.get_logger().info(
+                        f"tilt guard 보류: 앞이 {nose:.0f}° 들렸지만 {v_fwd:.2f} m/s 로 오르는 중")
+                return False         # 아직 잘 오르고 있다 — 계속 간다
         if nose > lim_p:
             # 앞이 들렸다 = 내리막은 뒤쪽. 어느 쪽으로 가던 중이든 뒤로 내려온다.
             self._guard_dir, self._guard_why = -1.0, f"앞이 {nose:.0f}° 들림"
@@ -931,8 +983,6 @@ class MissionManagerNode(Node):
                 f"tilt guard: 연달아 {self._guard_chain}번 물러남 — 기울기가 풀리거나 "
                 "5° 더 기울 때까지 반사를 쉬고 계획기에 맡긴다")
         # 가려던 쪽(물러나는 방향의 반대)의 바로 앞을 위험으로 표시 → 계획기가 돌아간다.
-        q = odom.pose.pose.orientation
-        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
         self._guard_p0 = (float(odom.pose.pose.position.x), float(odom.pose.pose.position.y))
         self._guard_fwd = (-self._guard_dir * math.cos(yaw), -self._guard_dir * math.sin(yaw))
         self._guard_far = 0.0
@@ -1431,8 +1481,9 @@ class MissionManagerNode(Node):
         if goal is not None and active_grid[goal] == 1:
             goal = self._nearest_free(goal, active_grid)
 
+        cost = self.map_layer.cost if self.map_layer is not None else None
         # 1차 시도 — 표준 grid 로.
-        path = astar(active_grid, start, goal) if start and goal else None
+        path = astar(active_grid, start, goal, cost=cost) if start and goal else None
 
         # 2차 시도 — 실패 시 시작 cell 주변 5×5 일시 free 처리 후 재시도.
         if not path and start and goal:
@@ -1443,7 +1494,7 @@ class MissionManagerNode(Node):
                     ii, jj = si + di, sj + dj
                     if self.ogrid.in_bounds(ii, jj):
                         relaxed[ii, jj] = 0
-            path = astar(relaxed, start, goal)
+            path = astar(relaxed, start, goal, cost=cost)
             if path:
                 self.get_logger().warn(
                     f"A* recovered with relaxed start cell "
@@ -1459,7 +1510,7 @@ class MissionManagerNode(Node):
             self.last_plan_target = (tx, ty)
             return
 
-        path = simplify_path(active_grid, path)
+        path = simplify_path(active_grid, path, cost=cost)
         self.waypoints = [self.ogrid.cell_to_world(i, j) for (i, j) in path]
         self.wp_idx = 1 if len(self.waypoints) > 1 else 0
         self.last_plan_target = (tx, ty)

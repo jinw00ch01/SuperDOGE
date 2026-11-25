@@ -46,7 +46,8 @@ def _rover_group(ns: str, terrain_dir: str, collection_goal: int,
                  arrive_r: float, fringe_r: float, reveal_radius: float,
                  map_source: str = "online", governor: str = "",
                  self_right: bool = False, slope_deg: float = 25.0,
-                 tilt_guard: bool = True):
+                 tilt_guard: bool = True, slope_cost: float = 0.0,
+                 tilt_guard_moving: float = 0.0):
     """단일 rover 의 5 노드 묶음 — 토픽 모두 /<ns>/... prefix.
 
     terrain_dir 는 T1 Isaac Sim 의 --terrain 인자와 동일한 terrain 폴더 경로.
@@ -176,6 +177,7 @@ def _rover_group(ns: str, terrain_dir: str, collection_goal: int,
                 "enable_minimap_topics": True,
                 "minimap_rover_id": ns,
                 "reveal_radius": reveal_radius,
+                "slope_cost_weight": slope_cost,
             }],
             remappings=[
                 # minimap_publisher 의 absolute 토픽 → namespace 강제
@@ -222,6 +224,8 @@ def _rover_group(ns: str, terrain_dir: str, collection_goal: int,
                 "event_topic":        f"{nsp}/mission/event",
                 "hazard_mark_topic":  f"{nsp}/hazard_map/mark",
                 "tilt_guard":         tilt_guard,
+                "slope_cost_weight":  slope_cost,
+                "tilt_guard_moving_mps": tilt_guard_moving,
                 "teleop_cmd_topic":   f"{nsp}/teleop/cmd_vel",
                 "terrain_dir":        terrain_dir,
                 "map_source":         map_source,
@@ -287,14 +291,18 @@ def _launch_setup(context, *args, **kwargs):
         "1", "true", "yes", "on")
     self_right = LaunchConfiguration("self_right").perform(context).strip().lower() in (
         "true", "1", "yes")
+    slope_cost = float(LaunchConfiguration("slope_cost").perform(context))
+    tilt_guard_moving = float(LaunchConfiguration("tilt_guard_moving").perform(context))
     print(f"[mvp_multi] terrain_dir={terrain_dir}  rovers={rovers}  "
           f"collection_goal={collection_goal} (per rover)  map_source={map_source}  "
-          f"drive_governor={governor}")
+          f"drive_governor={governor}  slope_cost={slope_cost:g}  "
+          f"tilt_guard_moving={tilt_guard_moving:g}")
     nodes = []
     for ns in rovers:
         nodes.extend(_rover_group(ns, terrain_dir, collection_goal,
                                   arrive_r, fringe_r, reveal_radius, map_source,
-                                  governor, self_right, slope_deg, tilt_guard))
+                                  governor, self_right, slope_deg, tilt_guard,
+                                  slope_cost, tilt_guard_moving))
 
     # Web HUD — 단일 인스턴스가 모든 rover namespace 추적 (옵션 X 단계 2).
     # mission_web_node 의 rover_namespaces param 으로 ns 리스트 전달.
@@ -370,6 +378,15 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument(
             "hud_actions", default_value="true",
             description="false 면 HUD 의 ACTIONS 버튼·수동 주행을 끈다 (보기 전용)."),
+        DeclareLaunchArgument(
+            "slope_cost", default_value="0",
+            description="경사 비용 (online 지도). 0 = 끔. 4 면 15° 부터 25° 까지 칸 비용이 "
+                        "1 → 5 배로 늘어, 지나갈 수 있어도 가파른 칸을 덜 밟는 길을 고른다 "
+                        "(README '저지대에서 못 올라옴')."),
+        DeclareLaunchArgument(
+            "tilt_guard_moving", default_value="0",
+            description="기울기 반사 보류 속도 (m/s). 0 = 끔. 0.15 면 앞이 30~40° 들려도 최근 1 s "
+                        "동안 그 속도 이상으로 오르는 중이면 물러나지 않는다 (README '저지대에서 못 올라옴')."),
         DeclareLaunchArgument(
             "tilt_guard", default_value="true",
             description="기울기 반사 — 앞이 30° 넘게 들리거나 옆으로 32° 넘게 기울면 밀어붙이지 "
