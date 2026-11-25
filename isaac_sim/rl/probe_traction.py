@@ -12,6 +12,13 @@
           capsule  : 캡슐 (굴러가는 방향으로 완전히 둥글다)
           sphere   : 구
 
+--wheel-grip k 는 run_vehicle_v3 의 같은 옵션이 물리에 실제로 들어가는지 보는 시험이다
+(같은 planet_physics.apply_planet_physics 를 거친다). 적용되면 구동·제동 유효 마찰이
+레골리스 동마찰 × k 로 나와야 한다 (0.52 → ×1.25 는 0.65, ×1.5 는 0.78). k 를 바꿔도
+0.52 그대로면 바퀴 재질이 접촉에 쓰이지 않는 것이다. 끝에 기대값과의 비를 찍는다.
+
+    tools/isaac-pypi isaac_sim/rl/probe_traction.py --wheel-grip 1.25
+
 결과 (terrain_00026, 로버 13대, 레골리스 동마찰 0.52):
     mesh 0.31~0.35 · cylinder 0.31~0.39 · capsule 0.50~0.52 · sphere 0.50~0.52
     제동(바퀴 잠김)은 어느 형상이든 0.48~0.54.
@@ -31,6 +38,9 @@ _p.add_argument("--hz", type=float, default=60.0, help="물리 스텝 주기")
 _p.add_argument("--control-hz", type=float, default=30.0)
 _p.add_argument("--slips", default="0.15,0.5,1.0,2.0")
 _p.add_argument("--out", default="")
+_p.add_argument("--wheel-grip", type=float, default=1.0,
+                help="바퀴 재질의 마찰 배율 (run_vehicle_v3 --wheel-grip 과 같은 경로). "
+                     "유효 마찰이 설정 동마찰 × 이 값으로 나오는지 본다")
 args, _ = _p.parse_known_args()
 
 from isaacsim import SimulationApp  # noqa: E402
@@ -45,6 +55,7 @@ from drive_env import REST_HEIGHT, RoverDriveEnv  # noqa: E402
 
 RoverDriveEnv.PHYSICS_HZ = float(args.hz)
 RoverDriveEnv.WHEEL_SHAPE = args.wheels
+RoverDriveEnv.WHEEL_GRIP = args.wheel_grip
 
 env = RoverDriveEnv(app, terrain=args.terrain, num_envs=16, seed=3, control_hz=args.control_hz)
 env.friction_range = (1.0, 1.0)
@@ -68,7 +79,8 @@ for c in cells:
 k = len(starts)
 starts += [starts[-1]] * (n - k)
 print(f"[trac] 바퀴 {args.wheels}, 물리 {args.hz:.0f} Hz (제어 {1 / dt:.0f} Hz), 평지 출발점 {k}곳, "
-      f"설정 마찰 정지 {mu_s} / 동 {mu_d}, 중력 {g}", flush=True)
+      f"설정 마찰 정지 {mu_s} / 동 {mu_d}, 바퀴 배율 ×{args.wheel_grip:g} "
+      f"(기대 동마찰 {mu_d * args.wheel_grip:.3f}), 중력 {g}", flush=True)
 
 # 로버 모델의 차체 속도는 1.57 m/s 에서 막힌다 (probe 로 확인). 그 전 구간만 가속도 계산에 쓴다.
 V_FIT_MAX = 1.1
@@ -111,7 +123,20 @@ for slip in [float(x) for x in args.slips.split(",")]:
          "pitch_max": round(float(np.median(np.abs(pitch[a0:a1]).max(axis=0))), 1)}
     rows.append(r)
     print("[trac] " + json.dumps(r), flush=True)
+# 배율이 물리에 들어갔는가: 잰 값 / (설정 동마찰 × 배율). 둥근 바퀴(capsule·sphere)는 배율 1.0 에서
+# 구동 0.96~1.0, 제동 0.92~0.94 가 나온다 (README "바퀴 접지력 교정"). 배율을 줬는데 적용이 안 됐다면
+# 이 비가 1/배율 로 떨어진다 (×1.25 → 0.80, ×1.5 → 0.67).
+expect = mu_d * args.wheel_grip
+drive = float(np.median([r["mu_drive"] for r in rows]))
+brake = float(np.median([r["mu_brake"] for r in rows]))
+verdict = {"wheel_grip": args.wheel_grip, "mu_expected": round(expect, 3),
+           "mu_drive_med": round(drive, 3), "mu_brake_med": round(brake, 3),
+           "drive_ratio": round(drive / expect, 3), "brake_ratio": round(brake / expect, 3),
+           "ratio_if_not_applied": round(1.0 / args.wheel_grip, 3)}
+print("[trac] 배율 확인 " + json.dumps(verdict, ensure_ascii=False), flush=True)
 if args.out:
     with open(args.out, "w") as f:
-        json.dump({"wheels": args.wheels, "hz": args.hz, "mu_set": [mu_s, mu_d], "rows": rows}, f)
+        json.dump({"wheels": args.wheels, "hz": args.hz, "mu_set": [mu_s, mu_d],
+                   "wheel_grip": args.wheel_grip, "verdict": verdict, "rows": rows}, f,
+                  ensure_ascii=False)
 app.close()

@@ -307,6 +307,71 @@ ros2 launch isaac_bringup mvp_multi.launch.py rovers:=rover_1 terrain_id:=terrai
 tools/isaac-pypi isaac_sim/rl/eval_drive.py --terrain terrain_00015 --steep-goal-frac 0.5 --controllers fixed,guard --minutes 15
 ```
 
+### 저지대에서 못 올라옴 — 원인 좁히기 (2026-11-25, 진행 중) — 새 옵션은 전부 선택 (기본 꺼짐)
+
+증상: 움푹 꺼진 곳에 들어간 로버가 자율주행으로는 높은 곳으로 못 올라오는데, HUD 에서 W(직진)만 누르면 올라옵니다.
+이번 단계는 **시뮬레이터 없이** 한 정적 분석과, 노트북에서 한 줄로 돌릴 측정 스크립트까지입니다. **시뮬레이터 실측은 아직 하지 않았습니다** — 아래 "가설" 은 코드에서 확인한 사실이지 측정한 결과가 아닙니다.
+
+**1. `--wheel-grip` 이 물리에 실제로 걸리는가** (`planet_physics.py`)
+
+로버 USD 를 usd-core 로 열어 같은 바인딩을 해 본 결과, 충돌이 켜진 바퀴 collider 12 개(캡슐 6 + 허브 Mesh_02 6) 모두 physics 용 재질이 `WheelGrouser` 로 해석됐습니다 (`ComputeBoundMaterial("physics")`). 원래 메시 collider 는 캡슐로 바꿀 때 충돌이 꺼지므로 셈에서 빠집니다.
+실행할 때도 같은 검사를 하도록 바꿨습니다 — `바퀴 collider n (충돌 켜진 n개 중 n개가 바퀴 재질로 해석됨)` 이 로그에 찍히고, 하나라도 다르면 경고합니다.
+물리 쪽 확인은 `probe_traction.py --wheel-grip k` 로 합니다: 평지에서 구동·제동 때의 실효 마찰(μ)을 재서 ×1.0 대비 비율이 k 쪽인지 1 쪽인지(`ratio_if_not_applied`)를 마지막 줄에 냅니다. 위 ×1.25 경사 시험(25° 정지 출발 3/3)이 간접 증거이긴 하지만 직접 잰 값은 아직 없습니다.
+
+**2. 계획기 입장에서 갇히는가** (`isaac_drive/scripts/pocket_check.py`, numpy 만)
+
+지형 30 개의 높이 지도를 위험 지도(0.3 m 평면 맞춤, 25°, 12 cm 턱, 로버 반경 0.8 m 부풀림)로 바꿔 "빈 땅인데 밖과 이어지지 않은 덩어리" 를 찾았습니다.
+갇힌 덩어리는 5 개, 모두 10 m² 이하이고 전부 **부풀림 때문에 생긴 것**(부풀리기 전에는 이어져 있음)이었습니다. 큰 저지대는 모두 계획기상 나가는 길이 있습니다 — "길이 없어서 못 나온다" 는 아닙니다.
+
+**3. 어떤 길로 나오는가** (`isaac_drive/scripts/slope_route_check.py`)
+
+같은 지형들의 꺼진 곳(76 곳)에서 높은 곳까지 실제 계획 경로(위험 지도 → `OnlineObstacleLayer` → A* → 직선 단순화)를 만들고, 경유점 사이 직선이 지나는 경사를 차체 크기(0.8 m)로 쟀습니다.
+지금 A* 는 칸마다 비용이 같아서 **가장 짧은 길** — 위험 문턱(25°) 바로 아래의 가파른 비탈을 곧장 오르는 길을 고르기 쉽습니다. 직진으로도 서 있다 출발하면 23° 에서 0\~33 % 만 오르므로, 자율주행이 고른 길 자체가 수동 운전자가 고른 길보다 가파를 수 있습니다.
+그래서 선택 옵션으로 **경사 비용**을 넣었습니다: 위험 지도 노드가 안전한 칸의 경사(도)를 0\~49 로 함께 보내고, 계획기는 15° 부터 25° 까지 칸 비용을 1 → 1 + w 배로 올립니다. 단순화도 더 가파른 칸을 가로지르는 지름길은 만들지 않습니다.
+
+| 꺼진 곳 → 높은 곳 경로 (지형 30 개, 607 개, 0.1 m 격자) | 균일 (지금) | 경사 비용 ×4 |
+|---|---|---|
+| 지나는 최대 경사 중앙값 | 16.7° | 15.6° |
+| 최대 경사 90 % 값 | 21.2° | 18.9° |
+| 20° 넘는 비탈을 지나는 경로 | 20 % | 7 % |
+| 23° 넘는 비탈을 지나는 경로 | 3 % | 1 % |
+| terrain_00015 만 (40 개): 20° 넘음 | 60 % | 20 % |
+| 길이 비 (경사 / 균일) | — | 중앙 1.00, 90 % 1.07 |
+
+0.2 m 격자(623 개)에서도 20° 넘는 경로가 19 % → 10 % 였습니다. 계획 시간은 중앙값 기준 +5 ms 입니다. **기본은 꺼 둡니다** (`slope_cost:=0`) — 임무 스택에서 돌려 보기 전이고, 실제로 못 올라오는 원인이 길의 경사인지 아직 측정하지 않았기 때문입니다.
+
+**4. 수동과 자율의 명령 차이 — 가설** (코드에서 확인한 사실, 측정 전)
+
+| | 수동 W | 자율 |
+|---|---|---|
+| 명령 | 0.3 / 0.6 / 0.9 m/s, 조향 0 | 탐색: lin = 3·cos(오차) (제한기가 0.92 로 자름), ang = 2·오차. 접근: 1.2 m/s (→ 0.92), ang = 1.5·오차 |
+| 방향 맞추기 | 사람이 비탈 아래에서 미리 | 오차 25° 넘으면 **제자리 회전** (15° 아래로 풀릴 때까지) — 비탈 위에서 서서 돌고 정지 출발 |
+| 기울기 반사 | **꺼짐** (MANUAL) | 앞 30° / 옆 32° 넘으면 물러나고 그 앞을 위험 표시 |
+| 경로 | 사람이 고름 | 가장 짧은 길 (위 3 번) |
+
+가장 유력한 후보는 **기울기 반사**입니다. 수동은 반사가 없어서 30° 를 넘겨도 계속 밀어 올라가는데, 자율은 짧은 턱 꼭대기에서 앞이 30° 를 넘는 순간 물러나고 그 자리를 위험으로 찍습니다. 몇 번 반복되면 나가는 길이 표시로 막힙니다. 앞서 기록한 16/16 통과 지점 (−11.1, 11.5) 에서도 통과 중 최대 기울기가 28\~47° 였고, terrain_00015 의 저지대 (−8.8, 11.0) 바로 옆입니다.
+그 밖의 후보: 비탈 위 제자리 회전 뒤 정지 출발(서 있다 출발은 23° 에서 0\~33 %), 조향 중의 곡률을 제한기가 유지하며 감속, 진행이 4 초 동안 15 % 미만이면 그 자리를 막힘으로 찍는 판정.
+
+이를 가르기 위한 선택 옵션: **오르는 중이면 반사 보류** (`tilt_guard_moving`, 기본 0 = 끔). 앞이 30\~40° 들렸어도 최근 1 초 동안 차체 앞 방향으로 그 속도 이상 나아가고 있으면 물러나지 않습니다. 40° (`tilt_guard_hard_pitch_deg`) 를 넘거나 옆 기울기가 문턱을 넘으면 예전처럼 물러납니다. 전복 8 회 중 7 회가 "명령은 최대인데 차체 속도 0" 이었으므로, 나아가는 중에는 보류해도 그 모양의 전복은 막는다는 계산입니다 — 역시 측정 전입니다.
+
+**노트북에서 돌릴 측정** (결과가 나오면 이 절을 갱신합니다):
+
+```bash
+# 1) 배율이 물리에 걸리는가 — 평지 실효 마찰 (mu_drive_med / mu_brake_med 가 ×k 쪽이면 적용)
+tools/isaac-pypi isaac_sim/rl/probe_traction.py --wheel-grip 1.0
+tools/isaac-pypi isaac_sim/rl/probe_traction.py --wheel-grip 1.25
+tools/isaac-pypi isaac_sim/rl/probe_traction.py --wheel-grip 1.5
+# 2) 같은 비탈에 명령만 바꿔서 — guard_in_reached 는 "넘은 시도 중 반사가 먼저 발동했을 것" 의 수
+tools/isaac-pypi isaac_sim/rl/probe_slope.py --terrain terrain_00015 --bins 20,23,25 \
+    --compare manual0.6,manual0.9,nav,nav_off18,nav_off30,nav_kink,approach0.92 --out logs/slope_compare.json
+# 3) 임무 스택에서 옵션 켜고 비교
+ros2 launch isaac_bringup mvp_multi.launch.py rovers:=rover_1 terrain_id:=terrain_00015 slope_cost:=4
+ros2 launch isaac_bringup mvp_multi.launch.py rovers:=rover_1 terrain_id:=terrain_00015 tilt_guard_moving:=0.15
+# 정적 분석 (시뮬레이터 불필요)
+python3 isaac_drive/scripts/pocket_check.py all
+python3 isaac_drive/scripts/slope_route_check.py --weight 4 --cell 0.1
+```
+
 ### Web HUD — 주소로 열기 · 버튼 · 기록 (2026-11-24, `mission_web_node.py`, `isaac_supervisor/web/`, `mission_manager_node.py`)
 
 `mvp_multi.launch.py` 로 띄웠을 때의 HUD 입니다. `mvp.launch.py`(단일 로버, namespace 없음)도 같은 HUD 노드를 쓰지만, 버튼·접속 키용 launch 인자와 토픽 연결은 `mvp_multi.launch.py` 에만 넣었고 시험도 그쪽으로만 했습니다.
@@ -585,6 +650,7 @@ a2_isaac/
 │  │  ├─ minimap_publisher.py, odom_to_estimated_pose.py
 │  │  └─ navigation/                      # hazard_map · online_map · path_planner(A*) · navigator ·
 │  │                                      # bcd_planner · fog_map · *_policy (numpy 추론) 등
+│  ├─ scripts/pocket_check.py, slope_route_check.py   # 저지대 갇힘 · 나오는 길의 경사 (정적 분석)
 │  └─ policies/                           # drive_governor.npz · self_right.npz · balance.npz
 │
 ├─ isaac_perception/                      # ④ 인지

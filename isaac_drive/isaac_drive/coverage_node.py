@@ -102,6 +102,11 @@ class CoverageNode(Node):
         # 곳으로 들어가지 않는다. 0 이하 = map_source 에 맞춘 기본값
         # (online 25°, prebuilt 45°).
         self.declare_parameter("point_turn_deg", 0.0)
+        # 경사 비용 (online 지도에서만): 지나갈 수 있는(25° 아래) 칸이라도 가파르면 돌아가는
+        # 길을 고른다. weight 0 = 끔 (균일 비용, 예전 동작). README "저지대에서 못 올라옴".
+        self.declare_parameter("slope_cost_weight", 0.0)
+        self.declare_parameter("slope_cost_from_deg", 15.0)
+        self.declare_parameter("slope_cost_to_deg", 25.0)
         self.declare_parameter("pose_topic", "/rover/estimated_pose")
         self.declare_parameter("cmd_vel_topic", "/cmd_vel")
         self.declare_parameter("tick_hz", 30.0)
@@ -159,7 +164,11 @@ class CoverageNode(Node):
         self.layer = None
         self.replans_blocked = 0
         if self.map_source == "online":
-            self.layer = OnlineObstacleLayer(ogrid, basecamp_keepout(self.meta))
+            self.layer = OnlineObstacleLayer(
+                ogrid, basecamp_keepout(self.meta),
+                slope_cost=(float(self.get_parameter("slope_cost_weight").value),
+                            float(self.get_parameter("slope_cost_from_deg").value),
+                            float(self.get_parameter("slope_cost_to_deg").value)))
             self.fog.set_obstacle_mask(self.layer.raw.astype("uint8"))
         point_turn = float(self.get_parameter("point_turn_deg").value)
         if point_turn <= 0.0:
@@ -181,6 +190,8 @@ class CoverageNode(Node):
             self.fog, ogrid, planner, navigator, self.pose,
             sector_done_ratio=float(self.get_parameter("sector_done_ratio").value),
         )
+        if self.layer is not None:
+            self.mission.cost_source = lambda: self.layer.cost
 
         # ── I5 입력: pose 구독 ──
         self.create_subscription(

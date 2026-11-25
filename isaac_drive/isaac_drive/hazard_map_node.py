@@ -12,8 +12,10 @@
     · <detections_topic> isaac_interfaces/DetectionArray — 광물은 장애물이 아니라
                       집을 대상이므로 그 주변은 위험에서 뺀다
   출력
-    · <map_topic>     nav_msgs/OccupancyGrid — -1 안 봄 / 0 안전 / 100 위험
+    · <map_topic>     nav_msgs/OccupancyGrid — -1 안 봄 / 0~49 안전 / 100 위험
                       (부풀리지 않은 값. 로버 반경만큼 부풀리는 것은 받는 쪽 몫)
+                      안전 칸의 값은 그 칸의 경사(도, 49 에서 자름). 위험 판정은 받는 쪽이
+                      50 초과로 보므로 예전 소비자는 그대로 동작한다. 경사 비용 계획에 쓴다.
 
 지도의 범위(크기)는 운용 구역 크기로, terrain meta.json 의 size_m 에서만 읽는다.
 """
@@ -182,6 +184,7 @@ class HazardMapNode(Node):
         cells = int(self.hm.obstacle_mask().sum())
         self.hm.evidence[:] = 0
         self.hm.seen[:] = 0
+        self.hm.grade[:] = np.nan
         bumps = len(self._bumps)
         self._bumps.clear()
         self._stall_ref = None
@@ -344,7 +347,9 @@ class HazardMapNode(Node):
         for (x, y) in self._minerals:
             self.hm.clear_disk(x, y, self.clear_r)
         cells = np.full((self.hm.rows, self.hm.cols), -1, dtype=np.int8)
-        cells[self.hm.observed_mask()] = 0
+        obs = self.hm.observed_mask()
+        g = np.nan_to_num(self.hm.grade, nan=0.0)
+        cells[obs] = np.clip(np.rint(g[obs]), 0, 49).astype(np.int8)
         cells[self.hm.obstacle_mask()] = 100
         if self._bumps:
             r = float(self.get_parameter("stall_mark_radius_m").value) / self.hm.cell

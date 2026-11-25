@@ -74,6 +74,9 @@ class HazardMap:
         # 누적 상태
         self.evidence = np.zeros((self.rows, self.cols), dtype=np.int16)
         self.seen = np.zeros((self.rows, self.cols), dtype=np.uint16)
+        # 칸별 경사(도) — 영상마다 맞춘 평면 기울기의 지수 평균. 안 본 칸은 nan.
+        # 위험 판정과 별개로 "지나갈 수는 있지만 가파른 칸" 을 계획기가 피하게 하는 데 쓴다.
+        self.grade = np.full((self.rows, self.cols), np.nan, dtype=np.float32)
         self.frames = 0
 
     # ── 좌표 ────────────────────────────────────────────────────────────
@@ -97,12 +100,16 @@ class HazardMap:
         base = np.stack([z, -xo, -yo], axis=1) + self.cam_offset
         return base @ R.T + p
 
-    def classify(self, pts: np.ndarray):
-        """world 점 → (칸 index i, j, 위험 여부) — 판정할 수 있는 칸만."""
+    def classify(self, pts: np.ndarray, with_grade: bool = False):
+        """world 점 → (칸 index i, j, 위험 여부) — 판정할 수 있는 칸만.
+
+        with_grade=True 면 네 번째로 칸마다 평면 기울기(도, 평면을 못 맞춘 칸은 nan)도 준다.
+        """
         i, j = self.world_to_cell(pts[:, 0], pts[:, 1])
         ok = (i >= 0) & (i < self.rows) & (j >= 0) & (j < self.cols)
         if not ok.any():
-            return (np.zeros(0, np.int64),) * 2 + (np.zeros(0, bool),)
+            empty = (np.zeros(0, np.int64),) * 2 + (np.zeros(0, bool),)
+            return empty + (np.zeros(0, np.float32),) if with_grade else empty
         i, j, pts = i[ok], j[ok], pts[ok]
         # 점이 있는 영역만 잘라서 계산 (전체 격자를 매번 돌지 않게).
         i0, i1, j0, j1 = i.min(), i.max() + 1, j.min(), j.max() + 1
@@ -146,7 +153,12 @@ class HazardMap:
         decided = (n >= 1) & (spread_ok | step_bad)
         hazard = slope_bad | rough_bad | step_bad
         ii, jj = np.nonzero(decided)
-        return ii + i0, jj + j0, hazard[ii, jj]
+        if not with_grade:
+            return ii + i0, jj + j0, hazard[ii, jj]
+        with np.errstate(invalid="ignore"):
+            deg = np.degrees(np.arctan(np.hypot(gx, gy)))
+        deg = np.where(spread_ok, deg, np.nan).astype(np.float32)
+        return ii + i0, jj + j0, hazard[ii, jj], deg[ii, jj]
 
     def integrate(self, depth, fx, fy, cx, cy, p, R, stride: int = 1) -> int:
         """영상 한 장을 지도에 반영. return: 이번 영상에서 판정한 칸 수."""
@@ -154,9 +166,12 @@ class HazardMap:
                                 np.asarray(R, float), stride)
         if len(pts) < 50:
             return 0
-        i, j, hazard = self.classify(pts)
+        i, j, hazard, deg = self.classify(pts, with_grade=True)
         if len(i) == 0:
             return 0
+        old = self.grade[i, j]
+        self.grade[i, j] = np.where(np.isnan(deg), old,
+                                    np.where(np.isnan(old), deg, 0.7 * old + 0.3 * deg))
         delta = np.where(hazard, self.hit_gain, -self.miss_gain).astype(np.int16)
         ev = self.evidence[i, j] + delta
         self.evidence[i, j] = np.clip(ev, -self.evidence_max, self.evidence_max)

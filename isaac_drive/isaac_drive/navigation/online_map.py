@@ -48,11 +48,17 @@ def basecamp_keepout(meta: dict):
 
 class OnlineObstacleLayer:
     def __init__(self, ogrid: ObstacleGrid, keepouts=(), check_margin_m: float = 0.2,
-                 unknown_margin_m: float = 0.8):
+                 unknown_margin_m: float = 0.8, slope_cost=(0.0, 15.0, 25.0)):
         """keepouts: [(x, y, radius)] — 처음부터 막아 둘 원 (기지).
         check_margin_m: 이미 가고 있는 경로가 막혔는지 볼 때는 로버 반경보다 이만큼
-        덜 부풀린 격자를 쓴다 (경계에서 계획이 계속 바뀌는 것을 막는 여유)."""
+        덜 부풀린 격자를 쓴다 (경계에서 계획이 계속 바뀌는 것을 막는 여유).
+        slope_cost: (weight, 시작 경사°, 끝 경사°). weight > 0 이면 위험 지도가 실어 보낸
+        안전 칸의 경사로 칸 비용을 만든다 — 시작 경사 아래는 0, 끝 경사에서 weight
+        (그 칸을 지나는 거리가 1 + weight 배). self.cost 로 A* 에 넘긴다. weight 0 = 끔
+        (self.cost = None, 예전과 같은 균일 비용)."""
         self.ogrid = ogrid
+        self.slope_w, self.slope_lo, self.slope_hi = (float(v) for v in slope_cost)
+        self.cost = None
         self.check_margin = float(check_margin_m)
         # 위험 칸에 붙어 있는 "아직 못 본 칸" 은 이 거리까지 위험으로 친다. 장애물은
         # 보인 면보다 더 넓을 수 있다 (둔덕 뒤에 가려진 건물 밑동, 바위의 뒷면).
@@ -89,9 +95,12 @@ class OnlineObstacleLayer:
         """nav_msgs/OccupancyGrid → 격자 갱신. return: planner 해상도의 raw 위험 mask."""
         w, h, res = msg.info.width, msg.info.height, float(msg.info.resolution)
         data = np.asarray(msg.data, dtype=np.int8).reshape(h, w)
-        return self.update(data > 50, res, unknown=data < 0)
+        grade = None
+        if self.slope_w > 0.0:
+            grade = np.where((data >= 0) & (data <= 50), data, 0).astype(np.float32)
+        return self.update(data > 50, res, unknown=data < 0, grade=grade)
 
-    def update(self, hazard: np.ndarray, cell: float, unknown=None) -> np.ndarray:
+    def update(self, hazard: np.ndarray, cell: float, unknown=None, grade=None) -> np.ndarray:
         rows, cols = self.ogrid.rows, self.ogrid.cols
         f = max(1, int(round(self.ogrid.cell_size / cell)))
 
@@ -100,7 +109,7 @@ class OnlineObstacleLayer:
                 R2, C2 = a.shape[0] // f, a.shape[1] // f
                 a = pool(a[:R2 * f, :C2 * f].reshape(R2, f, C2, f), axis=(1, 3))
             if a.shape != (rows, cols):
-                fixed = np.zeros((rows, cols), dtype=bool)
+                fixed = np.zeros((rows, cols), dtype=a.dtype)
                 r, c = min(rows, a.shape[0]), min(cols, a.shape[1])
                 fixed[:r, :c] = a[:r, :c]
                 a = fixed
@@ -114,6 +123,11 @@ class OnlineObstacleLayer:
                 <= self.unknown_margin
             self._ext = unknown & near & ~hazard
         self.raw = hazard | self._known | self._ext
+        if grade is not None and self.slope_w > 0.0:
+            g = to_planner(grade, np.max)                 # 칸 안에서 가장 가파른 값
+            span = max(self.slope_hi - self.slope_lo, 1e-3)
+            self.cost = (self.slope_w * np.clip((g - self.slope_lo) / span, 0.0, 1.0)
+                         ).astype(np.float32)
         self._rebuild()
         self.updates += 1
         return self.raw
