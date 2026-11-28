@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import math
 import os
+import time
 from typing import List, Optional, Tuple
 
 import rclpy
@@ -194,6 +195,12 @@ class MissionManagerNode(Node):
         # pick 이 실패한 지점(오검출 등) 을 이 시간 동안 후보에서 제외 — 같은
         # 허상 target 으로 무한 재시도하는 것 방지. 반경은 post_pick_skip_radius_m.
         self.declare_parameter("failed_pick_ignore_sec", 60.0)
+        # 갈 길이 없는 광물을 고르지 않는 시간 — 실패할 때마다 두 배, 최대 max.
+        self.declare_parameter("no_path_ignore_sec", 15.0)
+        self.declare_parameter("no_path_ignore_max_sec", 120.0)
+        # EVENT LOG 폭주 막이: 이 시간 안에 이만큼 넘게 나오면 나머지는 세기만 한다.
+        self.declare_parameter("event_burst_window_sec", 10.0)
+        self.declare_parameter("event_burst_max", 12)
         # 지도 없는 주행(map_source=online)에서는 광물도 위험 칸으로 잡힌다. 그 광물을
         # 집으러 갈 때는 목표 주변 이 반경의 위험 칸을 없는 것으로 치고 계획한다.
         self.declare_parameter("approach_target_clear_m", 0.5)
@@ -1150,6 +1157,23 @@ class MissionManagerNode(Node):
 
     # ── 운영자 명령 (HUD) ───────────────────────────────────────────────
     def _event(self, text: str) -> None:
+        # 폭주 막이 — 같은 일이 0.1 초마다 되풀이되는 버그가 생겨도 HUD 기록이 묻히지 않게.
+        now = time.monotonic()
+        win = float(self.get_parameter("event_burst_window_sec").value)
+        cap = int(self.get_parameter("event_burst_max").value)
+        st = getattr(self, "_ev_burst", None)
+        if st is None or now - st[0] > win:
+            dropped = st[2] if st else 0
+            st = self._ev_burst = [now, 0, 0]
+            if dropped:
+                m = String()
+                m.data = f"(기록이 너무 많아 {dropped}줄 생략)"
+                self.event_pub.publish(m)
+                self.get_logger().warn(f"EVENT LOG 폭주: {win:.0f} 초에 {dropped}줄 생략")
+        st[1] += 1
+        if st[1] > cap:
+            st[2] += 1
+            return
         m = String()
         m.data = text
         self.event_pub.publish(m)
@@ -1607,10 +1631,27 @@ class MissionManagerNode(Node):
             # obstacle 통과 위험. 정지 + target/lock 폐기로 다음 tick 에
             # det_fresh=False → 자동 EXPLORE 복귀. 같은 mineral 이 다시
             # 감지되면 rover 위치가 바뀐 상태에서 재시도 가능.
+            #
+            # 그냥 버리기만 하면 안 된다: 기억해 둔 광물이면 다음 tick 에 같은 광물을 다시
+            # 고르고, 또 길이 없어 버리고 — 0.1 초마다 EXPLORE↔APPROACH 를 오가며 기록을
+            # 쏟아 내고 탐색 경로도 매번 다시 짜게 해서 로버가 제자리에 선다 (2026-11-29,
+            # 넘어졌다 일어난 자리가 위험 칸에 둘러싸여 50 초 동안 480 번). 그래서 이 광물을
+            # 한동안 고르지 않는다. 실패 횟수는 올리지 않는다 — 로버가 선 자리 탓일 수 있고,
+            # 지도가 넓어지면 길이 생긴다. 다시 실패할 때마다 쉬는 시간을 두 배로 늘린다.
+            tries = 1
+            for k in self.known:
+                if math.hypot(k["x"] - tx, k["y"] - ty) <= 1.0:
+                    k["nopath"] = k.get("nopath", 0) + 1
+                    tries = max(tries, k["nopath"])
+            ignore_s = min(float(self.get_parameter("no_path_ignore_max_sec").value),
+                           float(self.get_parameter("no_path_ignore_sec").value)
+                           * 2 ** (tries - 1))
+            self.failed_pick_points.append(
+                (tx, ty, self.get_clock().now().nanoseconds + int(ignore_s * 1e9)))
             self.get_logger().warn(
-                f"APPROACH A* failed for target ({tx:.2f},{ty:.2f}) — "
-                f"dropping target, returning to EXPLORE",
-                throttle_duration_sec=2.0)
+                f"APPROACH: 광물 ({tx:.2f},{ty:.2f}) 까지 갈 길이 없음 ({tries}번째) — "
+                f"{ignore_s:.0f} 초 동안 이 광물은 빼고 EXPLORE 로")
+            self._event(f"광물 ({tx:.1f},{ty:.1f}) 까지 길 없음 — {ignore_s:.0f} 초 제외")
             self.target = None
             self.lock_target = None
             self.last_det_stamp_ns = 0
