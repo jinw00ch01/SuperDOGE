@@ -62,6 +62,24 @@
     return ROVER_COLORS[rid] || { rover: "#aaaaaa", path: "#aaaaaa" };
   }
 
+  // 모든 로버가 기억한 광물을 합친다 (같은 종류가 1 m 안이면 같은 광물).
+  // by = 그 광물로 가고 있는 로버 ("" = 아직 아무도).
+  function sharedMinerals() {
+    const out = [];
+    for (const rid in byRover) {
+      const m = byRover[rid].minerals;
+      if (!m || !Array.isArray(m.items)) continue;
+      for (const it of m.items) {
+        if (!Number.isFinite(it.x) || !Number.isFinite(it.y)) continue;
+        let e = out.find((o) => o.c === it.c && Math.hypot(o.x - it.x, o.y - it.y) < 1.0);
+        if (!e) { e = { c: it.c, x: it.x, y: it.y, by: "" }; out.push(e); }
+        if (it.t) e.by = rid;
+        else if (it.o && !e.by) e.by = it.o;
+      }
+    }
+    return out;
+  }
+
   function ensureRover(rid) {
     if (!byRover[rid]) byRover[rid] = {};
     return byRover[rid];
@@ -223,10 +241,12 @@
     CAMERAS.forEach(([id, ann, raw]) => connectCamera(id, yoloOn ? ann : raw));
   }
 
+  let renderEventsHook = null;   // EVENT LOG 를 고른 로버 것으로 다시 그린다 (아래에서 채움)
   function refreshActiveViews() {
     renderStatusFor(activeRover);
     refreshCameraSrcs();
     paintMap();
+    if (renderEventsHook) renderEventsHook();
   }
 
   /* ── Socket events: per-rover caching ────────────────────────── */
@@ -369,56 +389,45 @@
     }
 
     // 기억한 (아직 못 모은) 광물 — 종류마다 다른 모양·색의 아이콘 (지도 위 범례와 같은 그림).
-    // 숫자는 로버에서 가까운 순서 (1 = 다음 차례), 분홍 고리는 지금 가고 있는 광물.
-    for (const rid in byRover) {
-      const m = byRover[rid].minerals;
-      if (!m || !Array.isArray(m.items)) continue;
-      m.items.forEach((it, k) => {
-        if (!Number.isFinite(it.x) || !Number.isFinite(it.y)) return;
-        const icon = MINERAL_ICONS[it.c] || MINERAL_ICONS.blue_mineral;
-        const [mx, my] = worldToPx(it.x, it.y);
-        ctx.save();
-        ctx.globalAlpha = (rid === activeRover) ? 1.0 : 0.6;
-        ctx.translate(mx, my);
-        if (it.t) {
-          ctx.strokeStyle = "#ff5ce0";
-          ctx.lineWidth = 2.5;
-          ctx.beginPath();
-          ctx.arc(0, 0, 13, 0, 2 * Math.PI);
-          ctx.stroke();
-        }
-        ctx.lineJoin = "round";
+    // 로버들이 서로 알려 주는 목록이라 모든 로버의 것을 합쳐 한 번씩만 그린다 (어느 로버
+    // 버튼을 눌러도 같은 지도). 고리 = 그 광물로 가고 있는 로버의 색.
+    for (const it of sharedMinerals()) {
+      const icon = MINERAL_ICONS[it.c] || MINERAL_ICONS.blue_mineral;
+      const [mx, my] = worldToPx(it.x, it.y);
+      ctx.save();
+      ctx.translate(mx, my);
+      if (it.by) {
         ctx.strokeStyle = "#000";
-        ctx.lineWidth = 3;
-        ctx.stroke(icon.outline);
-        ctx.fillStyle = icon.fill;
-        ctx.fill(icon.outline);
-        ctx.strokeStyle = icon.dark;
-        ctx.lineWidth = 1;
-        ctx.stroke(icon.detail);
-        ctx.font = "bold 11px monospace";
-        ctx.textAlign = "left";
-        ctx.textBaseline = "middle";
-        ctx.lineWidth = 3;
-        ctx.strokeStyle = "#000";
-        ctx.strokeText(String(k + 1), 11, -7);
-        ctx.fillStyle = "#ffffff";
-        ctx.fillText(String(k + 1), 11, -7);
-        ctx.restore();
-      });
+        ctx.lineWidth = 4.5;
+        ctx.beginPath();
+        ctx.arc(0, 0, 13, 0, 2 * Math.PI);
+        ctx.stroke();
+        ctx.strokeStyle = colorFor(it.by).rover;
+        ctx.lineWidth = 2.5;
+        ctx.stroke();
+      }
+      ctx.lineJoin = "round";
+      ctx.strokeStyle = "#000";
+      ctx.lineWidth = 3;
+      ctx.stroke(icon.outline);
+      ctx.fillStyle = icon.fill;
+      ctx.fill(icon.outline);
+      ctx.strokeStyle = icon.dark;
+      ctx.lineWidth = 1;
+      ctx.stroke(icon.detail);
+      ctx.restore();
     }
 
-    // 모든 rover 의 target marker (분홍 별).
-    // 별은 "집으러 갈 광물이 하나도 없을 때" 의 탐색 목표에만 쓴다. 기억한 광물이 있으면
-    // 목표는 그 광물의 아이콘(분홍 고리)으로 보인다.
+    // 별은 "집으러 갈 광물이 없을 때" 의 탐색 목표에만 쓴다 (로버 색). 광물로 가는 중이면
+    // 목표는 그 광물 아이콘의 고리로 보인다.
     for (const rid in byRover) {
       const t = byRover[rid].target;
       const known = byRover[rid].minerals;
-      if (known && Array.isArray(known.items) && known.items.length > 0) continue;
+      if (known && Array.isArray(known.items) && known.items.some((it) => it.t)) continue;
       if (t && Number.isFinite(t.x) && Number.isFinite(t.y)) {
         const [tx, ty] = worldToPx(t.x, t.y);
         ctx.save();
-        ctx.fillStyle = "#ff5ce0";
+        ctx.fillStyle = colorFor(rid).rover;
         ctx.strokeStyle = "#000";
         ctx.lineWidth = 1.5;
         ctx.globalAlpha = 1.0;
@@ -638,7 +647,8 @@
      최신이 위. 칸보다 길어지면 스크롤 막대로 넘긴다. 예전 줄을 읽으려고 내려가 있는
      동안에는 새 줄이 들어와도 보던 자리가 밀리지 않게 한다. */
   const evList = $("event-list");
-  const EV_MAX = 400;
+  const EV_MAX = 400;          // 화면에 두는 줄 수
+  const EV_KEEP = 1500;        // 기억하는 줄 수 (모든 로버)
   const evData = [];     // 시간순 (복사용)
   const hh = (n) => String(n).padStart(2, "0");
   function clock(t) {
@@ -664,21 +674,34 @@
                (ev.origin ? ` (from ${ev.origin})` : "");
     return li;
   }
-  function addEvent(ev) {
-    evData.push(ev);
-    if (evData.length > EV_MAX) evData.shift();
+  // 고른 로버의 줄만 보인다 (로버 이름이 없는 줄 = 전체 알림은 늘 보인다).
+  const evMine = (ev) => !ev.rover_id || !activeRover || ev.rover_id === activeRover;
+  function showEvent(ev) {
     const away = evList.scrollTop > 4;          // 예전 줄을 보고 있다
     const li = eventLine(ev);
     evList.insertBefore(li, evList.firstChild);
     if (away) evList.scrollTop += li.offsetHeight;
     while (evList.children.length > EV_MAX) evList.removeChild(evList.lastChild);
-    $("event-count").textContent = `${evData.length}`;
+  }
+  function renderEvents() {
+    evList.innerHTML = "";
+    const mine = evData.filter(evMine);
+    mine.slice(-EV_MAX).forEach(showEvent);
+    $("event-count").textContent = `${mine.length}`;
+  }
+  renderEventsHook = renderEvents;
+  function addEvent(ev) {
+    evData.push(ev);
+    if (evData.length > EV_KEEP) evData.shift();
+    if (!evMine(ev)) return;
+    showEvent(ev);
+    $("event-count").textContent = `${evData.filter(evMine).length}`;
   }
   sock.on("event", addEvent);
   sock.on("events", (msg) => {
-    evList.innerHTML = "";
     evData.length = 0;
-    (msg.items || []).forEach(addEvent);
+    (msg.items || []).forEach((ev) => evData.push(ev));
+    renderEvents();
   });
 
   function copyText(text, onDone) {
@@ -698,11 +721,11 @@
   }
   $("event-copy").addEventListener("click", () => {
     const b = $("event-copy");
-    const text = evData.map((ev) =>
+    const text = evData.filter(evMine).map((ev) =>
       `${clock(ev.t)}\t${ev.rover_id || "-"}\t${ev.kind === "action" ? "[HUD] " : ""}${ev.text || ""}`
     ).join("\n");
     copyText(text, () => {
-      b.textContent = `COPIED ${evData.length}`;
+      b.textContent = `COPIED ${evData.filter(evMine).length}`;
       b.classList.add("copied");
       setTimeout(() => { b.textContent = "COPY"; b.classList.remove("copied"); }, 1200);
     });

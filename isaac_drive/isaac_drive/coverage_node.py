@@ -132,6 +132,11 @@ class CoverageNode(Node):
         # rover_id (예: "rover_1") 를 StateWriter 에 전달. 빈 문자열이면 단일
         # rover (기존 동작 — /tmp/starcraft_map_state.npz).
         self.declare_parameter("minimap_rover_id", "")
+        # 다른 로버 피하기: 다른 로버의 지금 위치를 계획용 격자에 원으로 넣는다 (지도 표시에는
+        # 안 남는다). 원 반경 + 로버 반경(robot_radius) 만큼 떨어져 지나가는 길이 나온다.
+        self.declare_parameter("rover_positions_topic", "")     # "" = 끔 (단일 로버)
+        self.declare_parameter("rover_avoid_disc_m", 0.6)
+        self.declare_parameter("rover_position_ttl_sec", 2.0)
 
         terrain_dir = str(self.get_parameter("terrain_dir").value)
         pose_topic = str(self.get_parameter("pose_topic").value)
@@ -193,6 +198,17 @@ class CoverageNode(Node):
                 QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
                            durability=DurabilityPolicy.TRANSIENT_LOCAL,
                            history=HistoryPolicy.KEEP_LAST, depth=1))
+
+        self._others: dict = {}                 # rover_id → (x, y, 받은 시각 ns)
+        self._my_rover_id = str(self.get_parameter("minimap_rover_id").value).strip()
+        pos_topic = str(self.get_parameter("rover_positions_topic").value).strip()
+        if pos_topic and self.layer is not None:
+            from geometry_msgs.msg import PointStamped as _PointStamped
+            self.create_subscription(_PointStamped, pos_topic, self._on_rover_position, 20)
+            self.create_timer(0.5, self._refresh_other_rovers)
+            self.get_logger().info(
+                f"다른 로버 피하기 켬 — {pos_topic}, 원 반경 "
+                f"{float(self.get_parameter('rover_avoid_disc_m').value):.1f} m")
 
         # External replan trigger — supervisor 가 EXPLORE 재진입 시 publish.
         # 받으면 현재 DRIVE path 무시하고 즉시 PLAN_PATH 로 강제 전환해
@@ -295,6 +311,33 @@ class CoverageNode(Node):
                 self.get_logger().info(
                     f"새로 본 장애물이 경로를 막음 → 다시 계획 "
                     f"(누적 {self.replans_blocked}회)",
+                    throttle_duration_sec=2.0)
+
+    def _on_rover_position(self, msg) -> None:
+        rid = (msg.header.frame_id or "").strip()
+        if rid and rid != self._my_rover_id:
+            self._others[rid] = (float(msg.point.x), float(msg.point.y),
+                                 self.get_clock().now().nanoseconds)
+
+    def _refresh_other_rovers(self) -> None:
+        """다른 로버의 위치를 계획용 격자에 반영하고, 가던 길이 막혔으면 다시 계획."""
+        now = self.get_clock().now().nanoseconds
+        ttl = int(float(self.get_parameter("rover_position_ttl_sec").value) * 1e9)
+        r = float(self.get_parameter("rover_avoid_disc_m").value)
+        discs = [(x, y, r) for _rid, (x, y, ts) in sorted(self._others.items())
+                 if now - ts <= ttl]
+        if not self.layer.set_dynamic(discs):
+            return
+        if (self.mission.state != "DRIVE" or not self.pose.has_pose
+                or self.mission.nav.is_done()):
+            return
+        x, y, _ = self.pose.get_pose_2d()
+        nav = self.mission.nav
+        if self.layer.path_blocked([(x, y)] + list(nav.path[nav.idx:])):
+            if self.mission.replan_keep_target():
+                self.replans_rover = getattr(self, "replans_rover", 0) + 1
+                self.get_logger().info(
+                    f"다른 로버가 경로를 막음 → 다시 계획 (누적 {self.replans_rover}회)",
                     throttle_duration_sec=2.0)
 
     def _on_replan_request(self, _msg) -> None:

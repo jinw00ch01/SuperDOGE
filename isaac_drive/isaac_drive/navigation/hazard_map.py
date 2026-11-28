@@ -148,10 +148,17 @@ class HazardMap:
         ii, jj = np.nonzero(decided)
         return ii + i0, jj + j0, hazard[ii, jj]
 
-    def integrate(self, depth, fx, fy, cx, cy, p, R, stride: int = 1) -> int:
-        """영상 한 장을 지도에 반영. return: 이번 영상에서 판정한 칸 수."""
+    def integrate(self, depth, fx, fy, cx, cy, p, R, stride: int = 1, exclude=()) -> int:
+        """영상 한 장을 지도에 반영. return: 이번 영상에서 판정한 칸 수.
+
+        exclude: [(x, y, r)] — 이 원 안의 점은 버린다 (다른 로버 — 움직이는 물체라
+        지도에 남기면 지나간 자리에 가짜 장애물이 쌓인다)."""
         pts = self.points_world(depth, fx, fy, cx, cy, np.asarray(p, float),
                                 np.asarray(R, float), stride)
+        for (ex, ey, er) in exclude:
+            if len(pts) == 0:
+                break
+            pts = pts[(pts[:, 0] - ex) ** 2 + (pts[:, 1] - ey) ** 2 > er * er]
         if len(pts) < 50:
             return 0
         i, j, hazard = self.classify(pts)

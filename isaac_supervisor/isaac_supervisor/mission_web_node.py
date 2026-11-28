@@ -412,7 +412,7 @@ class MissionWebRosNode(Node):
         self._teleop_pub: Dict[str, object] = {}
         self._mapclr_pub: Dict[str, object] = {}
         self._teleop_last: Dict[str, float] = {}       # ns → 마지막 teleop 시각 (기록용)
-        self._events: deque = deque(maxlen=400)          # 늦게 들어온 브라우저에게 줄 최근 기록
+        self._events: deque = deque(maxlen=1500)          # 늦게 들어온 브라우저에게 줄 최근 기록
         path = str(self.get_parameter("action_log_path").value).strip()
         self.action_log_path = os.path.expanduser(
             path or os.path.join(os.environ.get("ROS_LOG_DIR", "~/.ros/log"),

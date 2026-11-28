@@ -13,6 +13,8 @@ from __future__ import annotations
 import json
 import os
 
+import math
+
 import numpy as np
 from scipy import ndimage
 
@@ -69,6 +71,10 @@ class OnlineObstacleLayer:
         self._border = np.zeros((rows, cols), dtype=bool)
         self._border[:m, :] = self._border[-m:, :] = True
         self._border[:, :m] = self._border[:, -m:] = True
+        self._xs, self._ys = xs, ys
+        # 움직이는 장애물 (다른 로버) — 계획용 격자에만 들어가고 raw(지도 표시)에는 안 남는다.
+        self._dyn = np.zeros((rows, cols), dtype=bool)
+        self._dyn_discs: tuple = ()
         self.raw = self._known.copy()            # 부풀리기 전 (planner 해상도)
         self._ext = np.zeros((rows, cols), dtype=bool)   # raw 중 "못 본 칸" 이라 막은 것
         self.check_grid = np.zeros((rows, cols), dtype=np.uint8)
@@ -80,13 +86,32 @@ class OnlineObstacleLayer:
 
     def _rebuild(self) -> None:
         cs, r = self.ogrid.cell_size, self.ogrid.robot_radius
-        if self.raw.any():
-            dist = ndimage.distance_transform_edt(~self.raw) * cs
+        eff = self.raw | self._dyn
+        if eff.any():
+            dist = ndimage.distance_transform_edt(~eff) * cs
         else:
             dist = np.full(self.raw.shape, np.inf)
         self.ogrid.grid = ((dist <= r) | self._border).astype(np.uint8)
         self.check_grid = ((dist <= max(cs, r - self.check_margin))
                            | self._border).astype(np.uint8)
+
+    def set_dynamic(self, discs, min_move_m: float = 0.3) -> bool:
+        """움직이는 장애물 [(x, y, r)] 을 바꾼다. 달라졌으면 격자를 다시 만들고 True.
+
+        다른 로버의 위치다. 센서 지도에 남기면 지나간 자리에 가짜 장애물이 쌓이므로
+        (hazard_map_node 는 다른 로버에 맞은 점을 버린다) 지금 위치만 계획에 넣는다."""
+        discs = tuple((float(x), float(y), float(r)) for x, y, r in discs)
+        old = self._dyn_discs
+        if len(discs) == len(old) and all(
+                math.hypot(a[0] - b[0], a[1] - b[1]) < min_move_m and a[2] == b[2]
+                for a, b in zip(discs, old)):
+            return False
+        self._dyn_discs = discs
+        self._dyn = np.zeros(self.raw.shape, dtype=bool)
+        for (x, y, r) in discs:
+            self._dyn |= (self._xs - x) ** 2 + (self._ys - y) ** 2 <= r * r
+        self._rebuild()
+        return True
 
     def update_from_msg(self, msg) -> np.ndarray:
         """nav_msgs/OccupancyGrid → 격자 갱신. return: planner 해상도의 raw 위험 mask."""

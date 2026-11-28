@@ -120,6 +120,14 @@ class ArmExecutorNode(Node):
 
     def __init__(self) -> None:
         super().__init__("arm_executor_node")
+        # 시뮬레이션 속도 추정 (기다림을 늘리는 데 쓴다 — _time_scale)
+        self.declare_parameter("timing_ref_rtf", 0.6)
+        self._ref_rtf = float(self.get_parameter("timing_ref_rtf").value)
+        self._rtf = None
+        self._rtf_hist: list = []
+        self._clock_lock = threading.Lock()
+        self._nominal = 0.0
+        self._nominal_wall = time.monotonic()
         self.declare_parameter("publish_hz", 30.0)
         self.declare_parameter("step_duration_sec", 3.0)
         self.declare_parameter("joint_command_topic", "/arm/joint_command")
@@ -319,6 +327,41 @@ class ArmExecutorNode(Node):
         if self._wrist_K is None and msg.k[0] > 0.0:
             self._wrist_K = np.array(msg.k, dtype=np.float64).reshape(3, 3)
 
+    # ── 시뮬레이션 속도에 맞춘 시계 ─────────────────────────────────────
+    # 이 노드의 기다림(팔이 따라올 시간, 집게가 닫힐 시간, 궤적 보간 주기)은 로버 1 대
+    # (--render-every 2, 실시간의 약 0.6 배)에서 벽시계로 맞춘 값이다. 로버 3 대면 시뮬레이터가
+    # 0.3 배로 돌아서 같은 벽시계 시간 동안 팔이 절반만 움직인다 — 팔이 도착하기 전에 집게를
+    # 닫아 "nothing between the fingers" 로 실패했다 (logs/tri3: 집기 6 번 중 2 번).
+    # 그래서 기다림을 (기준 속도 / 지금 속도) 배로 늘린다. 기준 속도에서는 예전과 똑같다.
+    def _time_scale(self) -> float:
+        rtf = self._rtf
+        if rtf is None:
+            return 1.0
+        return min(6.0, max(0.5, self._ref_rtf / max(rtf, 0.05)))
+
+    def _ssleep(self, sec: float) -> None:
+        time.sleep(max(0.0, float(sec)) * self._time_scale())
+
+    def _smono(self) -> float:
+        """기준 속도로 환산한 단조 시계 (s). _ssleep(x) 동안 x 만큼 간다."""
+        now = time.monotonic()
+        with self._clock_lock:
+            self._nominal += (now - self._nominal_wall) / self._time_scale()
+            self._nominal_wall = now
+            return self._nominal
+
+    def _track_rtf(self, stamp) -> None:
+        """odom 의 stamp(시뮬레이션 시각)와 벽시계로 지금 시뮬레이션 속도를 잰다."""
+        sim = stamp.sec + stamp.nanosec * 1e-9
+        wall = time.monotonic()
+        h = self._rtf_hist
+        h.append((wall, sim))
+        while len(h) > 2 and wall - h[0][0] > 3.0:
+            h.pop(0)
+        if len(h) >= 2 and wall - h[0][0] > 1.0 and sim > h[0][1]:
+            self._smono()                       # 속도가 바뀌기 전까지의 시간을 먼저 적립
+            self._rtf = (sim - h[0][1]) / (wall - h[0][0])
+
     def _on_joint_states(self, msg: JointState) -> None:
         """Extract M0609 6 arm joints from rover's full joint state."""
         name_to_pos = dict(zip(msg.name, msg.position))
@@ -342,13 +385,14 @@ class ArmExecutorNode(Node):
         """Rover (articulation root = arm base) world pose 추출.
         chassisFrameId='base_link' = vehicle_v3 의 m0609/base_link → arm base.
         """
+        self._track_rtf(msg.header.stamp)
         p = msg.pose.pose.position
         o = msg.pose.pose.orientation
         with self._odom_lock:
             self._rover_xyz = np.array([p.x, p.y, p.z], dtype=np.float64)
             self._rover_yaw = _quat_to_yaw(o.x, o.y, o.z, o.w)
             self._rover_R = _quat_to_matrix(o.x, o.y, o.z, o.w)
-            now = time.monotonic()
+            now = self._smono()
             self._odom_hist.append((now, self._rover_xyz))
             while self._odom_hist and now - self._odom_hist[0][0] > 1.0:
                 self._odom_hist.pop(0)
@@ -366,7 +410,7 @@ class ArmExecutorNode(Node):
                 now_ns = self.get_clock().now().nanoseconds
                 if now_ns - stamp < int(0.5e9):
                     return max(dets, key=lambda d: d.confidence)
-            time.sleep(0.05)
+            self._ssleep(0.05)
         return None
 
     def _goal_callback(self, goal_request: ExecuteArmTask.Goal) -> GoalResponse:
@@ -465,10 +509,10 @@ class ArmExecutorNode(Node):
         # bridge 가 최소 한 frame 은 받도록 보장.
         for _ in range(6):
             self.grasp_pub.publish(msg)
-            time.sleep(0.1)
+            self._ssleep(0.1)
         delay = float(self.get_parameter("grasp_publish_delay_sec").value)
         if delay > 0.0:
-            time.sleep(delay)
+            self._ssleep(delay)
         self.get_logger().info(
             f"grasp/command -> {cmd} xyz=({x:.3f},{y:.3f},{z:.3f}) "
             f"target_id={target_id}")
@@ -476,7 +520,7 @@ class ArmExecutorNode(Node):
     def _on_grasp_status(self, msg: String) -> None:
         with self._grasp_status_lock:
             self._grasp_status_held = msg.data
-            self._grasp_status_mono = time.monotonic()
+            self._grasp_status_mono = self._smono()
             self._grasp_status_count += 1
 
     def _confirm_grasp(self, since_mono: float) -> bool:
@@ -490,15 +534,15 @@ class ArmExecutorNode(Node):
             self.get_logger().warn(
                 "grasp status 토픽 수신 없음 — 부착 확인 생략 (성공으로 간주)")
             return True
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
+        deadline = self._smono() + timeout
+        while self._smono() < deadline:
             with self._grasp_status_lock:
                 held = self._grasp_status_held
                 fresh = self._grasp_status_mono >= since_mono
             if fresh and held:
                 self.get_logger().info(f"grasp confirmed — holding {held}")
                 return True
-            time.sleep(0.05)
+            self._ssleep(0.05)
         return False
 
     def _abort_pick_not_attached(self, goal_handle, cur_deg: List[float]):
@@ -533,7 +577,7 @@ class ArmExecutorNode(Node):
         cur_deg = list(PICK_DOWN_DEG)
 
         # 3) GRASP — vehicle_v3 attaches nearest mineral to gripper
-        t_pickup = time.monotonic()
+        t_pickup = self._smono()
         self._publish_grasp("pickup", x=tx, y=ty, z=tz, target_id=req.target_id)
         if not self._confirm_grasp(t_pickup):
             return self._abort_pick_not_attached(goal_handle, cur_deg)
@@ -554,7 +598,7 @@ class ArmExecutorNode(Node):
         # 5.5) Visual settle — articulation lag 흡수 (mineral 이 cargo 도착 후 hide).
         settle = float(self.get_parameter("cargo_settle_sec").value)
         if settle > 0.0:
-            time.sleep(settle)
+            self._ssleep(settle)
 
         # 6) RELEASE — vehicle_v3 detaches + hides the mineral (cargo stowed)
         self._publish_grasp("release")
@@ -591,7 +635,7 @@ class ArmExecutorNode(Node):
             with self._odom_lock:
                 if self._rover_xyz is not None:
                     break
-            time.sleep(0.05)
+            self._ssleep(0.05)
         with self._odom_lock:
             arm_base_xyz = (None if self._rover_xyz is None
                             else self._rover_xyz.copy())
@@ -651,7 +695,7 @@ class ArmExecutorNode(Node):
         cur_deg = list(deg_descend)
 
         # 5) Grasp pickup — FixedJoint snap (mineral → gripper link origin)
-        t_pickup = time.monotonic()
+        t_pickup = self._smono()
         self._publish_grasp("pickup",
                             x=float(mineral_world[0]),
                             y=float(mineral_world[1]),
@@ -677,7 +721,7 @@ class ArmExecutorNode(Node):
         # 7.5) Visual settle — arm 이 시각적으로 cargo 도착까지 대기.
         settle = float(self.get_parameter("cargo_settle_sec").value)
         if settle > 0.0:
-            time.sleep(settle)
+            self._ssleep(settle)
 
         # 8) Release — detach + MakeInvisible
         self._publish_grasp("release")
@@ -709,16 +753,16 @@ class ArmExecutorNode(Node):
         한계 때문에 그 뒤로도 4~7 cm 더 굴러간다 (실측). 그 전에 목표를 받침대
         좌표로 바꾸면 그만큼 어긋난다.
         """
-        t0 = time.monotonic()
-        while time.monotonic() - t0 < timeout:
+        t0 = self._smono()
+        while self._smono() - t0 < timeout:
             with self._odom_lock:
                 hist = list(self._odom_hist)
             if hist and hist[-1][0] - hist[0][0] >= 0.4:
                 recent = [p for t, p in hist if hist[-1][0] - t <= 0.4]
                 if float(np.linalg.norm(recent[-1] - recent[0])) < 0.003:
                     break
-            time.sleep(0.05)
-        return time.monotonic() - t0
+            self._ssleep(0.05)
+        return self._smono() - t0
 
     def _wrist_measure(self, expected: np.ndarray):
         """손목 카메라 검출로 광물 중심과 윗면을 팔 받침대 좌표로 잰다.
@@ -736,13 +780,13 @@ class ArmExecutorNode(Node):
                           self.get_parameter("wrist_mount_xyz_link6").value])
         R_oc = np.array(list(self.get_parameter("wrist_R_optical_to_link6").value),
                         dtype=np.float64).reshape(3, 3)
-        time.sleep(max(0.0, float(self.get_parameter("wrist_settle_sec").value)))
+        self._ssleep(max(0.0, float(self.get_parameter("wrist_settle_sec").value)))
         samples: List[np.ndarray] = []
         rejected: List[str] = []
         self._wrist_nearest_m = None     # 이번 측정에서 본 광물 중 예상 위치에 가장 가까운 거리
         last_stamp = 0
-        t_end = time.monotonic() + 2.5
-        while time.monotonic() < t_end and len(samples) < 5:
+        t_end = self._smono() + 2.5
+        while self._smono() < t_end and len(samples) < 5:
             with self._wrist_lock:
                 dets = list(self._wrist_dets)
                 stamp = self._wrist_stamp_ns
@@ -786,7 +830,7 @@ class ArmExecutorNode(Node):
                                         f"지름 추정 {float(d.bbox_size_m.z) * 100:.0f} cm)")
                 if best is not None:
                     samples.append(np.concatenate([best[1], best[2]]))
-            time.sleep(0.05)
+            self._ssleep(0.05)
         if len(samples) < 3:
             self.get_logger().info(
                 f"wrist measure: 쓸 수 있는 검출 {len(samples)}장 — 버린 것: "
@@ -942,7 +986,7 @@ class ArmExecutorNode(Node):
             with self._odom_lock:
                 if self._rover_xyz is not None:
                     break
-            time.sleep(0.05)
+            self._ssleep(0.05)
         waited = self._wait_base_still()
         with self._odom_lock:
             base_xyz = None if self._rover_xyz is None else self._rover_xyz.copy()
@@ -1150,7 +1194,7 @@ class ArmExecutorNode(Node):
         pickup.linear.x, pickup.linear.y, pickup.linear.z = (
             float(mineral_world[0]), float(mineral_world[1]), float(mineral_world[2]))
         pickup.angular.x = 1.0
-        t_start = time.monotonic()
+        t_start = self._smono()
         q = q_above
         held = ""
         reached = z_start
@@ -1170,16 +1214,16 @@ class ArmExecutorNode(Node):
             fb.progress = float(0.25 + 0.2 * k / n_steps)
             fb.message = f"tip +{above:.3f} m"
             goal_handle.publish_feedback(fb)
-            time.sleep(dt)
+            self._ssleep(dt)
             held = self._held_now(t_start)
             if held:
                 break
         if not held:
             # 팔이 명령을 따라오는 지연만큼 조금 더 기다려 본다.
-            t_wait = time.monotonic() + 1.0
-            while time.monotonic() < t_wait and not held:
+            t_wait = self._smono() + 1.0
+            while self._smono() < t_wait and not held:
                 self.grasp_pub.publish(pickup)
-                time.sleep(dt)
+                self._ssleep(dt)
                 held = self._held_now(t_start)
         if not held:
             self.get_logger().warn(
@@ -1201,7 +1245,7 @@ class ArmExecutorNode(Node):
         cur_deg = list(CARGO_DEG)
         settle = float(self.get_parameter("cargo_settle_sec").value)
         if settle > 0.0:
-            time.sleep(settle)
+            self._ssleep(settle)
         self._publish_grasp("release")
         fb = ExecuteArmTask.Feedback()
         fb.state = "RELEASE"
@@ -1246,7 +1290,7 @@ class ArmExecutorNode(Node):
             """집게를 열고 HOME 으로 돌아가 실패로 끝낸다."""
             for _ in range(6):
                 self.grasp_pub.publish(release)
-                time.sleep(0.1)
+                self._ssleep(0.1)
             if cur is not deg_above:
                 self._goto(cur, deg_above, goal_handle, "RETREAT", 0.45, 0.6, duration=2.0)
             self._goto(deg_above, HOME_DEG, goal_handle, "HOME_ABORT", 0.6, 1.0)
@@ -1257,9 +1301,9 @@ class ArmExecutorNode(Node):
         def still_held(timeout: float = 2.0) -> str:
             """지금도 쥐고 있는지. 팔이 막 멈춘 직후에는 손가락 간격이 잠깐
             흔들려 '쥠' 이 한두 번 빠질 수 있으므로 timeout 동안 기다려 본다."""
-            t0 = time.monotonic()
-            while time.monotonic() - t0 < timeout:
-                time.sleep(0.1)
+            t0 = self._smono()
+            while self._smono() - t0 < timeout:
+                self._ssleep(0.1)
                 name = self._held_now(t0)
                 if name:
                     return name
@@ -1283,27 +1327,27 @@ class ArmExecutorNode(Node):
             fb.progress = float(0.25 + 0.15 * k / n_steps)
             fb.message = f"palm +{above:.3f} m"
             goal_handle.publish_feedback(fb)
-            time.sleep(dt)
-        time.sleep(0.8)          # 팔이 명령을 따라잡을 시간 (실측 지연 0.3~0.4 s)
+            self._ssleep(dt)
+        self._ssleep(0.8)          # 팔이 명령을 따라잡을 시간 (실측 지연 0.3~0.4 s)
 
         # ── 닫기: 손가락이 광물에 막혀 멈출 때까지 ──
-        t_close = time.monotonic()
+        t_close = self._smono()
         deadline = t_close + float(self.get_parameter("friction_close_timeout_sec").value)
         held = ""
-        while time.monotonic() < deadline and not held:
+        while self._smono() < deadline and not held:
             self.grasp_pub.publish(pickup)
-            time.sleep(0.1)
+            self._ssleep(0.1)
             held = self._held_now(t_close)
         if not held:
             log.warn("friction pick: 집게를 닫았지만 손가락 사이에 광물이 없음 — 실패")
             return give_up(cur_deg, "nothing between the fingers")
-        log.info(f"friction pick: 쥠 — {held} ({time.monotonic() - t_close:.1f} s)")
+        log.info(f"friction pick: 쥠 — {held} ({self._smono() - t_close:.1f} s)")
         fb = ExecuteArmTask.Feedback()
         fb.state = "GRASP_CLOSE"
         fb.progress = 0.45
         fb.message = held
         goal_handle.publish_feedback(fb)
-        time.sleep(0.5)
+        self._ssleep(0.5)
 
         # ── 들기: 마찰만으로 버티는지 확인 ──
         self._goto(cur_deg, deg_above, goal_handle, "LIFT", 0.45, 0.6, duration=2.5)
@@ -1319,7 +1363,7 @@ class ArmExecutorNode(Node):
         cur_deg = list(CARGO_DEG)
         settle = float(self.get_parameter("cargo_settle_sec").value)
         if settle > 0.0:
-            time.sleep(settle)
+            self._ssleep(settle)
         carried = still_held()
         # 열기 = 시뮬레이터가 그 순간 손가락 사이에 있는 광물을 적재 처리.
         self._publish_grasp("release")
@@ -1408,7 +1452,7 @@ class ArmExecutorNode(Node):
         fb.progress = 0.55
         fb.message = "gripper close (placeholder)"
         goal_handle.publish_feedback(fb)
-        time.sleep(0.5)
+        self._ssleep(0.5)
 
         # 7) LIFT (return to HOME briefly)
         self._goto(cur_deg, HOME_DEG, goal_handle, "LIFT", 0.6, 0.75)
@@ -1446,7 +1490,7 @@ class ArmExecutorNode(Node):
                 fb.progress = float((seg_idx + t) / total_steps)
                 fb.message = f"seg {seg_idx + 1}/{total_steps}"
                 goal_handle.publish_feedback(fb)
-                time.sleep(dt)
+                self._ssleep(dt)
             cur = list(target)
 
         self._publish_joint_state(HOME_DEG)
@@ -1471,7 +1515,7 @@ class ArmExecutorNode(Node):
             fb.progress = float(progress_start + (progress_end - progress_start) * t)
             fb.message = tag
             goal_handle.publish_feedback(fb)
-            time.sleep(dt)
+            self._ssleep(dt)
 
     def _publish_joint_state(self, positions_deg: List[float]) -> None:
         goal = self._active_goal

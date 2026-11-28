@@ -61,8 +61,10 @@ class ElevationMap:
         self._cache = None
 
     # ── 스캔 한 장 ──────────────────────────────────────────────────────
-    def integrate(self, pts_body: np.ndarray, p: np.ndarray, R: np.ndarray) -> int:
-        """몸체 좌표의 점 (N, 3) 을 그 시각의 자세 (p, R) 로 world 로 옮겨 쌓는다."""
+    def integrate(self, pts_body: np.ndarray, p: np.ndarray, R: np.ndarray, exclude=()) -> int:
+        """몸체 좌표의 점 (N, 3) 을 그 시각의 자세 (p, R) 로 world 로 옮겨 쌓는다.
+
+        exclude: [(x, y, r)] — 이 원 안에 떨어진 점은 버린다 (다른 로버)."""
         if pts_body.size == 0:
             return 0
         pts = np.asarray(pts_body, dtype=np.float64)
@@ -70,6 +72,10 @@ class ElevationMap:
         pts = pts[~((np.hypot(pts[:, 0], pts[:, 1]) < self.self_radius)
                     & (pts[:, 2] > self.self_above))]
         w = pts @ R.T + p
+        for (ex, ey, er) in exclude:
+            w = w[(w[:, 0] - ex) ** 2 + (w[:, 1] - ey) ** 2 > er * er]
+        if len(w) == 0:
+            return 0
         i, j = self.world_to_cell(w[:, 0], w[:, 1])
         ok = (i >= 0) & (i < self.rows) & (j >= 0) & (j < self.cols)
         if not ok.any():

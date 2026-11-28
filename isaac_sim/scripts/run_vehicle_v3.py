@@ -34,6 +34,10 @@ _p.add_argument("--rovers", nargs="*", default=[],
 _p.add_argument("--spawn-spacing", type=float, default=0.0,
                 help="다중 rover 시 사이 간격 (m). >0 이면 meta spawn_locations "
                      "무시하고 spawn[0] 기준 X 방향으로 N 미터씩 배치 (A* 회피 검증용).")
+_p.add_argument("--spawn", choices=["auto", "spread", "meta"], default="auto",
+                help="다중 rover 출발 자리. spread = 서로 가장 멀리 (장애물·광물·기지에서 떨어진 "
+                     "평지, spawn_spread.py), meta = 지형 meta 의 spawn_locations 순서대로. "
+                     "auto = 2 대 이상이면 spread, 1 대면 meta.")
 _p.add_argument("--render-every", type=int, default=1,
                 help="N step 마다 1회만 렌더 (기본 1 = 매 step). 렌더가 병목인 "
                      "GPU 에서 2 로 주면 물리는 그대로, 카메라/토픽 발행만 "
@@ -46,7 +50,7 @@ _p.add_argument("--max-rtf", type=float, default=None,
 _p.add_argument("--no-viewport", action="store_true",
                 help="GUI 메인 뷰포트 렌더 중단 — 창은 뜨지만 3D 화면은 갱신 안 됨. "
                      "카메라 토픽은 정상. Web HUD 로만 볼 때 GPU 절약.")
-_p.add_argument("--render-preset", choices=["default", "performance"],
+_p.add_argument("--render-preset", choices=["default", "performance", "balanced"],
                 default="default",
                 help="performance = RTX 반사/간접광/AO/반투명 끄고 DLSS Performance. "
                      "화면 톤이 달라지므로 YOLO 검출률 확인 필요.")
@@ -130,6 +134,11 @@ _PERF_PRESET_ARGS = [
 _kit_args = list(_a.kit_arg)
 if _a.render_preset == "performance":
     _kit_args = _PERF_PRESET_ARGS + _kit_args
+elif _a.render_preset == "balanced":
+    # 로버 3 대용: 조명 효과는 performance 처럼 끄되 업스케일은 고화질로 (execMode 2).
+    # 카메라 영상의 선명도는 default 와 비슷하고 (윤곽 분산 489 vs 524), 속도는 3 대에서
+    # default RTF 0.17 → 0.41 (performance 는 0.44).
+    _kit_args = _PERF_PRESET_ARGS + ["--/rtx/post/dlss/execMode=2"] + _kit_args
 
 app = SimulationApp({
     "headless": _a.headless,
@@ -1106,7 +1115,7 @@ def _flip_first_rover(stage) -> None:
 
 
 def _load_rover(stage, world, prim_path: str, spawn,
-                usd_source: str = V3) -> None:
+                usd_source: str = V3, yaw=None) -> None:
     """vehicle_v3 USD 를 prim_path 에 reference + 위치 설정.
 
     usd_source 가 V3 가 아니면 (다중 rover 시 per-rover copy) 별도 파일이라
@@ -1128,7 +1137,15 @@ def _load_rover(stage, world, prim_path: str, spawn,
     if top is None:
         top = xf.AddTranslateOp()
     top.Set(Gf.Vec3d(*spawn))
-    print(f"[run_v3] reference {os.path.basename(usd_source)} @ {prim_path}  spawn={spawn}")
+    if yaw is not None:
+        # 출발 방향. 회전 op 이 이미 있으면 건드리지 않는다 (순서가 바뀌면 자세가 틀어진다).
+        kinds = [op.GetOpType() for op in xf.GetOrderedXformOps()]
+        if all(k == UsdGeom.XformOp.TypeTranslate for k in kinds):
+            xf.AddRotateZOp().Set(math.degrees(float(yaw)))
+        else:
+            print(f"[run_v3]   {prim_path}: 회전 op 이 이미 있어 출발 방향은 그대로 둠 ({kinds})")
+    print(f"[run_v3] reference {os.path.basename(usd_source)} @ {prim_path}  spawn={spawn}"
+          + (f" yaw={math.degrees(float(yaw)):.0f}°" if yaw is not None else ""))
 
 
 def _per_rover_usd_copies(namespaces) -> dict:
@@ -1279,14 +1296,41 @@ def main() -> None:
         spacing = float(_a.spawn_spacing)
         if spacing > 0.0:
             print(f"[run_v3] close-spawn 모드: 간격 {spacing:.2f}m (A* 회피 검증)")
+        spread = []
+        if spacing <= 0.0 and len(_a.rovers) >= 2 and _a.spawn in ("auto", "spread") \
+                or (_a.spawn == "spread" and spacing <= 0.0):
+            try:
+                import numpy as _np
+                from extra_minerals import plan_extra
+                from spawn_spread import min_separation, pick_spread
+                _hm = _np.load(os.path.join(TERRAIN_DIR, "heightmap.npy"))
+                _og = _np.load(os.path.join(TERRAIN_DIR, "obstacle_grid.npy"))
+                _extra = plan_extra(terrain_meta, _hm, _og, _a.mineral_scale) \
+                    if _a.mineral_scale > 1.0 else []
+                spread = pick_spread(terrain_meta, _hm, _og, len(_a.rovers),
+                                     extra_minerals=_extra)
+                if len(spread) < len(_a.rovers):
+                    print(f"[run_v3] 떨어진 출발 자리를 {len(spread)}곳밖에 못 찾음 — meta 순서로 출발")
+                    spread = []
+                else:
+                    print(f"[run_v3] 출발 자리 (서로 가장 멀리, 최소 간격 "
+                          f"{min_separation(spread):.1f} m): "
+                          + json.dumps(dict(zip(_a.rovers, spread)), separators=(",", ":")))
+            except Exception as exc:  # noqa: BLE001 — 출발 자리 때문에 시뮬이 죽지는 않게
+                print(f"[run_v3] 떨어진 출발 자리 계산 실패 ({exc!r}) — meta 순서로 출발")
+                spread = []
         for i, ns in enumerate(_a.rovers):
             prim_path = f"/World/{_ns_to_prim_name(ns)}"
+            spawn_yaw = None
             if spacing > 0.0:
                 spawn_xyz = _close_spawn_for(spots, i, spacing)
+            elif spread:
+                spawn_xyz = (spread[i]["x"], spread[i]["y"], spread[i]["z"] + 0.3)
+                spawn_yaw = spread[i]["yaw"]
             else:
                 spawn_xyz = _spawn_for(spots, i, fallback=(i * 3.0, 0.0, 1.0))
             _load_rover(stage, world, prim_path, spawn_xyz,
-                        usd_source=usd_copies[ns])
+                        usd_source=usd_copies[ns], yaw=spawn_yaw)
             for _ in range(5):
                 app.update()
             n_topics = _patch_topic_names(stage, prim_path, ns)

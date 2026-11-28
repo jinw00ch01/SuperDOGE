@@ -102,6 +102,10 @@ def _score(det: Detection) -> float:
     return float(det.value_score) + 0.1 * float(det.confidence)
 
 
+# 다른 로버가 알려 준 광물로 Detection 을 만들 때 쓰는 가치 점수 (인식 노드와 같은 값).
+SHARED_VALUE_SCORE = {"yellow_mineral": 50.0, "green_gas": 25.0, "blue_mineral": 10.0}
+
+
 def _stop_dist_for(class_name: str, default_m: float) -> float:
     return float(CLASS_STOP_DIST_M.get(class_name, default_m))
 
@@ -152,11 +156,14 @@ def confirm_hits(seen: list, items, now_ns: int, need: int, radius_m: float,
 class _CmdTap:
     """cmd_vel publisher 를 감싸 마지막으로 보낸 진행 방향을 기억한다 (기울기 반사가 쓴다)."""
 
-    def __init__(self, pub) -> None:
+    def __init__(self, pub, guard=None) -> None:
         self._pub = pub
+        self._guard = guard         # Twist → Twist (다른 로버와의 안전 거리)
         self.last_dir = 1.0
 
     def publish(self, msg: Twist) -> None:
+        if self._guard is not None:
+            msg = self._guard(msg)
         if abs(msg.linear.x) > 0.05:
             self.last_dir = 1.0 if msg.linear.x > 0.0 else -1.0
         self._pub.publish(msg)
@@ -355,6 +362,30 @@ class MissionManagerNode(Node):
         self.declare_parameter("rover_position_ttl_sec", 2.0)
         self.declare_parameter("rover_avoid_radius_m", 1.2)
         self.declare_parameter("rover_replan_trigger_m", 0.8)
+        # ── 로버 여러 대 (2026-11-28) ─────────────────────────────────
+        # 안전 거리 (명령을 내보내기 직전에 거른다 — 탐색·접근·귀환 모두):
+        #   가는 방향 앞, 옆으로 corridor 안에 다른 로버가 있을 때
+        #     stop_m 안            → 직진 멈춤 (제자리 회전은 됨 — 계획이 돌아가는 길을 낸다)
+        #     slow_m 안, 상대가 움직이는 중이고 내 번호가 더 큼 → 멈춰서 양보
+        #     slow_m 안, 그 밖      → slow_speed 로 줄임
+        self.declare_parameter("rover_guard_stop_m", 2.0)
+        self.declare_parameter("rover_guard_slow_m", 4.0)
+        self.declare_parameter("rover_guard_corridor_m", 1.1)
+        self.declare_parameter("rover_guard_slow_speed", 0.35)
+        # 다른 로버 둘레의 검출은 버린다 (그 로버가 집어서 싣고 있는 광물이 보인다).
+        self.declare_parameter("rover_near_ignore_m", 1.5)
+        # 광물 공유: 각자 본 광물·집은 자리·"광물 아님" 판정을 1 초마다 알린다.
+        self.declare_parameter("share_topic", "/minerals/shared")
+        self.declare_parameter("share_period_sec", 1.0)
+        self.declare_parameter("share_gone_keep_sec", 60.0)
+        # 이보다 멀리서 잰 광물은 알리지 않는다. 30 m 까지 알렸더니 받은 46 개 중 16 개가
+        # 정답에서 1.5 m 넘게 틀렸다 (logs/tri2). 본 로버는 다가가며 고치지만 받은 쪽은 못 고친다.
+        self.declare_parameter("share_max_range_m", 10.0)
+        # 검출이 이만큼 쌓인 광물만 알린다. 틀린 자리 17 개 중 15 개는 검출 4 번 이하였다
+        # (스쳐 본 몇 장의 거리가 2~5 m 틀림). 진짜 광물은 계속 보이므로 곧 채운다.
+        self.declare_parameter("share_min_hits", 5)
+        # 같은 광물을 둘이 노리면 가까운 쪽이 간다 (차이가 이 값 안이면 번호가 작은 쪽).
+        self.declare_parameter("claim_tie_margin_m", 0.5)
 
         self.phase = "EXPLORE"
         self.mode = "AUTO"
@@ -422,6 +453,8 @@ class MissionManagerNode(Node):
         self._seen_dets: list = []      # confirm_hits 의 기억
         self._seen_mem: list = []       # 같은 것, 기억용 (기준이 낮다)
         self._appr_look_ns: int = 0     # 기억한 자리를 가까이서 보기 시작한 시각 (0 = 아님)
+        self._look_seen_key = None      # 그때의 (목표 검출 시각, 같은 종류의 좌표 없는 검출 시각)
+        self._blind_seen: dict = {}     # 종류 → 좌표 없는 검출을 마지막으로 본 시각 (ns)
         self.yaw_rate: float = 0.0      # odom 자세를 차분한 회전 속도 (rad/s)
         self._yaw_prev = None           # (stamp s, yaw)
         self._blind_hits: list = []     # 좌표 없는 검출을 본 시각들 (ns)
@@ -443,6 +476,12 @@ class MissionManagerNode(Node):
         self.known: list = []
         self.vetoed: list = []                  # [(x, y)] 광물이 아니라고 판정된 자리
         self._chosen_from: int = 0
+        self.other_speed: dict = {}             # rover_id → 속도 추정 (m/s)
+        self._gone: list = []                   # [(x, y, 만료 ns)] 내가 집었거나 없다고 확인한 자리 (알림용)
+        self._gone_seen: list = []              # [(x, y, 만료 ns)] 나 + 남이 알린 자리 (공유 목록에서 다시 안 받음)
+        self._given_up: list = []               # [(x, y)] 내가 여러 번 실패해 지운 자리 (공유로 다시 안 받음)
+        self._guard_state: str = ""             # 안전 거리로 멈춤/감속 중인 상대 ("" = 아님)
+        self.share_stats = {"sent": 0, "got": 0, "added": 0, "gone": 0, "yield": 0}
         # 실제 속력 (odom 위치 차분, m/s) — 멈췄는지·멈추는 데 얼마나 갈지 보는 데 쓴다.
         self.speed: float = 0.0
         self._speed_prev = None                 # (stamp s, x, y)
@@ -491,7 +530,8 @@ class MissionManagerNode(Node):
                 self, ExecuteArmTask, str(self.get_parameter("arm_action_name").value))
 
         self.cmd_pub = _CmdTap(self.create_publisher(
-            Twist, str(self.get_parameter("cmd_vel_topic").value), 10))
+            Twist, str(self.get_parameter("cmd_vel_topic").value), 10),
+            guard=self._rover_guard)
         self._guard_pub = self.cmd_pub._pub
         self.hazard_mark_pub = self.create_publisher(
             PointStamped, str(self.get_parameter("hazard_mark_topic").value), 10)
@@ -586,6 +626,12 @@ class MissionManagerNode(Node):
                 f"topic={claim_topic} radius="
                 f"{float(self.get_parameter('claim_skip_radius_m').value):.2f}m "
                 f"ttl={float(self.get_parameter('claim_ttl_sec').value):.1f}s")
+            share_topic = str(self.get_parameter("share_topic").value)
+            self.share_pub = self.create_publisher(String, share_topic, 10)
+            self.create_subscription(String, share_topic, self._on_shared, 20)
+            self.create_timer(float(self.get_parameter("share_period_sec").value),
+                              self._publish_shared)
+            self.get_logger().info(f"광물 공유 켬 — {share_topic}")
         else:
             self.claim_pub = None
 
@@ -629,19 +675,22 @@ class MissionManagerNode(Node):
             return False
 
         mem_conf = min(min_conf, float(self.get_parameter("memory_min_confidence").value))
+        for d in msg.detections:
+            if d.confidence >= mem_conf and d.world_position.x == 0.0 \
+                    and d.world_position.y == 0.0 and d.world_position.z == 0.0:
+                self._blind_seen[d.class_name] = now_ns
         # 돌다가 본 광물 (좌표 없음) → 잠깐 멈춰서 좌표를 얻는다.
+        sim_ns = self._sim_now()
         if (self.phase == "EXPLORE" and self.lock_target is None and self.mode == "AUTO"
                 and self.yaw_rate > float(self.get_parameter("look_stop_min_yaw_rate").value)
-                and now_ns >= self._look_stop_next_ns
-                and any(d.confidence >= mem_conf and d.world_position.x == 0.0
-                        and d.world_position.y == 0.0 and d.world_position.z == 0.0
-                        for d in msg.detections)):
-            self._blind_hits = [h for h in self._blind_hits if now_ns - h < int(1e9)] + [now_ns]
+                and sim_ns >= self._look_stop_next_ns
+                and any(now_ns - t < int(0.5e9) for t in self._blind_seen.values())):
+            self._blind_hits = [h for h in self._blind_hits if sim_ns - h < int(1e9)] + [sim_ns]
             if len(self._blind_hits) >= int(self.get_parameter("look_stop_hits").value):
                 self._blind_hits = []
-                self._look_stop_until_ns = now_ns + int(
+                self._look_stop_until_ns = sim_ns + int(
                     float(self.get_parameter("look_stop_sec").value) * 1e9)
-                self._look_stop_next_ns = now_ns + int(
+                self._look_stop_next_ns = sim_ns + int(
                     float(self.get_parameter("look_stop_cooldown_sec").value) * 1e9)
                 self.get_logger().info(
                     f"도는 중({self.yaw_rate:.2f} rad/s)에 광물이 보임 — 잠깐 멈춰서 위치를 잰다")
@@ -658,6 +707,8 @@ class MissionManagerNode(Node):
             # Multi-rover: 다른 rover 가 claim 한 mineral 은 후보 제외
             and not self._is_claimed_by_other(
                 d.world_position.x, d.world_position.y)
+            # 다른 로버 바로 옆의 검출 = 그 로버가 집어서 싣고 있는 광물
+            and not self._near_other_rover(d.world_position.x, d.world_position.y)
         ]
         # 기억: 낮은 기준으로 확인된 것을 모두 적는다 (목표 고정과는 별개).
         seen_ok = []
@@ -777,8 +828,8 @@ class MissionManagerNode(Node):
                         self.last_det_stamp_ns = now_ns
                         self.lock_started_ns = now_ns
                         self._appr_best = float("inf")
-                        self._appr_progress_ns = now_ns
-                        self._appr_started_ns = now_ns
+                        self._appr_progress_ns = self._sim_now()
+                        self._appr_started_ns = self._sim_now()
                         self._appr_budget_ns = 0
                         self._appr_unseen_logged = False
             return
@@ -791,7 +842,9 @@ class MissionManagerNode(Node):
 
     def _on_mineral_veto(self, msg: PointStamped) -> None:
         """지도 노드의 판정: 이 자리의 "광물" 은 건물 벽이다. 기억에서 지우고, 가던 중이면 그만둔다."""
-        x, y = float(msg.point.x), float(msg.point.y)
+        self._apply_veto(float(msg.point.x), float(msg.point.y), msg.header.frame_id or "광물")
+
+    def _apply_veto(self, x: float, y: float, label: str) -> None:
         if any(math.hypot(x - vx, y - vy) < 0.3 for vx, vy in self.vetoed):
             return
         self.vetoed.append((x, y))
@@ -803,7 +856,7 @@ class MissionManagerNode(Node):
             self.get_logger().info(
                 f"목표 {tgt.class_name} ({tgt.world_position.x:.2f},{tgt.world_position.y:.2f}) "
                 f"은 광물이 아님 (건물 벽) — 버리고 EXPLORE 로")
-            self._event(f"{msg.header.frame_id or '광물'} 로 본 것이 건물 벽 — 목표에서 뺌")
+            self._event(f"{label} 로 본 것이 건물 벽 — 목표에서 뺌")
             self.target = None
             self.lock_target = None
             self.last_det_stamp_ns = 0
@@ -843,14 +896,24 @@ class MissionManagerNode(Node):
                 if same:
                     if rng <= k["range"] * 1.2:
                         k.update(x=x, y=y, det=d, range=min(rng, k["range"]))
+                    k["src"] = self._my_rover_id        # 내가 직접 봄 — 내 관측으로 알린다
+                    k["n"] = k.get("n", 0) + 1
                     break
             else:
                 self.known.append({"cls": d.class_name, "x": x, "y": y, "range": rng,
-                                   "det": d, "fails": 0})
+                                   "det": d, "fails": 0, "src": self._my_rover_id, "n": 1})
 
-    def _forget_mineral(self, x: float, y: float, radius: float, failed: bool = False) -> None:
-        """(x, y) 근처의 기억을 지운다. failed=True 면 실패 횟수만 올리고 한도를 넘을 때 지운다."""
+    def _forget_mineral(self, x: float, y: float, radius: float, failed: bool = False,
+                        share: bool = True) -> None:
+        """(x, y) 근처의 기억을 지운다. failed=True 면 실패 횟수만 올리고 한도를 넘을 때 지운다.
+
+        share: 집었거나 없다고 확인한 자리(failed=False)를 다른 로버에게도 알린다."""
         limit = int(self.get_parameter("mineral_memory_max_fails").value)
+        if not failed and share:
+            exp = self.get_clock().now().nanoseconds + int(
+                float(self.get_parameter("share_gone_keep_sec").value) * 1e9)
+            self._gone.append((x, y, exp))
+            self._gone_seen.append((x, y, exp))
         keep = []
         for k in self.known:
             if math.hypot(k["x"] - x, k["y"] - y) <= radius:
@@ -861,6 +924,7 @@ class MissionManagerNode(Node):
                     self.get_logger().info(
                         f"광물 기억 삭제: {k['cls']} ({k['x']:.2f},{k['y']:.2f}) — "
                         f"{k['fails']}번 실패")
+                    self._given_up.append((k["x"], k["y"]))
                     continue
             keep.append(k)
         self.known = keep
@@ -878,7 +942,9 @@ class MissionManagerNode(Node):
               "d": round(math.hypot(k["x"] - p.x, k["y"] - p.y), 1), "f": int(k["fails"]),
               # 지금 가고 있는 광물 — HUD 가 고리로 표시한다
               "t": int(tgt is not None and tgt.class_name == k["cls"] and math.hypot(
-                  tgt.world_position.x - k["x"], tgt.world_position.y - k["y"]) < 1.0)}
+                  tgt.world_position.x - k["x"], tgt.world_position.y - k["y"]) < 1.0),
+              # 다른 로버가 가고 있는 광물이면 그 로버 이름
+              "o": (self._claimer_of(k["x"], k["y"]) or ("",))[0]}
              for k in self.known), key=lambda it: it["d"])
         msg = String()
         msg.data = json.dumps({"items": items}, separators=(",", ":"))
@@ -914,6 +980,15 @@ class MissionManagerNode(Node):
     def _on_coverage_cmd(self, msg: Twist) -> None:
         self.last_coverage_cmd = msg
         self.last_coverage_cmd_ns = self.get_clock().now().nanoseconds
+
+    def _sim_now(self) -> int:
+        """시뮬레이션 시각 (ns) — 마지막 odom 의 stamp. 로버 여러 대면 시뮬레이터가 실시간의
+        0.3 배로 돌아서, 벽시계로 잰 "25 초 동안 진척 없음" 은 시뮬레이션의 7.5 초가 된다.
+        로버의 움직임에 걸린 시간을 재는 곳(접근 진척, 가까이서 보기, 멈춰서 보기)은 이 시계를 쓴다."""
+        if self.last_odom is None:
+            return self.get_clock().now().nanoseconds
+        st = self.last_odom.header.stamp
+        return int(st.sec) * 1_000_000_000 + int(st.nanosec)
 
     def _on_odom(self, msg: Odometry) -> None:
         self.last_odom = msg
@@ -1133,6 +1208,7 @@ class MissionManagerNode(Node):
         self.failed_pick_points = []
         self.known = []
         self.vetoed = []
+        self._gone, self._gone_seen, self._given_up = [], [], []
         self.last_error = "" if not self.estop else self.last_error
         self.operator_rtb = False
         restarted = ""
@@ -1346,6 +1422,7 @@ class MissionManagerNode(Node):
 
         now_ns = self.get_clock().now().nanoseconds
         stale_ns = int(float(self.get_parameter("detection_stale_sec").value) * 1e9)
+        self._yield_if_contested()
         if self.lock_target is None and self.phase == "EXPLORE":
             self._choose_target(now_ns)
         det_fresh = (self.target is not None) and (now_ns - self.last_det_stamp_ns < stale_ns)
@@ -1407,8 +1484,8 @@ class MissionManagerNode(Node):
                 self.lock_target = self.target
                 self.lock_started_ns = now_ns
                 self._appr_best = float("inf")
-                self._appr_progress_ns = now_ns
-                self._appr_started_ns = now_ns
+                self._appr_progress_ns = self._sim_now()
+                self._appr_started_ns = self._sim_now()
                 self._appr_budget_ns = 0
                 self._appr_unseen_logged = False
                 if self._chosen_from >= 2:
@@ -1444,7 +1521,7 @@ class MissionManagerNode(Node):
             stale_sec = float(self.get_parameter("coverage_cmd_stale_sec").value)
             cmd_age = (now_ns - self.last_coverage_cmd_ns) / 1e9 \
                 if self.last_coverage_cmd_ns else float("inf")
-            if in_resume_cooldown or now_ns < self._look_stop_until_ns:
+            if in_resume_cooldown or self._sim_now() < self._look_stop_until_ns:
                 self.cmd_pub.publish(Twist())
             elif self.last_coverage_cmd is not None and cmd_age < stale_sec:
                 self.cmd_pub.publish(self.last_coverage_cmd)
@@ -1645,17 +1722,24 @@ class MissionManagerNode(Node):
         looking = (float(self.get_parameter("mineral_look_min_m").value) <= dist
                    <= float(self.get_parameter("mineral_look_max_m").value)
                    and off <= math.radians(float(self.get_parameter("mineral_look_cone_deg").value)))
-        if not looking or self.last_det_stamp_ns >= self._appr_look_ns > 0:
-            self._appr_look_ns = now_ns if looking else 0
+        if not looking:
+            self._appr_look_ns = 0
             return False
-        if self._appr_look_ns == 0:
-            self._appr_look_ns = now_ns
+        # "보였다" = 목표의 검출이 갱신됐거나, 같은 종류가 좌표 없이(도는 중이라) 보였다.
+        # 처음에는 좌표 있는 검출만 셌는데, 다가가며 방향을 트는 동안에는 좌표가 안 나와서
+        # 화면에 뚜렷이 보이는 진짜 광물을 5 번 지웠다 (logs/tri2).
+        sim = self._sim_now()
+        key = (self.last_det_stamp_ns, self._blind_seen.get(self.target.class_name, 0))
+        if self._appr_look_ns == 0 or key != self._look_seen_key:
+            self._appr_look_ns = sim
+            self._look_seen_key = key
             return False
-        return now_ns - self._appr_look_ns > int(
+        return sim - self._appr_look_ns > int(
             float(self.get_parameter("mineral_look_sec").value) * 1e9)
 
     def _approach_progress(self, now_ns: int) -> bool:
         """접근이 진척되고 있는가. 아니면 목표를 한동안 제외하고 False (→ EXPLORE)."""
+        wall_ns, now_ns = now_ns, self._sim_now()       # 진척은 시뮬레이션 시각으로 잰다
         rem = self._approach_remaining()
         if not math.isfinite(rem):
             return True
@@ -1690,7 +1774,7 @@ class MissionManagerNode(Node):
             return True
         tx, ty = self.target.world_position.x, self.target.world_position.y
         ignore_ns = int(float(self.get_parameter("failed_pick_ignore_sec").value) * 1e9)
-        self.failed_pick_points.append((tx, ty, now_ns + ignore_ns))
+        self.failed_pick_points.append((tx, ty, wall_ns + ignore_ns))
         self._forget_mineral(tx, ty, 1.0, failed=True)
         self.get_logger().warn(
             f"APPROACH 포기: {self.target.class_name} ({tx:.2f},{ty:.2f}) — {why} "
@@ -1709,7 +1793,7 @@ class MissionManagerNode(Node):
             return
         now_ns = self.get_clock().now().nanoseconds
         self.other_claims[rid] = (
-            float(msg.point.x), float(msg.point.y), now_ns)
+            float(msg.point.x), float(msg.point.y), now_ns, float(msg.point.z))
 
     def _publish_claim(self) -> None:
         """phase 가 APPROACH/PICK_READY 일 때 자신 target XY publish."""
@@ -1724,7 +1808,9 @@ class MissionManagerNode(Node):
         msg.header.frame_id = self._my_rover_id
         msg.point.x = float(self.target.world_position.x)
         msg.point.y = float(self.target.world_position.y)
-        msg.point.z = 0.0
+        # z = 목표까지 남은 거리 (겹치면 가까운 쪽이 간다). 집는 중이면 −1 (양보 안 함).
+        msg.point.z = -1.0 if (self.phase == "PICK_READY" or self.arm_in_flight) \
+            else float(self._distance_to_target())
         self.claim_pub.publish(msg)
 
     def _on_rover_position(self, msg: PointStamped) -> None:
@@ -1733,6 +1819,11 @@ class MissionManagerNode(Node):
         if not rid or rid == self._my_rover_id:
             return
         now_ns = self.get_clock().now().nanoseconds
+        prev = self.other_rovers.get(rid)
+        if prev is not None and 0.05e9 < now_ns - prev[2] < 2e9:
+            v = math.hypot(float(msg.point.x) - prev[0], float(msg.point.y) - prev[1]) \
+                / ((now_ns - prev[2]) * 1e-9)
+            self.other_speed[rid] = 0.6 * self.other_speed.get(rid, v) + 0.4 * v
         self.other_rovers[rid] = (
             float(msg.point.x), float(msg.point.y), now_ns)
 
@@ -1820,7 +1911,7 @@ class MissionManagerNode(Node):
         ttl_ns = int(float(self.get_parameter("claim_ttl_sec").value) * 1e9)
         now_ns = self.get_clock().now().nanoseconds
         skip_r2 = skip_r * skip_r
-        for rid, (cx, cy, ts) in list(self.other_claims.items()):
+        for rid, (cx, cy, ts, _d) in list(self.other_claims.items()):
             if now_ns - ts > ttl_ns:
                 self.other_claims.pop(rid, None)
                 continue
@@ -1829,6 +1920,198 @@ class MissionManagerNode(Node):
             if dx * dx + dy * dy < skip_r2:
                 return True
         return False
+
+    def _claimer_of(self, x: float, y: float):
+        """(x, y) 의 광물을 노리는 다른 로버 → (rover_id, 그 로버의 남은 거리) 또는 None."""
+        skip_r = float(self.get_parameter("claim_skip_radius_m").value)
+        ttl_ns = int(float(self.get_parameter("claim_ttl_sec").value) * 1e9)
+        now_ns = self.get_clock().now().nanoseconds
+        best = None
+        for rid, (cx, cy, ts, d) in self.other_claims.items():
+            if now_ns - ts <= ttl_ns and math.hypot(x - cx, y - cy) < skip_r:
+                if best is None or d < best[1]:
+                    best = (rid, d)
+        return best
+
+    def _yield_if_contested(self) -> None:
+        """내 목표를 다른 로버도 노리고 있으면 가까운 쪽이 간다 (먼 쪽인 내가 양보)."""
+        if self.phase != "APPROACH" or self.arm_in_flight or self.claim_pub is None:
+            return
+        tgt = self.lock_target or self.target
+        if tgt is None:
+            return
+        other = self._claimer_of(tgt.world_position.x, tgt.world_position.y)
+        if other is None:
+            return
+        rid, od = other
+        mine = self._distance_to_target()
+        margin = float(self.get_parameter("claim_tie_margin_m").value)
+        if not (od < 0.0 or od < mine - margin
+                or (abs(od - mine) <= margin and rid < self._my_rover_id)):
+            return
+        self.share_stats["yield"] += 1
+        why = "집는 중" if od < 0.0 else f"{od:.1f} m, 나는 {mine:.1f} m"
+        self.get_logger().info(
+            f"목표 양보: {tgt.class_name} ({tgt.world_position.x:.2f},"
+            f"{tgt.world_position.y:.2f}) — {rid} 도 이 광물로 가는 중 ({why}). 다른 광물을 찾는다")
+        self._event(f"{rid} 와 목표가 겹침 — 양보하고 다른 광물로")
+        self.target = None
+        self.lock_target = None
+        self.last_det_stamp_ns = 0
+
+    # ── 광물 공유 ───────────────────────────────────────────────────────
+    def _publish_shared(self) -> None:
+        """내가 직접 본 광물, 집었거나 없다고 확인한 자리, "광물 아님" 판정을 알린다."""
+        import json
+        now_ns = self.get_clock().now().nanoseconds
+        self._gone = [g for g in self._gone if g[2] > now_ns]
+        self._gone_seen = [g for g in self._gone_seen if g[2] > now_ns]
+        msg = String()
+        msg.data = json.dumps({
+            "id": self._my_rover_id,
+            "known": [[k["cls"], round(k["x"], 2), round(k["y"], 2),
+                       round(float(k["det"].world_position.z), 2), round(k["range"], 1)]
+                      for k in self.known if k.get("src", self._my_rover_id) == self._my_rover_id
+                      and k["range"] <= float(self.get_parameter("share_max_range_m").value)
+                      and k.get("n", 0) >= int(self.get_parameter("share_min_hits").value)],
+            "gone": [[round(g[0], 2), round(g[1], 2)] for g in self._gone],
+            "veto": [[round(v[0], 2), round(v[1], 2)] for v in self.vetoed],
+        }, separators=(",", ":"))
+        self.share_pub.publish(msg)
+        self.share_stats["sent"] += 1
+
+    def _on_shared(self, msg: String) -> None:
+        import json
+        try:
+            d = json.loads(msg.data)
+        except ValueError:
+            return
+        rid = str(d.get("id", ""))
+        if not rid or rid == self._my_rover_id:
+            return
+        self.share_stats["got"] += 1
+        now_ns = self.get_clock().now().nanoseconds
+        for v in d.get("veto") or []:
+            self._apply_veto(float(v[0]), float(v[1]), f"{rid} 의 판정")
+        keep_ns = int(float(self.get_parameter("share_gone_keep_sec").value) * 1e9)
+        for g in d.get("gone") or []:
+            gx, gy = float(g[0]), float(g[1])
+            if any(math.hypot(gx - a, gy - b) < 0.5 for a, b, _ in self._gone_seen):
+                continue
+            self._gone_seen.append((gx, gy, now_ns + keep_ns))
+            self.share_stats["gone"] += 1
+            self._forget_mineral(gx, gy, 1.0, share=False)
+            tgt = self.lock_target or self.target
+            if tgt is not None and not self.arm_in_flight and self.phase != "PICK_READY" \
+                    and math.hypot(tgt.world_position.x - gx, tgt.world_position.y - gy) <= 1.0:
+                self.get_logger().info(
+                    f"목표 {tgt.class_name} ({gx:.2f},{gy:.2f}) 은 {rid} 가 이미 처리함 — 버림")
+                self._event(f"{rid} 가 그 광물을 이미 집음 — 목표에서 뺌")
+                self.target = None
+                self.lock_target = None
+                self.last_det_stamp_ns = 0
+        # 그 로버에게서 받아 적은 것 중 그 로버의 목록에서 빠진 것은 지운다 — 그 로버가 다가가며
+        # 위치를 고쳤거나 지운 것이다. (안 지우면 고치기 전의 자리가 따로 남는다.)
+        theirs = [(str(it[0]), float(it[1]), float(it[2])) for it in d.get("known") or []]
+        tgt = self.lock_target or self.target
+        kept = []
+        for k in self.known:
+            stale = k.get("src") == rid and not any(
+                c == k["cls"] and math.hypot(k["x"] - a, k["y"] - b)
+                < max(1.0, 0.15 * k["range"]) for c, a, b in theirs)
+            if stale and tgt is not None and math.hypot(
+                    tgt.world_position.x - k["x"], tgt.world_position.y - k["y"]) <= 1.0:
+                stale = False                   # 지금 가고 있는 목표는 건드리지 않는다
+            if stale:
+                self.share_stats["dropped"] = self.share_stats.get("dropped", 0) + 1
+            else:
+                kept.append(k)
+        self.known = kept
+        for it in d.get("known") or []:
+            cls, x, y, z, rng = str(it[0]), float(it[1]), float(it[2]), float(it[3]), float(it[4])
+            if self._is_vetoed(x, y) \
+                    or any(math.hypot(x - a, y - b) < 1.0 for a, b, _ in self._gone_seen) \
+                    or any(math.hypot(x - a, y - b) < 1.0 for a, b in self._given_up):
+                continue
+            det = Detection()
+            det.class_name = cls
+            det.world_position.x, det.world_position.y, det.world_position.z = x, y, z
+            det.confidence = 0.6
+            det.value_score = float(SHARED_VALUE_SCORE.get(cls, 0.0))
+            det.mineral_id = -1
+            for k in self.known:
+                if k["cls"] != cls:
+                    continue
+                if math.hypot(k["x"] - x, k["y"] - y) < max(1.0, 0.15 * max(rng, k["range"])):
+                    # 같은 광물 — 훨씬 가까이서 잰 값이면 그쪽 위치로 고친다.
+                    if rng < 0.8 * k["range"]:
+                        k.update(x=x, y=y, det=det, range=rng)
+                    break
+            else:
+                self.known.append({"cls": cls, "x": x, "y": y, "range": rng, "det": det,
+                                   "fails": 0, "src": rid})
+                self.share_stats["added"] += 1
+                self.get_logger().info(
+                    f"{rid} 가 알려 준 광물을 적음: {cls} ({x:.2f},{y:.2f}) "
+                    f"(기억 {len(self.known)}개)")
+
+    def _near_other_rover(self, x: float, y: float) -> bool:
+        """(x, y) 가 다른 로버 바로 옆인가 — 그 로버가 싣고 있는 광물일 수 있다."""
+        if not self.other_rovers:
+            return False
+        r = float(self.get_parameter("rover_near_ignore_m").value)
+        return any(math.hypot(x - ox, y - oy) < r
+                   for (ox, oy) in self._other_rovers_alive().values())
+
+    def _rover_guard(self, msg: Twist) -> Twist:
+        """다른 로버와의 안전 거리 — 내보내는 주행 명령의 직진 속도를 줄이거나 0 으로."""
+        if getattr(self, "rover_pos_pub", None) is None or self.last_odom is None \
+                or abs(msg.linear.x) < 0.02 or not self.other_rovers:
+            if self._guard_state and abs(msg.linear.x) >= 0.02:
+                self._guard_state = ""
+            return msg
+        others = self._other_rovers_alive()
+        pose = self.last_odom.pose.pose
+        q = pose.orientation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        if msg.linear.x < 0.0:
+            yaw += math.pi
+        ux, uy = math.cos(yaw), math.sin(yaw)
+        stop_m = float(self.get_parameter("rover_guard_stop_m").value)
+        slow_m = float(self.get_parameter("rover_guard_slow_m").value)
+        corridor = float(self.get_parameter("rover_guard_corridor_m").value)
+        limit, who, why = None, "", ""
+        for rid, (ox, oy) in others.items():
+            dx, dy = ox - pose.position.x, oy - pose.position.y
+            d = math.hypot(dx, dy)
+            ahead, lat = dx * ux + dy * uy, abs(-dx * uy + dy * ux)
+            if d > slow_m or ahead <= 0.0:
+                continue
+            if d <= stop_m and lat <= corridor:
+                limit, who, why = 0.0, rid, f"{d:.1f} m 앞 — 멈춤"
+                break
+            if lat > corridor + 0.4:
+                continue
+            if self.other_speed.get(rid, 0.0) > 0.15 and self._my_rover_id > rid:
+                limit, who, why = 0.0, rid, f"{d:.1f} m 앞에서 움직이는 중 — 멈춰서 양보"
+            elif limit is None:
+                limit = float(self.get_parameter("rover_guard_slow_speed").value)
+                who, why = rid, f"{d:.1f} m 앞 — 천천히"
+        if limit is None:
+            self._guard_state = ""
+            return msg
+        key = f"{who}:{'stop' if limit == 0.0 else 'slow'}"
+        if key != self._guard_state:
+            self._guard_state = key
+            self.get_logger().info(f"로버 간 안전 거리: {who} 가 {why}")
+            if limit == 0.0:
+                self._event(f"{who} 가 가까움 — 멈춤")
+        if abs(msg.linear.x) <= limit:
+            return msg
+        out = Twist()
+        out.angular.z = msg.angular.z
+        out.linear.x = math.copysign(limit, msg.linear.x)
+        return out
 
     def _on_hazard_map(self, msg) -> None:
         """새 위험 지도 → 계획용 격자 갱신. 가던 경로가 막혔으면 버리고 다시 짠다."""

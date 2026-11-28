@@ -148,6 +148,13 @@ class HazardMapNode(Node):
         self.min_conf = float(self.get_parameter("mineral_min_confidence").value)
         self.mineral_range = float(self.get_parameter("mineral_max_range_m").value)
 
+        # 다른 로버: 깊이 카메라·지형 스캐너에 찍힌 다른 로버를 지도에 남기지 않는다.
+        self.declare_parameter("rover_positions_topic", "")     # "" = 끔 (단일 로버)
+        self.declare_parameter("rover_id", "")
+        self.declare_parameter("rover_mask_radius_m", 1.2)
+        self._others: dict = {}                 # rover_id → (x, y, 받은 시각 ns)
+        self.n_masked = 0
+
         self.K = None
         self._odom = deque(maxlen=600)          # (t, p, q)
         self._arm_dev = None                    # HOME 에서 가장 많이 벗어난 관절 (rad)
@@ -193,6 +200,10 @@ class HazardMapNode(Node):
                 String, str(self.get_parameter("elevation_topic").value), 5)
             self.create_timer(0.5, self._publish_elevation)
             self.get_logger().info(f"지형 스캐너 사용: {scan_topic} → 높이 지도")
+        self._my_rover_id = str(self.get_parameter("rover_id").value).strip()
+        pos_topic = str(self.get_parameter("rover_positions_topic").value).strip()
+        if pos_topic:
+            self.create_subscription(PointStamped, pos_topic, self._on_rover_position, 20)
         self.veto_pub = self.create_publisher(
             PointStamped, str(self.get_parameter("veto_topic").value), 10)
         if scan_topic:
@@ -383,6 +394,23 @@ class HazardMapNode(Node):
             m.point.x, m.point.y, m.point.z = x, y, z
             self.veto_pub.publish(m)
 
+    def _on_rover_position(self, msg) -> None:
+        rid = (msg.header.frame_id or "").strip()
+        if rid and rid != self._my_rover_id:
+            self._others[rid] = (float(msg.point.x), float(msg.point.y),
+                                 self.get_clock().now().nanoseconds)
+
+    def _other_rovers(self) -> list:
+        """지금 살아 있는 다른 로버의 [(x, y, 가릴 반경)]."""
+        if not self._others:
+            return []
+        now = self.get_clock().now().nanoseconds
+        r = float(self.get_parameter("rover_mask_radius_m").value)
+        out = [(x, y, r) for (x, y, ts) in self._others.values() if now - ts < int(3e9)]
+        if out:
+            self.n_masked += 1
+        return out
+
     def _pose_at(self, t: float):
         buf = self._odom
         if len(buf) < 2 or abs(t - buf[-1][0]) > 1.0:
@@ -404,7 +432,7 @@ class HazardMapNode(Node):
             return
         raw = np.frombuffer(msg.data, dtype=np.uint8).reshape(-1, msg.point_step)
         pts = np.ascontiguousarray(raw[:, :12]).view(np.float32).reshape(-1, 3)
-        self.em.integrate(pts, pose[0], pose[1])
+        self.em.integrate(pts, pose[0], pose[1], exclude=self._other_rovers())
         self.n_scans += 1
 
     def _elevation_hazard(self) -> np.ndarray:
@@ -492,7 +520,8 @@ class HazardMapNode(Node):
         self._last_t = t
         fx, fy, cx, cy = self.K
         s = self.stride
-        if self.hm.integrate(depth[::s, ::s], fx, fy, cx, cy, pose[0], pose[1], stride=s):
+        if self.hm.integrate(depth[::s, ::s], fx, fy, cx, cy, pose[0], pose[1], stride=s,
+                             exclude=self._other_rovers()):
             self.n_used += 1
 
     # ── 출력 ────────────────────────────────────────────────────────────

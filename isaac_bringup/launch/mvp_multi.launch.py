@@ -112,6 +112,8 @@ def _rover_group(ns: str, terrain_dir: str, collection_goal: int,
                 "scan_topic":       f"{nsp}/terrain_scan" if terrain_scan else "",
                 "elevation_topic":  f"{nsp}/elevation/summary",
                 "veto_topic":       f"{nsp}/hazard_map/not_mineral",
+                "rover_positions_topic": "/rover_positions",
+                "rover_id":         ns,
                 "mark_topic":       f"{nsp}/hazard_map/mark",
                 "cmd_topic":        f"{nsp}/cmd_vel",
             }],
@@ -178,6 +180,7 @@ def _rover_group(ns: str, terrain_dir: str, collection_goal: int,
                 "enable_minimap": False,
                 "enable_minimap_topics": True,
                 "minimap_rover_id": ns,
+                "rover_positions_topic": "/rover_positions",
                 "reveal_radius": reveal_radius,
             }],
             remappings=[
@@ -267,7 +270,8 @@ def _rover_group(ns: str, terrain_dir: str, collection_goal: int,
 
 def _launch_setup(context, *args, **kwargs):
     rovers_str = LaunchConfiguration("rovers").perform(context).strip()
-    rovers = [r for r in rovers_str.split() if r]
+    # 공백이나 쉼표로 구분 (쉼표면 셸에서 따옴표 없이 쓸 수 있다: rovers:=rover_1,rover_2,rover_3)
+    rovers = [r for r in rovers_str.replace(",", " ").split() if r]
     if not rovers:
         rovers = ["rover_1", "rover_2"]
     terrain_id = LaunchConfiguration("terrain_id").perform(context)
@@ -343,7 +347,7 @@ def generate_launch_description() -> LaunchDescription:
     return LaunchDescription([
         DeclareLaunchArgument(
             "rovers", default_value="rover_1 rover_2",
-            description="공백 구분 namespace 리스트. 예: 'rover_1 rover_2 rover_3'"),
+            description="공백 또는 쉼표 구분 namespace 리스트. 예: rover_1,rover_2,rover_3"),
         DeclareLaunchArgument(
             "terrain_id", default_value="terrain_00026",
             description="T1 Isaac Sim 의 --terrain 인자와 동일해야 obstacle_grid 정합."),
