@@ -24,6 +24,28 @@
   // byRover[rid] = {state, odom, path, target, minimap}
   const byRover = {};
   let activeRover = "";  // 선택된 rover_id (selector 와 연동)
+
+  // 광물 아이콘 — 지도 캔버스와 범례(index.html 의 svg)가 같은 path 를 쓴다. 16 px 상자, 중심 (0,0).
+  //   blue_mineral   파란 결정 (위아래가 뾰족한 육각 기둥)
+  //   yellow_mineral 노란 보석 (위가 평평하고 아래가 뾰족한 컷)
+  //   green_gas      초록 가스통 (몸통 + 마개)
+  const MINERAL_ICONS = {
+    blue_mineral: {
+      fill: "#3d9bff", dark: "#0b3d80",
+      outline: new Path2D("M0,-9 L6,-3 L6,4 L0,9 L-6,4 L-6,-3 Z"),
+      detail: new Path2D("M-6,-3 L0,1 L6,-3 M0,1 L0,9"),
+    },
+    yellow_mineral: {
+      fill: "#ffd21f", dark: "#7a5a00",
+      outline: new Path2D("M-5,-7 L5,-7 L9,-2 L0,9 L-9,-2 Z"),
+      detail: new Path2D("M-9,-2 L9,-2 M-5,-7 L-3,-2 L0,9 L3,-2 L5,-7"),
+    },
+    green_gas: {
+      fill: "#35d96a", dark: "#0b5a26",
+      outline: new Path2D("M-3,-9 L3,-9 L3,-6 L6,-6 L6,8 L-6,8 L-6,-6 L-3,-6 Z"),
+      detail: new Path2D("M-6,-1 L6,-1 M-6,3 L6,3"),
+    },
+  };
   let knownRovers = [""]; // backend 가 connect 시 emit 한 namespace 리스트
 
   // rover_id → minimap overlay 색. 추가 rover 는 cycle.
@@ -346,9 +368,53 @@
       ctx.restore();
     }
 
+    // 기억한 (아직 못 모은) 광물 — 종류마다 다른 모양·색의 아이콘 (지도 위 범례와 같은 그림).
+    // 숫자는 로버에서 가까운 순서 (1 = 다음 차례), 분홍 고리는 지금 가고 있는 광물.
+    for (const rid in byRover) {
+      const m = byRover[rid].minerals;
+      if (!m || !Array.isArray(m.items)) continue;
+      m.items.forEach((it, k) => {
+        if (!Number.isFinite(it.x) || !Number.isFinite(it.y)) return;
+        const icon = MINERAL_ICONS[it.c] || MINERAL_ICONS.blue_mineral;
+        const [mx, my] = worldToPx(it.x, it.y);
+        ctx.save();
+        ctx.globalAlpha = (rid === activeRover) ? 1.0 : 0.6;
+        ctx.translate(mx, my);
+        if (it.t) {
+          ctx.strokeStyle = "#ff5ce0";
+          ctx.lineWidth = 2.5;
+          ctx.beginPath();
+          ctx.arc(0, 0, 13, 0, 2 * Math.PI);
+          ctx.stroke();
+        }
+        ctx.lineJoin = "round";
+        ctx.strokeStyle = "#000";
+        ctx.lineWidth = 3;
+        ctx.stroke(icon.outline);
+        ctx.fillStyle = icon.fill;
+        ctx.fill(icon.outline);
+        ctx.strokeStyle = icon.dark;
+        ctx.lineWidth = 1;
+        ctx.stroke(icon.detail);
+        ctx.font = "bold 11px monospace";
+        ctx.textAlign = "left";
+        ctx.textBaseline = "middle";
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = "#000";
+        ctx.strokeText(String(k + 1), 11, -7);
+        ctx.fillStyle = "#ffffff";
+        ctx.fillText(String(k + 1), 11, -7);
+        ctx.restore();
+      });
+    }
+
     // 모든 rover 의 target marker (분홍 별).
+    // 별은 "집으러 갈 광물이 하나도 없을 때" 의 탐색 목표에만 쓴다. 기억한 광물이 있으면
+    // 목표는 그 광물의 아이콘(분홍 고리)으로 보인다.
     for (const rid in byRover) {
       const t = byRover[rid].target;
+      const known = byRover[rid].minerals;
+      if (known && Array.isArray(known.items) && known.items.length > 0) continue;
       if (t && Number.isFinite(t.x) && Number.isFinite(t.y)) {
         const [tx, ty] = worldToPx(t.x, t.y);
         ctx.save();
@@ -482,6 +548,11 @@
   sock.on("path", (p) => {
     const rid = p.rover_id || "";
     ensureRover(rid).path = p;
+    paintMap();
+  });
+  sock.on("minerals", (m) => {
+    const rid = m.rover_id || "";
+    ensureRover(rid).minerals = m;
     paintMap();
   });
   sock.on("target", (t) => {

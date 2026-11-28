@@ -86,10 +86,15 @@ VALUE_PRIORITY = {"yellow_mineral": 50.0, "green_gas": 25.0, "blue_mineral": 10.
 # Per-class stop distance — balanced for wrist cam visibility (max depth ~1.1m)
 # and rover P-control overshoot. T2 standalone uses tighter values (0.25 blue,
 # 0.75 yellow/green) but assumes precise rover positioning; we widen here.
+#
+# 2026-11-28: 0.55 / 0.70 → 0.47 / 0.60. 예전 값은 "멈추라는 명령 뒤에 0.1~0.16 m 더 굴러간다"
+# 를 전제로 한 것이었다 (실제로 선 자리: 파랑 0.40~0.45, 초록·노랑 0.51~0.59). 명령 지연을
+# 없애고 나니 명령한 자리에 그대로 서서 (0.61~0.77), 팔이 닿는 한계(받침대에서 0.72 m 쯤,
+# logs/min2_fix3 "out of reach x=0.77") 에 걸렸다. 서는 자리를 예전에 실제로 서던 곳으로 맞춘다.
 CLASS_STOP_DIST_M = {
-    "blue_mineral":   0.55,
-    "yellow_mineral": 0.70,
-    "green_gas":      0.70,
+    "blue_mineral":   0.47,
+    "yellow_mineral": 0.60,
+    "green_gas":      0.60,
 }
 
 
@@ -196,9 +201,67 @@ class MissionManagerNode(Node):
         self.declare_parameter("enable_arm_action", True)
         self.declare_parameter("approach_lin_speed", 0.6)
         self.declare_parameter("approach_creep_speed", 0.25)
+        # 멈출 자리를 지나치지 않게 속도를 줄이는 기준 (_approach_speed).
+        #   approach_brake_decel_m_s2 : 줄일 때 쓰는 감속도. 구동부 한계(화성 0.72)보다 낮게.
+        #   approach_brake_delay_sec  : 명령이 바퀴에 닿기까지의 지연 — 그동안 가는 거리를 뺀다.
+        #   approach_creep_lead_m     : 멈출 자리의 이만큼 앞에서 이미 느린 속도가 되게.
+        self.declare_parameter("approach_brake_decel_m_s2", 0.4)
+        self.declare_parameter("approach_brake_delay_sec", 0.3)
+        self.declare_parameter("approach_creep_lead_m", 0.35)
+        # 멈춘 뒤 광물이 받침대에서 이보다 가까우면(지나쳤으면) 집기 전에 물러난다.
+        # 반대로 멈춘 자리가 stop 거리 + pick_reach_slack_m 보다 멀면 (비탈에서 뒤로 밀림)
+        # 천천히 다가가서 맞춘다.
+        self.declare_parameter("pick_min_dist_m", 0.30)
+        self.declare_parameter("pick_backoff_speed", 0.15)
+        self.declare_parameter("pick_reach_slack_m", 0.06)
         self.declare_parameter("steer_gain", 1.5)
         self.declare_parameter("detection_stale_sec", 1.5)
-        self.declare_parameter("approach_lock_timeout_sec", 8.0)
+        # 접근을 포기하는 기준. 예전에는 "마지막으로 본 지 8 초" 였는데, 장애물을 돌아가는
+        # 동안에는 카메라가 광물을 등지므로 접근의 절반이 그 8 초에 걸려 끊겼다 (광물은
+        # 움직이지 않으니 안 보인다고 버릴 이유가 없다). 지금은 "가까워지고 있는가" 로 본다:
+        # 남은 경로 길이가 approach_stall_sec 동안 approach_stall_progress_m 만큼도 줄지
+        # 않으면 포기하고, 전체로는 approach_budget_base_sec + 처음 경로 길이 ×
+        # approach_budget_sec_per_m 를 넘기지 않는다.
+        # 본 광물을 기억해 두는 목록 (_remember_minerals). 지금 안 보여도 가까운 것부터 찾아간다.
+        #   mineral_memory_range_m : 이보다 멀리서 본 것은 적지 않는다. 처음에는 12 m 로 두었는데
+        #       13 m·23 m 밖에서 또렷이 보이는 광물이 지도에도 안 뜨고 가지도 않았다
+        #       (logs/min2_fix5 t=128). 멀리서 잰 거리는 틀릴 수 있지만 가까이서 다시 잰 값으로
+        #       고치면 된다 (_remember_minerals) — 접근을 시작하는 거리(30 m)까지 적는다.
+        #   target_switch_margin_m : 접근 중에 이만큼 더 가까운 광물이 보이면 그쪽으로 바꾼다
+        #   mineral_memory_max_fails : 접근·집기에 이만큼 실패한 자리는 목록에서 지운다
+        # 지도 노드가 "광물이 아님 (건물 벽)" 이라고 알려 오는 자리 — 그 둘레의 검출은 무시한다.
+        self.declare_parameter("mineral_veto_topic", "/hazard_map/not_mineral")
+        self.declare_parameter("mineral_veto_radius_m", 1.0)
+        # 기억한 광물 목록을 HUD 지도에 그리도록 내보내는 토픽 (JSON, 1 Hz).
+        self.declare_parameter("known_minerals_topic", "/mission/known_minerals")
+        self.declare_parameter("mineral_memory_range_m", 30.0)
+        # 기억에 적는 기준은 목표로 고정하는 기준(0.6, 3 번)보다 낮다. 지나가며 0.4 s 쯤만
+        # 보인 광물(검출 3 번, 신뢰도 0.53~0.69)이 화면에는 상자로 뜨는데 지도에 안 남고
+        # 가지도 않았다 (logs/min2_fix7 t=19). 잘못 적은 것은 가서 걸러 낸다:
+        #   mineral_look_* : 기억한 자리에 look_max_m 안으로 다가와 그쪽을 look_sec 동안
+        #       보고 있는데 검출이 한 번도 없으면 "없는 것" 으로 지운다 (팔을 뻗기 전에).
+        self.declare_parameter("memory_min_confidence", 0.5)
+        self.declare_parameter("memory_confirm_hits", 2)
+        #       접근 속도가 0.5~0.9 m/s 라 이 구간은 2~3 초면 지나간다 — look_sec 를 4 초로
+        #       두었더니 한 번도 걸리지 않고 빈 자리에 팔을 뻗었다 (logs/min2_turn1 t=130).
+        self.declare_parameter("mineral_look_max_m", 3.5)
+        self.declare_parameter("mineral_look_min_m", 1.0)
+        self.declare_parameter("mineral_look_cone_deg", 20.0)
+        self.declare_parameter("mineral_look_sec", 1.5)
+        # 멈춰서 보기: 인식 노드는 빨리 도는 중(0.25 rad/s 초과)의 검출에 좌표를 주지 않는다
+        # (그때의 좌표는 90 % 오차가 0.24 → 1.86 m 로 커진다 — logs/min2_turn1). 그래서
+        # 탐색 중 제자리에서 돌다가 본 광물은 화면에 상자만 뜨고 지도에 남지 않았다.
+        # 좌표 없는 검출이 look_stop_hits 번 이어지면 look_stop_sec 동안 멈춰서 좌표를 얻는다.
+        self.declare_parameter("look_stop_hits", 2)
+        self.declare_parameter("look_stop_sec", 1.2)
+        self.declare_parameter("look_stop_cooldown_sec", 6.0)
+        self.declare_parameter("look_stop_min_yaw_rate", 0.2)
+        self.declare_parameter("target_switch_margin_m", 1.0)
+        self.declare_parameter("mineral_memory_max_fails", 3)
+        self.declare_parameter("approach_stall_sec", 25.0)
+        self.declare_parameter("approach_stall_progress_m", 0.3)
+        self.declare_parameter("approach_budget_base_sec", 40.0)
+        self.declare_parameter("approach_budget_sec_per_m", 8.0)
         self.declare_parameter("explore_resume_delay_sec", 2.0)
         self.declare_parameter("phase_log_period_sec", 1.0)
         self.declare_parameter("coverage_cmd_topic", "/coverage/cmd_vel_raw")
@@ -357,12 +420,35 @@ class MissionManagerNode(Node):
         self.failed_pick_points: list = []
         self.plan_goal_gap = 0.0        # 마지막 계획의 끝점 ↔ 목표 거리 (m)
         self._seen_dets: list = []      # confirm_hits 의 기억
+        self._seen_mem: list = []       # 같은 것, 기억용 (기준이 낮다)
+        self._appr_look_ns: int = 0     # 기억한 자리를 가까이서 보기 시작한 시각 (0 = 아님)
+        self.yaw_rate: float = 0.0      # odom 자세를 차분한 회전 속도 (rad/s)
+        self._yaw_prev = None           # (stamp s, yaw)
+        self._blind_hits: list = []     # 좌표 없는 검출을 본 시각들 (ns)
+        self._look_stop_until_ns: int = 0
+        self._look_stop_next_ns: int = 0
         self._defer_since_ns = 0
         self.last_plan_ns = 0
         self.last_pick_done_ns: int = 0
         # Target lock-on (kept while APPROACH, even if detection briefly lost)
         self.lock_target: Optional[Detection] = None
         self.lock_started_ns: int = 0
+        # 접근 진척 감시 (_approach_progress): 남은 경로 길이의 최소값과 그것이 줄어든 시각.
+        self._appr_best: float = float("inf")
+        self._appr_progress_ns: int = 0
+        self._appr_started_ns: int = 0
+        self._appr_budget_ns: int = 0
+        self._appr_unseen_logged: bool = False
+        # 본 광물 목록: {"cls", "x", "y", "range"(잰 거리), "det"(Detection), "fails"}
+        self.known: list = []
+        self.vetoed: list = []                  # [(x, y)] 광물이 아니라고 판정된 자리
+        self._chosen_from: int = 0
+        # 실제 속력 (odom 위치 차분, m/s) — 멈췄는지·멈추는 데 얼마나 갈지 보는 데 쓴다.
+        self.speed: float = 0.0
+        self._speed_prev = None                 # (stamp s, x, y)
+        # PICK_READY 에 들어와 아직 팔에 명령을 보내지 않은 상태 (멈추기·물러나기 중).
+        self._pick_pending: bool = False
+        self._pick_adjust: str = ""             # "" | "back" (지나쳐서 물러남) | "fwd" (멀어서 다가감)
         # EXPLORE resume cooldown — force stop briefly after any APPROACH/PICK
         # exit so coverage_node can replan from the rover's new position.
         self.explore_entry_ns: int = 0
@@ -409,6 +495,12 @@ class MissionManagerNode(Node):
         self._guard_pub = self.cmd_pub._pub
         self.hazard_mark_pub = self.create_publisher(
             PointStamped, str(self.get_parameter("hazard_mark_topic").value), 10)
+        self.create_subscription(
+            PointStamped, str(self.get_parameter("mineral_veto_topic").value),
+            self._on_mineral_veto, 10)
+        self.known_pub = self.create_publisher(
+            String, str(self.get_parameter("known_minerals_topic").value), 5)
+        self.create_timer(1.0, self._publish_known)
         self.phase_pub = self.create_publisher(
             String, str(self.get_parameter("phase_topic").value), 10)
         self.state_pub = self.create_publisher(
@@ -536,18 +628,49 @@ class MissionManagerNode(Node):
                     return True
             return False
 
-        candidates = [
+        mem_conf = min(min_conf, float(self.get_parameter("memory_min_confidence").value))
+        # 돌다가 본 광물 (좌표 없음) → 잠깐 멈춰서 좌표를 얻는다.
+        if (self.phase == "EXPLORE" and self.lock_target is None and self.mode == "AUTO"
+                and self.yaw_rate > float(self.get_parameter("look_stop_min_yaw_rate").value)
+                and now_ns >= self._look_stop_next_ns
+                and any(d.confidence >= mem_conf and d.world_position.x == 0.0
+                        and d.world_position.y == 0.0 and d.world_position.z == 0.0
+                        for d in msg.detections)):
+            self._blind_hits = [h for h in self._blind_hits if now_ns - h < int(1e9)] + [now_ns]
+            if len(self._blind_hits) >= int(self.get_parameter("look_stop_hits").value):
+                self._blind_hits = []
+                self._look_stop_until_ns = now_ns + int(
+                    float(self.get_parameter("look_stop_sec").value) * 1e9)
+                self._look_stop_next_ns = now_ns + int(
+                    float(self.get_parameter("look_stop_cooldown_sec").value) * 1e9)
+                self.get_logger().info(
+                    f"도는 중({self.yaw_rate:.2f} rad/s)에 광물이 보임 — 잠깐 멈춰서 위치를 잰다")
+                self._event("도는 중에 광물이 보임 — 멈춰서 위치 확인")
+        loose = [
             d for d in msg.detections
-            if d.confidence >= min_conf
+            if d.confidence >= mem_conf
             and not (d.world_position.x == 0.0
                      and d.world_position.y == 0.0
                      and d.world_position.z == 0.0)
             and not in_cooldown(d)
             and not near_failed_pick(d)
+            and not self._is_vetoed(d.world_position.x, d.world_position.y)
             # Multi-rover: 다른 rover 가 claim 한 mineral 은 후보 제외
             and not self._is_claimed_by_other(
                 d.world_position.x, d.world_position.y)
         ]
+        # 기억: 낮은 기준으로 확인된 것을 모두 적는다 (목표 고정과는 별개).
+        seen_ok = []
+        if loose:
+            ok = confirm_hits(
+                self._seen_mem,
+                [(d.class_name, d.world_position.x, d.world_position.y) for d in loose],
+                now_ns, int(self.get_parameter("memory_confirm_hits").value),
+                float(self.get_parameter("target_confirm_radius_m").value),
+                int(float(self.get_parameter("target_confirm_window_sec").value) * 1e9))
+            seen_ok = [d for d, keep in zip(loose, ok) if keep]
+            self._remember_minerals(seen_ok)
+        candidates = [d for d in loose if d.confidence >= min_conf]
         if candidates:
             ok = confirm_hits(
                 self._seen_dets,
@@ -567,7 +690,7 @@ class MissionManagerNode(Node):
                     return
             else:
                 self._defer_since_ns = 0
-        if not candidates:
+        if self.lock_target is None and not candidates:
             return
 
         if self.lock_target is not None:
@@ -577,8 +700,10 @@ class MissionManagerNode(Node):
             lx = self.lock_target.world_position.x
             ly = self.lock_target.world_position.y
             match_r2 = 2.0 * 2.0
+            # 고정한 목표의 갱신은 기억용 기준으로 본다 — 신뢰도가 낮게 나오는 광물도
+            # 다가가며 위치가 고쳐지고 "보인다" 로 친다.
             same = [
-                d for d in candidates
+                d for d in seen_ok
                 if d.class_name == self.lock_target.class_name
                 and (d.world_position.x - lx) ** 2
                     + (d.world_position.y - ly) ** 2 < match_r2
@@ -623,13 +748,168 @@ class MissionManagerNode(Node):
                     self.last_det_stamp_ns = now_ns
                     self.lock_target = d
                     self.lock_started_ns = now_ns
-            # 같은 mineral 없으면 lock 유지 (timeout 자연 흐름)
+            # 지금 보이는 다른 광물이 잡아 둔 목표보다 뚜렷이 가까우면 그쪽부터 집는다.
+            # 원래 목표는 목록(self.known)에 남아 있어 나중에 다시 간다.
+            if self.phase == "APPROACH" and self.last_odom is not None \
+                    and self.lock_target is not None:
+                p = self.last_odom.pose.pose.position
+                lx = self.lock_target.world_position.x
+                ly = self.lock_target.world_position.y
+                d_lock = math.hypot(lx - p.x, ly - p.y)
+                others = [d for d in candidates
+                          if (d.world_position.x - lx) ** 2
+                          + (d.world_position.y - ly) ** 2 >= match_r2]
+                if others:
+                    near = min(others, key=lambda d: math.hypot(
+                        d.world_position.x - p.x, d.world_position.y - p.y))
+                    d_near = math.hypot(near.world_position.x - p.x,
+                                        near.world_position.y - p.y)
+                    if d_near < d_lock - float(
+                            self.get_parameter("target_switch_margin_m").value):
+                        self.get_logger().info(
+                            f"더 가까운 광물이 보임 — 목표를 {self.lock_target.class_name} "
+                            f"({lx:.2f},{ly:.2f}) {d_lock:.1f} m → {near.class_name} "
+                            f"({near.world_position.x:.2f},{near.world_position.y:.2f}) "
+                            f"{d_near:.1f} m 로 바꿈 (원래 목표는 기억해 둠)")
+                        self._event(f"더 가까운 {near.class_name} ({d_near:.1f} m) 부터 집음")
+                        self.target = near
+                        self.lock_target = near
+                        self.last_det_stamp_ns = now_ns
+                        self.lock_started_ns = now_ns
+                        self._appr_best = float("inf")
+                        self._appr_progress_ns = now_ns
+                        self._appr_started_ns = now_ns
+                        self._appr_budget_ns = 0
+                        self._appr_unseen_logged = False
             return
+        # Lock 없음 — 목표는 _tick 이 기억한 목록에서 가까운 것으로 고른다 (_choose_target).
 
-        # Lock 없음 — best target 자유 선택
-        best = max(candidates, key=_score)
-        self.target = best
-        self.last_det_stamp_ns = now_ns
+    # ── 광물이 아닌 것 (건물 벽) ────────────────────────────────────────
+    def _is_vetoed(self, x: float, y: float) -> bool:
+        r = float(self.get_parameter("mineral_veto_radius_m").value)
+        return any(math.hypot(x - vx, y - vy) <= r for vx, vy in self.vetoed)
+
+    def _on_mineral_veto(self, msg: PointStamped) -> None:
+        """지도 노드의 판정: 이 자리의 "광물" 은 건물 벽이다. 기억에서 지우고, 가던 중이면 그만둔다."""
+        x, y = float(msg.point.x), float(msg.point.y)
+        if any(math.hypot(x - vx, y - vy) < 0.3 for vx, vy in self.vetoed):
+            return
+        self.vetoed.append((x, y))
+        r = float(self.get_parameter("mineral_veto_radius_m").value)
+        self.known = [k for k in self.known if math.hypot(k["x"] - x, k["y"] - y) > r]
+        tgt = self.lock_target or self.target
+        if tgt is not None and not self.arm_in_flight and math.hypot(
+                tgt.world_position.x - x, tgt.world_position.y - y) <= r:
+            self.get_logger().info(
+                f"목표 {tgt.class_name} ({tgt.world_position.x:.2f},{tgt.world_position.y:.2f}) "
+                f"은 광물이 아님 (건물 벽) — 버리고 EXPLORE 로")
+            self._event(f"{msg.header.frame_id or '광물'} 로 본 것이 건물 벽 — 목표에서 뺌")
+            self.target = None
+            self.lock_target = None
+            self.last_det_stamp_ns = 0
+
+    # ── 본 광물 기억 ────────────────────────────────────────────────────
+    def _remember_minerals(self, dets) -> None:
+        """확인된 검출을 목록에 적는다. 같은 광물이면 더 가까이서 잰 위치로 고친다.
+
+        로버는 광물을 지나가며 잠깐씩만 본다. 예전에는 "지금 보이는 것 중 값진 것" 만
+        목표가 될 수 있어서, 돌아가느라 시야에서 벗어난 광물과 다른 것을 집는 동안 본 광물은
+        잊혔다. 광물은 움직이지 않으므로 본 자리를 적어 두면 된다.
+        (실제 로버라면 위치 추정 오차만큼 적어 둔 좌표가 틀어진다 — 그래서 접근하며 다시
+        보일 때 좌표를 고치고, 집을 때는 손목 카메라로 다시 잰다. 그 구조는 여기도 같다.)
+        """
+        if self.last_odom is None:
+            return
+        p = self.last_odom.pose.pose.position
+        max_r = float(self.get_parameter("mineral_memory_range_m").value)
+        for d in dets:
+            x, y = float(d.world_position.x), float(d.world_position.y)
+            rng = math.hypot(x - p.x, y - p.y)
+            if rng > max_r:
+                continue
+            bearing = math.atan2(y - p.y, x - p.x)
+            for k in self.known:
+                if k["cls"] != d.class_name:
+                    continue
+                # 멀리서 잰 것일수록 거리 오차가 크다 → 같은 광물로 보는 반경도 넓게.
+                tol = max(1.0, 0.15 * max(rng, k["range"]))
+                same = math.hypot(k["x"] - x, k["y"] - y) < tol
+                if not same and k["range"] > 6.0:
+                    # 멀리서 적어 둔 것과 같은 방향인데 더 가깝게 잡힘 = 같은 광물이고 적어 둔
+                    # 거리가 길게 틀렸던 것 (먼 광물은 깊이 화소가 뒤쪽 배경을 읽기도 한다).
+                    kb = math.atan2(k["y"] - p.y, k["x"] - p.x)
+                    diff = abs((bearing - kb + math.pi) % (2 * math.pi) - math.pi)
+                    same = diff < math.radians(6.0) and rng < math.hypot(k["x"] - p.x, k["y"] - p.y)
+                if same:
+                    if rng <= k["range"] * 1.2:
+                        k.update(x=x, y=y, det=d, range=min(rng, k["range"]))
+                    break
+            else:
+                self.known.append({"cls": d.class_name, "x": x, "y": y, "range": rng,
+                                   "det": d, "fails": 0})
+
+    def _forget_mineral(self, x: float, y: float, radius: float, failed: bool = False) -> None:
+        """(x, y) 근처의 기억을 지운다. failed=True 면 실패 횟수만 올리고 한도를 넘을 때 지운다."""
+        limit = int(self.get_parameter("mineral_memory_max_fails").value)
+        keep = []
+        for k in self.known:
+            if math.hypot(k["x"] - x, k["y"] - y) <= radius:
+                if not failed:
+                    continue
+                k["fails"] += 1
+                if k["fails"] >= limit:
+                    self.get_logger().info(
+                        f"광물 기억 삭제: {k['cls']} ({k['x']:.2f},{k['y']:.2f}) — "
+                        f"{k['fails']}번 실패")
+                    continue
+            keep.append(k)
+        self.known = keep
+
+    def _publish_known(self) -> None:
+        """기억한 (아직 못 모은) 광물을 가까운 순으로 내보낸다 — HUD 지도가 번호와 함께 그린다."""
+        import json
+        if self.last_odom is None:
+            return
+        p = self.last_odom.pose.pose.position
+        tgt = (self.lock_target or self.target) if self.phase in ("APPROACH", "PICK_READY") \
+            else None
+        items = sorted(
+            ({"c": k["cls"], "x": round(k["x"], 2), "y": round(k["y"], 2),
+              "d": round(math.hypot(k["x"] - p.x, k["y"] - p.y), 1), "f": int(k["fails"]),
+              # 지금 가고 있는 광물 — HUD 가 고리로 표시한다
+              "t": int(tgt is not None and tgt.class_name == k["cls"] and math.hypot(
+                  tgt.world_position.x - k["x"], tgt.world_position.y - k["y"]) < 1.0)}
+             for k in self.known), key=lambda it: it["d"])
+        msg = String()
+        msg.data = json.dumps({"items": items}, separators=(",", ":"))
+        self.known_pub.publish(msg)
+
+    def _choose_target(self, now_ns: int) -> None:
+        """잡아 둔 목표가 없을 때: 기억한 광물 중 가장 가까운 것을 목표로 삼는다."""
+        if self.last_odom is None or not self.known:
+            return
+        p = self.last_odom.pose.pose.position
+        skip_r = float(self.get_parameter("post_pick_skip_radius_m").value)
+        cooldown_ns = int(float(self.get_parameter("post_pick_cooldown_sec").value) * 1e9)
+        self.failed_pick_points = [f for f in self.failed_pick_points if f[2] > now_ns]
+        best = None
+        for k in self.known:
+            if any(math.hypot(k["x"] - fx, k["y"] - fy) <= skip_r
+                   for fx, fy, _ in self.failed_pick_points):
+                continue
+            if self.last_pick_world is not None and now_ns - self.last_pick_done_ns < cooldown_ns \
+                    and math.hypot(k["x"] - self.last_pick_world[0],
+                                   k["y"] - self.last_pick_world[1]) <= skip_r:
+                continue
+            if self._is_claimed_by_other(k["x"], k["y"]):
+                continue
+            d = math.hypot(k["x"] - p.x, k["y"] - p.y)
+            if best is None or d < best[0]:
+                best = (d, k)
+        if best is not None:
+            self.target = best[1]["det"]
+            self.last_det_stamp_ns = now_ns
+            self._chosen_from = len(self.known)     # phase 기록에 "N 개 중" 을 남기려고
 
     def _on_coverage_cmd(self, msg: Twist) -> None:
         self.last_coverage_cmd = msg
@@ -637,6 +917,22 @@ class MissionManagerNode(Node):
 
     def _on_odom(self, msg: Odometry) -> None:
         self.last_odom = msg
+        t = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        p = msg.pose.pose.position
+        prev = self._speed_prev
+        if prev is None or t < prev[0] or t - prev[0] > 1.0:
+            self._speed_prev = (t, p.x, p.y)
+        elif t - prev[0] >= 0.1:
+            self.speed = math.hypot(p.x - prev[1], p.y - prev[2]) / (t - prev[0])
+            self._speed_prev = (t, p.x, p.y)
+        q = msg.pose.pose.orientation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        yp = self._yaw_prev
+        if yp is None or t < yp[0] or t - yp[0] > 1.0:
+            self._yaw_prev = (t, yaw)
+        elif t - yp[0] >= 0.1:
+            self.yaw_rate = abs((yaw - yp[1] + math.pi) % (2 * math.pi) - math.pi) / (t - yp[0])
+            self._yaw_prev = (t, yaw)
 
     def _on_teleop_cmd(self, msg: Twist) -> None:
         self.last_teleop_cmd = msg
@@ -835,6 +1131,8 @@ class MissionManagerNode(Node):
         for k in self.collected_by_class:
             self.collected_by_class[k] = 0
         self.failed_pick_points = []
+        self.known = []
+        self.vetoed = []
         self.last_error = "" if not self.estop else self.last_error
         self.operator_rtb = False
         restarted = ""
@@ -1048,19 +1346,23 @@ class MissionManagerNode(Node):
 
         now_ns = self.get_clock().now().nanoseconds
         stale_ns = int(float(self.get_parameter("detection_stale_sec").value) * 1e9)
+        if self.lock_target is None and self.phase == "EXPLORE":
+            self._choose_target(now_ns)
         det_fresh = (self.target is not None) and (now_ns - self.last_det_stamp_ns < stale_ns)
 
-        # Target lock-on: keep approaching cached target if detection briefly
-        # lost, until approach_lock_timeout_sec elapses.
-        lock_timeout_ns = int(float(self.get_parameter("approach_lock_timeout_sec").value) * 1e9)
+        # 고정한 목표는 안 보여도 기억한 위치로 계속 간다 (광물은 움직이지 않는다).
+        # 포기는 시간이 아니라 진척으로 정한다 — _approach_progress.
         if not det_fresh and self.lock_target is not None:
-            if now_ns - self.lock_started_ns < lock_timeout_ns:
-                # use lock as virtual target
-                self.target = self.lock_target
-                det_fresh = True
-            else:
-                self.lock_target = None
-                self.lock_started_ns = 0
+            self.target = self.lock_target
+            det_fresh = True
+            if (not self._appr_unseen_logged and self.phase == "APPROACH"
+                    and now_ns - self.lock_started_ns > int(8e9)):
+                self._appr_unseen_logged = True
+                self.get_logger().info(
+                    f"목표 {self.target.class_name} 이 8 s 째 안 보임 — "
+                    f"기억한 위치 ({self.target.world_position.x:.2f},"
+                    f"{self.target.world_position.y:.2f}) 로 계속 접근")
+                self._event("목표가 안 보임 — 기억한 위치로 계속 접근")
 
         engage_d = float(self.get_parameter("approach_engage_dist_m").value)
         default_stop_d = float(self.get_parameter("approach_stop_dist_m").value)
@@ -1079,8 +1381,9 @@ class MissionManagerNode(Node):
         else:
             if dist <= stop_d:
                 self.phase = "PICK_READY"
-            elif dist <= engage_d:
-                self.phase = "APPROACH"
+            elif dist <= engage_d or (prev_phase == "APPROACH"
+                                      and self.lock_target is not None):
+                self.phase = "APPROACH"         # 돌아가느라 멀어져도 잡은 목표는 놓지 않는다
             else:
                 self.phase = "EXPLORE"
 
@@ -1103,11 +1406,24 @@ class MissionManagerNode(Node):
                 # Lock onto this target's coordinates for the duration of APPROACH
                 self.lock_target = self.target
                 self.lock_started_ns = now_ns
+                self._appr_best = float("inf")
+                self._appr_progress_ns = now_ns
+                self._appr_started_ns = now_ns
+                self._appr_budget_ns = 0
+                self._appr_unseen_logged = False
+                if self._chosen_from >= 2:
+                    self.get_logger().info(
+                        f"기억한 광물 {self._chosen_from}개 중 가장 가까운 "
+                        f"{self.target.class_name} ({dist:.1f} m) 부터 감")
+                    self._event(f"기억한 광물 {self._chosen_from}개 중 가장 가까운 것부터")
             if self.phase != "APPROACH" and self.phase != "PICK_READY":
                 self.lock_target = None
                 self.lock_started_ns = 0
             if self.phase == "PICK_READY" and prev_phase != "PICK_READY":
-                self._send_arm_goal()
+                self._pick_pending = True       # 멈춘 것을 확인하고 보낸다 (아래 PICK_READY)
+                self._pick_adjust = ""
+            elif self.phase != "PICK_READY":
+                self._pick_pending = False
             if self.phase == "EXPLORE" and prev_phase != "EXPLORE":
                 # Drop stale coverage cmd, ask coverage to replan from the new
                 # rover position, and start a brief cooldown so the replan can
@@ -1128,7 +1444,7 @@ class MissionManagerNode(Node):
             stale_sec = float(self.get_parameter("coverage_cmd_stale_sec").value)
             cmd_age = (now_ns - self.last_coverage_cmd_ns) / 1e9 \
                 if self.last_coverage_cmd_ns else float("inf")
-            if in_resume_cooldown:
+            if in_resume_cooldown or now_ns < self._look_stop_until_ns:
                 self.cmd_pub.publish(Twist())
             elif self.last_coverage_cmd is not None and cmd_age < stale_sec:
                 self.cmd_pub.publish(self.last_coverage_cmd)
@@ -1141,13 +1457,16 @@ class MissionManagerNode(Node):
             # 청소용 빈 path 발행 → 그 후엔 coverage 가 takeover.
             self.waypoints = []
         elif self.phase == "APPROACH":
-            self.cmd_pub.publish(self._approach_twist(dist))
+            twist = self._approach_twist(dist)
+            if self.target is not None and not self._approach_progress(now_ns):
+                twist = Twist()
+            self.cmd_pub.publish(twist)
             # _maybe_replan 후 waypoints + target 발행.
             tgt = (self.target.world_position.x, self.target.world_position.y) \
                   if self.target is not None else None
             self._publish_supervisor_viz(target_xy=tgt)
         else:  # PICK_READY
-            self.cmd_pub.publish(Twist())
+            self.cmd_pub.publish(self._pick_ready_twist(dist))
             tgt = (self.target.world_position.x, self.target.world_position.y) \
                   if self.target is not None else None
             self._publish_supervisor_viz(target_xy=tgt)
@@ -1195,6 +1514,7 @@ class MissionManagerNode(Node):
                     self.get_parameter("failed_pick_ignore_sec").value) * 1e9)
                 self.failed_pick_points.append(
                     (tx, ty, self.get_clock().now().nanoseconds + ignore_ns))
+                self._forget_mineral(tx, ty, 1.0, failed=True)
                 self.get_logger().warn(
                     f"APPROACH: 광물 ({tx:.2f},{ty:.2f}) 까지 {dist:.2f} m 남기고 "
                     f"길이 막힘 — 이 광물은 잠시 제외하고 EXPLORE 로")
@@ -1223,11 +1543,7 @@ class MissionManagerNode(Node):
         bearing = math.atan2(goal_y - ry, goal_x - rx)
         heading_err = math.atan2(math.sin(bearing - yaw), math.cos(bearing - yaw))
 
-        creep_d = float(self.get_parameter("approach_stop_dist_m").value) * 2.0
-        if dist < creep_d:
-            lin = float(self.get_parameter("approach_creep_speed").value)
-        else:
-            lin = float(self.get_parameter("approach_lin_speed").value)
+        lin = self._approach_speed(dist)
         if abs(heading_err) > 0.4:
             lin *= 0.3
         t.linear.x = lin
@@ -1240,6 +1556,150 @@ class MissionManagerNode(Node):
         elif t.angular.z < -max_ang:
             t.angular.z = -max_ang
         return t
+
+    def _approach_speed(self, dist: float) -> float:
+        """목표까지 dist 남았을 때의 전진 속도 — 멈출 자리를 지나치지 않는 한에서 빠르게.
+
+        예전에는 "1.5 m 안이면 0.25 m/s, 밖이면 최고 속도" 의 두 단계였다. 화성 구동부는
+        0.72 m/s² 로만 줄일 수 있고 명령이 바퀴에 닿기까지도 시간이 걸려서, 최고 속도로
+        들어오면 느린 구간(0.8 m)이 끝나기 전에 속도가 다 줄지 않았다. 내리막이면 더 길어져
+        멈출 자리를 0.5 m 지나쳐 광물을 깔고 섰다 (logs/min2_on t=409, blue_mineral_0024).
+
+        지금은 제동 곡선이다: 멈출 자리의 creep_lead 앞에서 느린 속도가 되도록
+        v = sqrt(v_creep² + 2·a·남은 거리), 남은 거리에서는 명령 지연 동안 갈 거리를 뺀다.
+        """
+        stop_d = _stop_dist_for(self.target.class_name if self.target is not None else "",
+                                float(self.get_parameter("approach_stop_dist_m").value))
+        v_max = float(self.get_parameter("approach_lin_speed").value)
+        v_creep = float(self.get_parameter("approach_creep_speed").value)
+        a = float(self.get_parameter("approach_brake_decel_m_s2").value)
+        room = (dist - stop_d - float(self.get_parameter("approach_creep_lead_m").value)
+                - self.speed * float(self.get_parameter("approach_brake_delay_sec").value))
+        if room <= 0.0:
+            return min(v_creep, v_max)
+        return min(v_max, math.sqrt(v_creep * v_creep + 2.0 * a * room))
+
+    def _pick_ready_twist(self, dist: float) -> Twist:
+        """PICK_READY: 완전히 멈추고, 팔이 닿는 거리인지 확인한 뒤 팔에 명령을 보낸다.
+
+        멈추라는 명령을 낸 뒤에도 로버는 조금 움직인다 (내리막이면 더 가고, 오르막이면 뒤로
+        밀린다). 광물이 받침대 바로 앞·아래로 들어오면 손목 카메라에 보이지 않아 "그 자리에
+        광물이 없음" 으로, 0.72 m 보다 멀면 "팔이 닿지 않음" 으로 실패한다. 그래서 선 뒤에
+        거리를 다시 보고, 너무 가까우면 물러나고 멀면 다가가서 맞춘다.
+        """
+        t = Twist()
+        if not self._pick_pending or self.arm_in_flight:
+            return t
+        stop_d = _stop_dist_for(self.target.class_name if self.target is not None else "",
+                                float(self.get_parameter("approach_stop_dist_m").value))
+        v_adj = float(self.get_parameter("pick_backoff_speed").value)
+        if self._pick_adjust == "back" and dist >= stop_d - 0.1:
+            self._pick_adjust = ""
+        elif self._pick_adjust == "fwd" and dist <= stop_d:
+            self._pick_adjust = ""
+        if not self._pick_adjust:
+            if dist < float(self.get_parameter("pick_min_dist_m").value):
+                self._pick_adjust = "back"
+                self.get_logger().warn(
+                    f"PICK_READY: 광물을 지나쳐 {dist:.2f} m 까지 붙음 — "
+                    f"{stop_d - 0.1:.2f} m 가 될 때까지 물러남")
+                self._event(f"광물에 너무 붙음 ({dist:.2f} m) — 물러나서 집기")
+            elif self.speed > 0.03:
+                return t                                # 아직 구르는 중 — 설 때까지 기다림
+            elif dist > stop_d + float(self.get_parameter("pick_reach_slack_m").value):
+                self._pick_adjust = "fwd"
+                self.get_logger().info(
+                    f"PICK_READY: 멈춘 자리가 {dist:.2f} m 로 멀다 — {stop_d:.2f} m 까지 다가감")
+        if self._pick_adjust:
+            t.linear.x = -v_adj if self._pick_adjust == "back" else v_adj
+            return t
+        self._send_arm_goal()
+        self._pick_pending = not self.arm_in_flight     # 팔 서버가 없으면 다음 tick 에 다시
+        return t
+
+    def _approach_remaining(self) -> float:
+        """로버에서 목표까지 남은 길 (계획한 경로를 따라, m). 경로가 없으면 직선 거리."""
+        if self.last_odom is None or self.target is None:
+            return float("inf")
+        p = self.last_odom.pose.pose.position
+        x, y = float(p.x), float(p.y)
+        total = 0.0
+        for wx, wy in self.waypoints[self.wp_idx:]:
+            total += math.hypot(wx - x, wy - y)
+            x, y = wx, wy
+        return total + math.hypot(self.target.world_position.x - x,
+                                  self.target.world_position.y - y)
+
+    def _looked_and_absent(self, now_ns: int) -> bool:
+        """기억한 자리를 가까이서 정면으로 보고 있는데 광물이 검출되지 않는가."""
+        if self.target is None or self.last_odom is None:
+            self._appr_look_ns = 0
+            return False
+        pose = self.last_odom.pose.pose
+        q = pose.orientation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        dx = self.target.world_position.x - pose.position.x
+        dy = self.target.world_position.y - pose.position.y
+        dist = math.hypot(dx, dy)
+        off = abs((math.atan2(dy, dx) - yaw + math.pi) % (2 * math.pi) - math.pi)
+        looking = (float(self.get_parameter("mineral_look_min_m").value) <= dist
+                   <= float(self.get_parameter("mineral_look_max_m").value)
+                   and off <= math.radians(float(self.get_parameter("mineral_look_cone_deg").value)))
+        if not looking or self.last_det_stamp_ns >= self._appr_look_ns > 0:
+            self._appr_look_ns = now_ns if looking else 0
+            return False
+        if self._appr_look_ns == 0:
+            self._appr_look_ns = now_ns
+            return False
+        return now_ns - self._appr_look_ns > int(
+            float(self.get_parameter("mineral_look_sec").value) * 1e9)
+
+    def _approach_progress(self, now_ns: int) -> bool:
+        """접근이 진척되고 있는가. 아니면 목표를 한동안 제외하고 False (→ EXPLORE)."""
+        rem = self._approach_remaining()
+        if not math.isfinite(rem):
+            return True
+        if self._appr_budget_ns == 0:
+            self._appr_budget_ns = int(1e9 * (
+                float(self.get_parameter("approach_budget_base_sec").value)
+                + rem * float(self.get_parameter("approach_budget_sec_per_m").value)))
+        step = float(self.get_parameter("approach_stall_progress_m").value)
+        if rem < self._appr_best - step:
+            self._appr_best = rem
+            self._appr_progress_ns = now_ns
+        elif rem > self._appr_best + 1.5:
+            self._appr_best = rem          # 다시 계획해서 길이 길어짐 — 새 길 기준으로 본다
+        if self._looked_and_absent(now_ns):
+            tx, ty = self.target.world_position.x, self.target.world_position.y
+            self._forget_mineral(tx, ty, 1.0)
+            self.get_logger().warn(
+                f"기억한 자리에 광물이 없음: {self.target.class_name} ({tx:.2f},{ty:.2f}) — "
+                f"가까이서 그쪽을 봐도 검출이 없다. 기억에서 지우고 EXPLORE 로")
+            self._event("기억한 자리에 광물이 안 보임 — 지움")
+            self.target = None
+            self.lock_target = None
+            self.last_det_stamp_ns = 0
+            return False
+        stall_ns = int(float(self.get_parameter("approach_stall_sec").value) * 1e9)
+        why = ""
+        if now_ns - self._appr_progress_ns > stall_ns:
+            why = f"{stall_ns / 1e9:.0f} s 동안 가까워지지 못함"
+        elif now_ns - self._appr_started_ns > self._appr_budget_ns:
+            why = f"접근 시간 {self._appr_budget_ns / 1e9:.0f} s 초과"
+        if not why:
+            return True
+        tx, ty = self.target.world_position.x, self.target.world_position.y
+        ignore_ns = int(float(self.get_parameter("failed_pick_ignore_sec").value) * 1e9)
+        self.failed_pick_points.append((tx, ty, now_ns + ignore_ns))
+        self._forget_mineral(tx, ty, 1.0, failed=True)
+        self.get_logger().warn(
+            f"APPROACH 포기: {self.target.class_name} ({tx:.2f},{ty:.2f}) — {why} "
+            f"(남은 길 {rem:.1f} m). 이 광물은 잠시 제외하고 EXPLORE 로")
+        self._event(f"접근 포기 — {why}")
+        self.target = None
+        self.lock_target = None
+        self.last_det_stamp_ns = 0
+        return False
 
     # ── Multi-rover 협조 메서드 (T2 패턴, 838d5ed) ─────────────────────
     def _on_claim(self, msg: PointStamped) -> None:
@@ -1531,12 +1991,20 @@ class MissionManagerNode(Node):
         if not ok and msg_text.startswith("canceled"):
             # 운영자가 세운 것 — 채취 실패로 치지 않는다 (그 자리를 피하지도 않는다).
             self.target = None
+            self.lock_target = None      # 잡아 둔 목표도 같이 놓는다
             self.last_det_stamp_ns = 0
             self.get_logger().info("arm action canceled by operator — 팔이 그 자리에 섬")
             self._event("채취 동작 취소됨 — 팔이 그 자리에 섬")
             if not self.estop and self._arm_stopped:
                 self._send_arm_home()        # 취소가 끝나기 전에 이미 RESUME 을 눌렀다
             return
+        if self.last_pick_world is not None:
+            # 집었으면 그 자리의 기억을 지운다. 손목 카메라가 "그 자리에 없음" 이라고 한 것도
+            # 지운다 (잘못 적힌 자리). 다른 실패는 횟수만 올려 나중에 다시 가 본다.
+            gone = ok or "no mineral" in msg_text
+            self._forget_mineral(self.last_pick_world[0], self.last_pick_world[1],
+                                 float(self.get_parameter("post_pick_skip_radius_m").value),
+                                 failed=not gone)
         if ok:
             self.collected_count += 1
             cap = int(self.get_parameter("cargo_capacity").value)
@@ -1561,6 +2029,7 @@ class MissionManagerNode(Node):
                      self.last_pick_done_ns + ignore_ns))
         # Drop the current target so PICK_READY exits and EXPLORE resumes.
         self.target = None
+        self.lock_target = None      # 잡아 둔 목표도 같이 놓는다
         self.last_det_stamp_ns = 0
         goal = int(self.get_parameter("collection_goal").value)
         self.get_logger().info(

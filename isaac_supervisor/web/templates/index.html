@@ -81,7 +81,14 @@
     <div class="hud-cell hud-map">
       <div class="hud-cell-title">
         <span>COVERAGE MAP</span>
-        <span class="hud-cell-tag">all rovers</span>
+        <!-- 지도 위 광물 아이콘의 뜻. 모양은 dashboard.js 의 MINERAL_ICONS 와 같다. -->
+        <span class="map-legend">
+          <span class="lg"><svg viewBox="-10 -10 20 20"><path d="M0,-9 L6,-3 L6,4 L0,9 L-6,4 L-6,-3 Z" fill="#3d9bff" stroke="#000" stroke-width="1.5"/><path d="M-6,-3 L0,1 L6,-3 M0,1 L0,9" fill="none" stroke="#0b3d80"/></svg>파랑 광물</span>
+          <span class="lg"><svg viewBox="-10 -10 20 20"><path d="M-5,-7 L5,-7 L9,-2 L0,9 L-9,-2 Z" fill="#ffd21f" stroke="#000" stroke-width="1.5"/><path d="M-9,-2 L9,-2 M-5,-7 L-3,-2 L0,9 L3,-2 L5,-7" fill="none" stroke="#7a5a00"/></svg>노랑 광물</span>
+          <span class="lg"><svg viewBox="-10 -10 20 20"><path d="M-3,-9 L3,-9 L3,-6 L6,-6 L6,8 L-6,8 L-6,-6 L-3,-6 Z" fill="#35d96a" stroke="#000" stroke-width="1.5"/><path d="M-6,-1 L6,-1 M-6,3 L6,3" fill="none" stroke="#0b5a26"/></svg>초록 가스</span>
+          <span class="lg"><svg viewBox="-10 -10 20 20"><circle r="8" fill="none" stroke="#ff5ce0" stroke-width="2.5"/></svg>가는 중</span>
+          <span class="lg"><svg viewBox="-10 -10 20 20"><path d="M0,-9 L2.4,-3.2 L8.6,-2.8 L3.8,1.2 L5.3,7.3 L0,4 L-5.3,7.3 L-3.8,1.2 L-8.6,-2.8 L-2.4,-3.2 Z" fill="#ff5ce0" stroke="#000"/></svg>탐색 목표</span>
+        </span>
       </div>
       <div class="map-wrap">
         <canvas id="minimap" width="480" height="480"></canvas>

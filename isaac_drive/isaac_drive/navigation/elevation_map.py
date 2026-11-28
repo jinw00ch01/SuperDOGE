@@ -156,6 +156,30 @@ class ElevationMap:
         a = self.z[max(i - r, 0):i + r + 1, max(j - r, 0):j + r + 1]
         return float(np.nanmean(a)) if a.size and np.isfinite(a).any() else None
 
+    def relief_at(self, x: float, y: float, top_r: float = 0.3, ground_r: float = 0.8,
+                  min_cells: int = 10):
+        """(x, y) 에 무엇이 서 있나: (꼭대기, 바닥) 높이. 본 칸이 모자라면 None.
+
+        꼭대기 = top_r 안에서 가장 높은 칸, 바닥 = ground_r 안에서 가장 낮은 칸.
+        광물(20 cm)이 놓인 자리는 꼭대기 − 바닥이 0.5 m 를 넘지 않고(경사 18° 까지 실측
+        0.14~0.49), 건물 벽은 1 m 를 넘는다 (logs/min2_fix2: 1.96).
+        """
+        i, j = (int(v) for v in self.world_to_cell(x, y))
+        if not (0 <= i < self.rows and 0 <= j < self.cols):
+            return None
+
+        def disk(radius):
+            k = int(math.ceil(radius / self.cell))
+            i0, j0 = max(i - k, 0), max(j - k, 0)
+            a = self.z[i0:i + k + 1, j0:j + k + 1]
+            yy, xx = np.mgrid[i0:i0 + a.shape[0], j0:j0 + a.shape[1]]
+            return a[(np.hypot(yy - i, xx - j) * self.cell <= radius) & np.isfinite(a)]
+
+        top, ground = disk(top_r), disk(ground_r)
+        if len(top) < 3 or len(ground) < int(min_cells):
+            return None
+        return float(top.max()), float(ground.min())
+
     def around(self, x: float, y: float, yaw: float, ground_z: float,
                dist: float = 2.0, radius: float = 4.0) -> dict:
         """로버 기준 요약: 앞·뒤·좌·우 dist m 지점의 (높이 − 발밑), 주변 radius 의 최고·최저."""

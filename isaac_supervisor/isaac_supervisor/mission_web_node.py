@@ -143,6 +143,12 @@ class PublicTunnel:
     HUD 가 다시 뜨면 이어진다. 주소가 바뀌는 때는 재부팅했거나 터널을 직접 닫았을 때
     (tools/hud_tunnel.sh stop)뿐이다.
 
+    **고정 주소 (Tailscale Funnel)**: tailscale 이 설치돼 있고 로그인돼 있으면 그쪽을 먼저
+    쓴다. 주소가 https://<PC 이름>.<tailnet 이름>.ts.net 으로 정해져 있어 재부팅해도 같다
+    (`tailscale funnel --bg <port>` — tailscaled 가 설정을 기억한다). 이때 떠 있던
+    cloudflared 임시 터널은 닫는다 (공개 주소는 하나만). 로그인돼 있지 않으면 아래의
+    임시 주소로 간다.
+
     cloudflared 실행 파일이 필요하다 (PATH 또는 ~/.local/bin). ssh 만으로 되는
     localhost.run 도 시험했지만 익명 터널이 2~20 kB/s 로 묶이고 주소가 도중에 바뀌어
     영상은커녕 화면도 제대로 뜨지 않았다 — 쓰지 않는다.
@@ -163,13 +169,90 @@ class PublicTunnel:
         self.provider = "cloudflared"
         self.pid = 0
         self.exe = shutil.which("cloudflared") or ""
+        self.ts = shutil.which("tailscale") or ""
         local = os.path.expanduser("~/.local/bin/cloudflared")
         if not self.exe and os.access(local, os.X_OK):
             self.exe = local
-        if not self.exe:
+        if not self.exe and not self.ts:
             log(self.INSTALL_HINT)
             return
         threading.Thread(target=self._run, daemon=True).start()
+
+    # ── Tailscale Funnel (고정 주소) ────────────────────────────────────
+    def _ts(self, *args, timeout: float = 8.0) -> str:
+        try:
+            r = subprocess.run([self.ts, *args], capture_output=True, text=True,
+                               timeout=timeout, stdin=subprocess.DEVNULL)
+            return (r.stdout or "") + (r.stderr or "")
+        except (OSError, subprocess.SubprocessError) as e:
+            return f"ERR {e}"
+
+    def _ts_url(self) -> str:
+        """Tailscale 에 로그인돼 있으면 이 PC 의 고정 주소, 아니면 ""."""
+        if not self.ts:
+            return ""
+        try:
+            st = json.loads(subprocess.run(
+                [self.ts, "status", "--json"], capture_output=True, text=True, timeout=8.0,
+                stdin=subprocess.DEVNULL).stdout)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return ""
+        name = str((st.get("Self") or {}).get("DNSName") or "").rstrip(".")
+        if st.get("BackendState") != "Running" or not name.endswith(".ts.net"):
+            return ""
+        return f"https://{name}"
+
+    def _ts_funnel_on(self) -> bool:
+        out = self._ts("funnel", "status")
+        return "Funnel on" in out and f"127.0.0.1:{self.port}" in out
+
+    def _ts_funnel_start(self) -> bool:
+        out = self._ts("funnel", "--bg", str(self.port), timeout=20.0)
+        if self._ts_funnel_on():
+            return True
+        self.log("Tailscale Funnel 을 켜지 못함 — " + " ".join(out.split())[:300])
+        return False
+
+    def _close_cloudflared(self) -> None:
+        """고정 주소로 넘어갈 때 떠 있던 임시 터널을 닫는다."""
+        try:
+            with open(self.STATE) as f:
+                st = json.load(f)
+            pid = int(st.get("pid", 0))
+        except (OSError, ValueError):
+            return
+        if st.get("provider") == "tailscale":
+            return
+        if self._alive(pid):
+            try:
+                os.kill(pid, 15)
+                self.log(f"임시 터널을 닫음: {st.get('url')}")
+            except OSError:
+                pass
+
+    def _run_tailscale(self) -> bool:
+        """고정 주소로 내보내고, 내려갈 때까지 지킨다. 쓸 수 없으면 바로 False."""
+        url = self._ts_url()
+        if not url:
+            return False
+        reused = self._ts_funnel_on()
+        if not reused and not self._ts_funnel_start():
+            return False
+        self._close_cloudflared()
+        self.provider, self.url, self.pid = "tailscale", url, 0
+        tmp = self.STATE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"pid": 0, "url": url, "port": self.port, "provider": "tailscale",
+                       "started": time.strftime("%Y-%m-%dT%H:%M:%S")}, f)
+        os.replace(tmp, self.STATE)
+        self.on_url(url, "tailscale funnel · 고정 주소" + (" · 켜져 있던 것을 다시 씀" if reused else ""))
+        misses = 0
+        while misses < 3:                      # 한 번 실패로 끊겼다고 보지 않는다
+            time.sleep(15.0)
+            misses = 0 if self._ts_funnel_on() else misses + 1
+        self.url = ""
+        self.on_url("", self.provider)
+        return True
 
     def _alive(self, pid: int) -> bool:
         """그 pid 가 이 포트를 내보내는 cloudflared 인가."""
@@ -223,6 +306,12 @@ class PublicTunnel:
     def _run(self) -> None:
         wait = 5.0
         while True:
+            if self._run_tailscale():
+                continue
+            if not self.exe:
+                time.sleep(30.0)               # tailscale 로그인을 기다린다
+                continue
+            self.provider = "cloudflared"
             reused = self._reuse()
             if reused or self._spawn():
                 wait = 5.0
@@ -297,6 +386,7 @@ class MissionWebRosNode(Node):
         self._last_odom: Dict[str, dict] = {}
         self._last_minimap: Dict[str, dict] = {}
         self._last_terrain: Dict[str, dict] = {}     # 주변 높낮이 (hazard_map_node 의 요약)
+        self._last_minerals: Dict[str, dict] = {}    # 기억한 광물 (mission_manager)
         self._last_path: Dict[str, dict] = {}
         # explore path (coverage) 와 supervisor path (A* APPROACH/RTB) 를
         # 분리 캐싱. 같은 slot 공유 시 두 source 가 번갈아 덮어쓰며 미니맵
@@ -380,6 +470,9 @@ class MissionWebRosNode(Node):
         self.create_subscription(
             PointStamped, self._topic(ns, "supervisor/target"),
             partial(self._on_supervisor_target, ns), 10)
+        self.create_subscription(
+            String, self._topic(ns, "mission/known_minerals"),
+            partial(self._on_known_minerals, ns), 5)
         self.create_subscription(
             String, self._topic(ns, "mission/event"),
             partial(self._on_event, ns), 20)
@@ -485,6 +578,7 @@ class MissionWebRosNode(Node):
             "odom":    dict(self._last_odom),
             "minimap": dict(self._last_minimap),
             "terrain": dict(self._last_terrain),
+            "minerals": dict(self._last_minerals),
             "path":    dict(self._last_path),
             "target":  dict(self._last_target),
             "events":  list(self._events),
@@ -663,6 +757,17 @@ class MissionWebRosNode(Node):
         self._last_target_explore[ns] = target
         self._emit_active_target(ns)
 
+    def _on_known_minerals(self, ns: str, msg: String) -> None:
+        """기억한 (아직 못 모은) 광물 목록 — 지도에 번호와 함께 그린다. JSON 그대로 넘긴다."""
+        try:
+            payload = json.loads(msg.data)
+        except ValueError:
+            return
+        if self._last_minerals.get(ns) == payload:
+            return
+        self._last_minerals[ns] = payload
+        self._emit("minerals", ns, payload)
+
     def _on_terrain(self, ns: str, msg: String) -> None:
         """로버 둘레의 높낮이 (지형 스캐너 → 높이 지도 요약). JSON 그대로 넘긴다."""
         try:
@@ -739,7 +844,8 @@ def main(args: list[str] | None = None) -> None:
     tunnel_box: Dict[str, Any] = {"t": None}
 
     TUNNEL_HEADERS = ("X-Forwarded-For", "X-Forwarded-Host", "Forwarded",
-                      "Cf-Connecting-Ip", "Cf-Ray")
+                      "Cf-Connecting-Ip", "Cf-Ray",
+                      "Tailscale-Funnel-Request", "Tailscale-User-Login")
 
     def from_this_pc() -> bool:
         """이 PC 의 브라우저가 localhost 로 직접 연 요청인가.
@@ -900,7 +1006,7 @@ def main(args: list[str] | None = None) -> None:
         # Per-rover cache 를 ns 별로 re-emit. payload 마다 rover_id 박혀있음
         # (사실 캐시 시점 emit 의 payload 와 동일). 늦게 들어온 client 도
         # 모든 rover 의 latest state 받음.
-        for event_key in ("state", "odom", "minimap", "terrain", "path", "target"):
+        for event_key in ("state", "odom", "minimap", "terrain", "minerals", "path", "target"):
             for ns, payload in snap[event_key].items():
                 if payload is None:
                     continue
@@ -923,10 +1029,12 @@ def main(args: list[str] | None = None) -> None:
 
     def on_public_url(url: str, provider: str) -> None:
         if url:
+            via = "Tailscale" if provider.startswith("tailscale") else "Cloudflare"
+            keep = ("재부팅해도 이 주소는 그대로다" if via == "Tailscale"
+                    else "스택을 다시 띄워도 이 주소는 그대로다 (재부팅하면 바뀐다)")
             ros_node.get_logger().info(
-                f"HUD 주소 — 인터넷: {url}{suffix}   ({provider} 터널. 영상·상태가 Cloudflare "
-                "서버를 거쳐 나간다. 스택을 다시 띄워도 이 주소는 그대로다. 닫기: "
-                "tools/hud_tunnel.sh stop)")
+                f"HUD 주소 — 인터넷: {url}{suffix}   ({provider} 터널. 영상·상태가 {via} "
+                f"서버를 거쳐 나간다. {keep}. 닫기: tools/hud_tunnel.sh stop)")
             ros_node.push_event("", "info", f"인터넷 주소 열림: {url}")
         else:
             ros_node.push_event("", "info", "인터넷 주소 닫힘 (터널이 끊김)")

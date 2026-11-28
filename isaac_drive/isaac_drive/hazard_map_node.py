@@ -113,6 +113,12 @@ class HazardMapNode(Node):
         self.declare_parameter("elevation_patch_cell_m", 0.2)
         # 먼 검출은 위치가 부정확해서 엉뚱한 곳(바위)을 지울 수 있다.
         self.declare_parameter("mineral_max_range_m", 4.0)
+        # 건물을 광물로 잘못 본 검출 가려내기 (지형 스캐너가 있을 때). 검출 위치가 그 둘레
+        # 바닥보다 mineral_max_height_m 넘게 높거나, 그 자리에 mineral_max_relief_m 넘는
+        # 것이 서 있으면 광물이 아니다 — veto_topic 으로 알린다.
+        self.declare_parameter("veto_topic", "/hazard_map/not_mineral")
+        self.declare_parameter("mineral_max_height_m", 0.6)
+        self.declare_parameter("mineral_max_relief_m", 0.9)
 
         size = [float(v) for v in self.get_parameter("map_size_m").value]
         terrain_dir = str(self.get_parameter("terrain_dir").value)
@@ -147,6 +153,9 @@ class HazardMapNode(Node):
         self._arm_dev = None                    # HOME 에서 가장 많이 벗어난 관절 (rad)
         self._last_t = -1e9
         self._minerals: list = []               # [(x, y)]
+        # 구조물 판정: 아직 판단 못 한 검출 [(x, y, z, 종류)] 과 광물이 아니라고 본 자리.
+        self._undecided: list = []
+        self._vetoed: list = []                 # [(x, y, z, 종류, 이유)]
         self.n_used = self.n_skip_arm = self.n_skip_pose = 0
 
         self.create_subscription(CameraInfo, str(self.get_parameter("info_topic").value),
@@ -184,6 +193,10 @@ class HazardMapNode(Node):
                 String, str(self.get_parameter("elevation_topic").value), 5)
             self.create_timer(0.5, self._publish_elevation)
             self.get_logger().info(f"지형 스캐너 사용: {scan_topic} → 높이 지도")
+        self.veto_pub = self.create_publisher(
+            PointStamped, str(self.get_parameter("veto_topic").value), 10)
+        if scan_topic:
+            self.create_timer(1.0, self._judge_minerals)
         self.create_subscription(Empty, str(self.get_parameter("clear_marks_topic").value),
                                  self._on_clear_marks, 10)
         self.create_subscription(PointStamped, str(self.get_parameter("mark_topic").value),
@@ -208,6 +221,7 @@ class HazardMapNode(Node):
         self.hm.evidence[:] = 0
         self.hm.seen[:] = 0
         self.em.clear()
+        self._undecided, self._vetoed = [], []
         bumps = len(self._bumps)
         self._bumps.clear()
         self._stall_ref = None
@@ -313,6 +327,12 @@ class HazardMapNode(Node):
             x, y = d.world_position.x, d.world_position.y
             if d.confidence < self.min_conf or (x == 0.0 and y == 0.0):
                 continue
+            if any((vx - x) ** 2 + (vy - y) ** 2 < 1.0 for vx, vy, *_ in self._vetoed):
+                continue                         # 건물로 판정한 자리 — 광물 취급하지 않는다
+            if not any((ux - x) ** 2 + (uy - y) ** 2 < 0.3 ** 2 for ux, uy, *_ in self._undecided) \
+                    and len(self._undecided) < 200:
+                self._undecided.append((float(x), float(y), float(d.world_position.z),
+                                        str(d.class_name)))
             if math.hypot(x - rover[0], y - rover[1]) > self.mineral_range:
                 continue
             for k, (mx, my) in enumerate(self._minerals):
@@ -321,6 +341,47 @@ class HazardMapNode(Node):
                     break
             else:
                 self._minerals.append((float(x), float(y)))
+
+    def _judge_minerals(self) -> None:
+        """검출된 "광물" 이 건물 벽은 아닌지 높이 지도로 가린다 (1 Hz).
+
+        건물의 노란·초록 부분을 광물로 잘못 보는 일이 있다 (terrain_00015 의 전함·막사:
+        지면 위 1.1~2.3 m 에 노란 광물이 있다고 71 회 검출). 진짜 광물은 땅에 놓여 있으므로
+        검출 위치가 둘레 바닥보다 훨씬 높거나, 그 자리에 높은 것이 서 있으면 광물이 아니다.
+        높이 지도가 아직 그 자리를 못 봤으면 판단을 미룬다 (가까이 가면 보인다).
+        """
+        if not self._undecided:
+            return
+        max_h = float(self.get_parameter("mineral_max_height_m").value)
+        max_relief = float(self.get_parameter("mineral_max_relief_m").value)
+        left = []
+        for (x, y, z, cls) in self._undecided:
+            rel = self.em.relief_at(x, y)
+            if rel is None:
+                left.append((x, y, z, cls))
+                continue
+            top, ground = rel
+            why = ""
+            if z - ground > max_h:
+                why = f"바닥보다 {z - ground:.2f} m 높은 곳"
+            elif top - ground > max_relief:
+                why = f"높이 {top - ground:.2f} m 인 것이 서 있는 자리"
+            if not why:
+                continue                         # 땅에 놓인 것 — 광물로 둔다
+            self._vetoed.append((x, y, z, cls, why))
+            self._minerals = [(mx, my) for (mx, my) in self._minerals
+                              if (mx - x) ** 2 + (my - y) ** 2 >= 1.0]
+            self.get_logger().info(
+                f"광물 아님: {cls} ({x:.2f},{y:.2f},{z:.2f}) — {why} (건물·벽으로 판단)")
+        self._undecided = left
+        from geometry_msgs.msg import PointStamped
+        stamp = self.get_clock().now().to_msg()
+        for (x, y, z, cls, _why) in self._vetoed:      # 늦게 뜬 구독자도 받도록 되풀이해 보낸다
+            m = PointStamped()
+            m.header.stamp = stamp
+            m.header.frame_id = cls
+            m.point.x, m.point.y, m.point.z = x, y, z
+            self.veto_pub.publish(m)
 
     def _pose_at(self, t: float):
         buf = self._odom

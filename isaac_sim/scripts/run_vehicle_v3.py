@@ -82,6 +82,12 @@ _p.add_argument("--wheel-grip", type=float, default=1.0,
                      "화성 레골리스 0.58/0.52 에서 등판 한계는 atan(0.52 × 배율): "
                      "1.0 → 27.5°, 1.25 → 33°, 1.5 → 38°. 올리면 더 가파른 곳을 오르지만 "
                      "앞이 들려 뒤로 넘어가는 일도 는다 (README '바퀴 접지력')")
+_p.add_argument("--cmd-queue", choices=["latest", "fifo"], default="latest",
+                help="주행 명령 구독: latest = 최신 명령 하나만 (기본), fifo = 원래대로 10 개를 "
+                     "쌓아 차례로 (명령이 0.5~1.6 초 늦게 듣는 원인 — 비교용)")
+_p.add_argument("--mineral-scale", type=float, default=1.0,
+                help="시험용: 광물 수 배율. 2 = 지형의 광물을 종류별로 두 배 (지도 전체에 고르게, "
+                     "지형 파일은 그대로). 한 번의 실행에 집기 시도를 늘려 비교를 쉽게 한다")
 _p.add_argument("--terrain-scanner", choices=["on", "off"], default="on",
                 help="로버 위 기둥의 360° 거리 스캐너 (/<ns>/terrain_scan, PointCloud2). "
                      "깊이 카메라(지면 위 19 cm, 정면 60°)가 못 보는 옆·뒤와 낮은 곳의 "
@@ -149,7 +155,8 @@ from planet_physics import MINERAL_MASS_KG, apply_mineral_mass, apply_planet_phy
 from wheel_colliders import lift_link_speed_cap, round_wheel_colliders  # noqa: E402
 from contact_grasp import ContactGrasp  # noqa: E402
 from wide_gripper import FrictionGrasp, install_wide_gripper  # noqa: E402
-from drive_limits import apply_drive_limits, limits_for_gravity, parse_limits  # noqa: E402
+from drive_limits import (apply_drive_limits, latest_command_only,  # noqa: E402
+                          limits_for_gravity, parse_limits)
 ISAAC_SIM = os.path.dirname(HERE)
 WORLD = f"{ISAAC_SIM}/worlds/{_a.terrain}.usd"
 V3 = f"{ISAAC_SIM}/assets/vehicle/vehicle_v3.usd"
@@ -1369,6 +1376,11 @@ def main() -> None:
         mineral_mass = MINERAL_MASS_KG if _a.physics != "earth" else None
     else:
         mineral_mass = float(_a.mineral_mass)
+    if _a.mineral_scale > 1.0:
+        from extra_minerals import spawn_extra
+        spawn_extra(stage, TERRAIN_DIR, terrain_meta, _a.mineral_scale,
+                    scene_root="/World/MarsScene",
+                    marker_dir=f"{ISAAC_SIM}/assets/markers")
     apply_mineral_mass(stage, mineral_mass, scene_root="/World/MarsScene")
     drive_limits = None
     if _a.drive_limits != "off":
@@ -1381,6 +1393,8 @@ def main() -> None:
         else:
             drive_limits = base
     apply_drive_limits(stage, rover_roots, drive_limits)
+    if _a.cmd_queue == "latest":
+        latest_command_only(stage, rover_roots)
     contact_grasp = None
     friction_grasp = None
     if _a.grasp in ("contact", "friction"):

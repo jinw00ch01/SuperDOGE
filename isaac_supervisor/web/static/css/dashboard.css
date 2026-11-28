@@ -227,6 +227,10 @@ body {
   width: min(100cqw, 100cqh);
   height: min(100cqw, 100cqh);
 }
+.map-legend { display: flex; flex-wrap: wrap; gap: 2px 9px; font-size: 10px; color: #c8d8ea;
+              letter-spacing: 0; text-transform: none; font-weight: 400; }
+.map-legend .lg { display: inline-flex; align-items: center; gap: 3px; white-space: nowrap; }
+.map-legend svg { width: 13px; height: 13px; flex: none; }
 .minimap-axes {
   position: absolute;
   inset: 0;

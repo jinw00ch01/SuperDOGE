@@ -262,3 +262,33 @@ def apply_drive_limits(stage, rover_roots, limits: dict | None) -> int:
           f"최고 {limits['max_lin']} m/s · {limits['max_ang']} rad/s, "
           f"가속 {limits['acc_lin']} m/s² · {limits['acc_ang']} rad/s²")
     return n
+
+
+def latest_command_only(stage, rover_roots, node_names=("SubTwist",)) -> int:
+    """주행 명령 구독 노드가 **가장 최근 명령 하나만** 갖고 있게 한다 (queueSize = 1).
+
+    왜 필요한가: 구독 노드(ROS2SubscribeTwist)는 그래프가 한 번 돌 때 메시지를 하나만
+    꺼내고, 기본 대기열은 10 개다. 그래프는 화면을 그릴 때 돈다 — `--render-every 2` 에
+    실시간 배율 0.6 이면 초당 18 번. 상위 노드는 초당 20 번 보내므로 대기열이 차오르고,
+    로버는 **0.5~1.6 초 전의 명령**으로 움직인다 (logs/min2_on: 감속 명령 뒤 속력이 줄기
+    시작하기까지 출발 직후 0.2 s → 대기열이 찬 뒤 0.75~1.6 s). 멈출 자리를 지나치고,
+    방향 수정도 그만큼 늦는다. 속도 명령은 최신 것만 뜻이 있으므로 쌓아 둘 이유가 없다.
+
+    return: 바꾼 노드 수.
+    """
+    from pxr import Sdf
+    n = 0
+    for root in rover_roots:
+        rp = stage.GetPrimAtPath(root)
+        if not rp or not rp.IsValid():
+            continue
+        for prim in Usd.PrimRange(rp):
+            if prim.GetTypeName() != "OmniGraphNode" or prim.GetName() not in node_names:
+                continue
+            attr = prim.GetAttribute("inputs:queueSize")
+            if not attr or not attr.IsValid():
+                attr = prim.CreateAttribute("inputs:queueSize", Sdf.ValueTypeNames.UInt64)
+            attr.Set(1)
+            n += 1
+    print(f"[drive] 주행 명령 대기열 1 (최신 명령만 사용): 노드 {n}개")
+    return n
