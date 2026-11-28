@@ -97,6 +97,9 @@ _p.add_argument("--terrain-scanner", choices=["on", "off"], default="on",
                      "깊이 카메라(지면 위 19 cm, 정면 60°)가 못 보는 옆·뒤와 낮은 곳의 "
                      "높낮이를 잰다. 광선은 물리 충돌 형상에 쏜다 (GPU 부담 없음)")
 _p.add_argument("--scanner-hz", type=float, default=2.0, help="지형 스캐너 주기 (시뮬레이션 시각 기준)")
+_p.add_argument("--camera-gate", choices=["on", "off"], default="on",
+                help="on: 영상 토픽을 구독하는 쪽이 없는 카메라는 그리지 않는다 (camera_gate.py). "
+                     "off: 모든 카메라를 늘 그린다 (예전 동작)")
 _p.add_argument("--link-speed-cap", choices=["off", "model"], default="off",
                 help="로버 link 의 선속도 상한. model = 로버 모델 그대로 (1.5 m/s 에서 속도를 "
                      "잘라 냄 — 주행뿐 아니라 넘어질 때 떨어지는 속도까지). off (기본) = 해제")
@@ -379,7 +382,7 @@ def _find_articulation_root(stage, rover_root: str = ""):
     return None
 
 
-def _update_chase_cam(stage, transform_op, state: dict) -> None:
+def _update_chase_cam(stage, transform_op, state: dict, alpha: float = 0.15) -> None:
     """rover 의 world transform 을 읽어 chase cam 위치/시선을 매 step 갱신.
 
     rover local +x = forward (Ackermann 주행 + spawn yaw=π/2 검증). chase 는
@@ -419,7 +422,7 @@ def _update_chase_cam(stage, transform_op, state: dict) -> None:
         if heading is None:
             heading = flat
         else:                                   # 급회전에 화면이 튀지 않게 조금씩 따라간다
-            heading = heading * 0.85 + flat * 0.15
+            heading = heading * (1.0 - alpha) + flat * alpha
             heading = heading / max(heading.GetLength(), 1e-6)
         state["heading"] = heading
     if heading is None:
@@ -983,6 +986,7 @@ class GraspBridge:
         node = _RclpyNode("grasp_bridge_listener")
         self._pending = []
         self._pickups = []
+        self.received = 0           # 받은 명령 수 (main loop 가 "더 받을 것이 있나" 판단에 씀)
         # ns → (status publisher, grasp FixedJoint path). arm_executor 가 pickup
         # 직후 이 토픽으로 실제 부착 여부를 확인한다 (data = 잡은 mineral prim
         # 이름, 안 잡았으면 빈 문자열).
@@ -1023,6 +1027,7 @@ class GraspBridge:
             pub.publish(msg)
 
     def _on_grasp(self, ns, msg):
+        self.received += 1
         if msg.angular.x < -0.5:
             self._pending.append(ns)
         elif msg.angular.x > 0.5:
@@ -1514,7 +1519,19 @@ def main() -> None:
         except Exception as exc:
             print(f"[run_v3] 지형 스캐너 초기화 실패 ({exc}) — 스캐너 없이 진행")
             terrain_scanner = None
+    camera_gate = None
+    if _a.camera_gate == "on" and grasp_bridge is not None:
+        try:
+            from camera_gate import CameraGate
+            camera_gate = CameraGate(stage, grasp_bridge.node)
+        except Exception as exc:
+            print(f"[run_v3] camera gate 초기화 실패 ({exc}) — 모든 카메라를 늘 그린다")
+            camera_gate = None
     scan_wall = 0.0
+    step_wall, step_cnt = [0.0, 0.0], [0, 0]      # [렌더 포함 step, 물리만 step] 의 시간·횟수
+    part_wall = [0.0, 0.0]                        # [집게 bridge, 추적 카메라] 에 쓴 시간
+    # 추적 카메라의 방향 따라가기: step 마다 15 % 씩이던 것을 렌더 간격에 맞춘 같은 빠르기로.
+    chase_alpha = 1.0 - 0.85 ** render_every
 
     step = 0
     chase_state: dict = {}
@@ -1525,7 +1542,16 @@ def main() -> None:
     try:
         flip_at = float(_a.flip_at)
         while app.is_running():
-            world.step(render=(step % render_every == 0))
+            _do_render = (step % render_every == 0)
+            _ts = time.perf_counter()
+            world.step(render=_do_render)
+            _te = time.perf_counter() - _ts
+            if _do_render:
+                step_wall[0] += _te
+                step_cnt[0] += 1
+            else:
+                step_wall[1] += _te
+                step_cnt[1] += 1
             if flip_at > 0.0 and float(world.current_time) >= flip_at:
                 flip_at = 0.0
                 _flip_first_rover(stage)
@@ -1548,12 +1574,24 @@ def main() -> None:
                 scan_wall += time.perf_counter() - _t0
             # rclpy bridge poll + pending release 처리. main thread 에서
             # 직접 stage 조작 (안전).
+            if camera_gate is not None:
+                try:
+                    camera_gate.step()
+                except Exception as exc:
+                    print(f"[run_v3] camera gate 오류 ({exc}) — 끔 (켜져 있던 그대로 둔다)")
+                    camera_gate = None
+            _tb = time.perf_counter()
             if grasp_executor is not None and grasp_bridge is not None:
                 try:
                     # 한 step 에 밀린 명령을 모두 처리 (pickup 은 팔이 내려오는
                     # 동안 연속으로 온다).
+                    # 받은 것이 없으면 한 번만 확인한다. 예전에는 늘 8 번 확인했고 (확인 한 번이
+                    # 약 0.6 ms) 로버 3 대에서 전체 시간의 11 % 가 여기였다.
                     for _ in range(8):
+                        _seen = grasp_bridge.received
                         grasp_executor.spin_once(timeout_sec=0.0)
+                        if grasp_bridge.received == _seen:
+                            break
                     sim_now = float(world.current_time)
                     for ns in grasp_bridge.drain_releases():
                         if friction_grasp is not None:
@@ -1584,12 +1622,17 @@ def main() -> None:
                               f"쥠={friction_grasp.last_held.get(ns_norm) or '-'}")
             elif _a.debug_grasp and step % 12 == 0:
                 _debug_grasp_trace(stage, bridge_namespaces, step)
-            # 단일 모드 chase cam.
-            if chase_xform_op is not None:
-                _update_chase_cam(stage, chase_xform_op, chase_state)
-            # multi 모드 per-rover chase cams.
-            for entry in multi_chase_cams:
-                _update_chase_cam(stage, entry["op"], entry["state"])
+            _tc = time.perf_counter()
+            part_wall[0] += _tc - _tb
+            # 추적 카메라는 다음 step 이 렌더일 때만 옮긴다 (그 사이 step 의 위치는 아무도 안 본다).
+            if (step + 1) % render_every == 0:
+                # 단일 모드 chase cam.
+                if chase_xform_op is not None:
+                    _update_chase_cam(stage, chase_xform_op, chase_state, chase_alpha)
+                # multi 모드 per-rover chase cams.
+                for entry in multi_chase_cams:
+                    _update_chase_cam(stage, entry["op"], entry["state"], chase_alpha)
+            part_wall[1] += time.perf_counter() - _tc
             if step % 600 == 0:
                 now = time.time()
                 dt = now - last_log_wall
@@ -1600,6 +1643,18 @@ def main() -> None:
                 print(f"[run_v3] running... step {step}  "
                       f"({rate:.1f} step/s, 600-step wall={dt:.2f}s, "
                       f"RTF={rate * physics_dt:.2f})")
+                if step_cnt[0]:
+                    _other = dt - step_wall[0] - step_wall[1]
+                    print(f"[run_v3] 시간 배분: 렌더 포함 step {1e3 * step_wall[0] / step_cnt[0]:.1f} ms "
+                          f"× {step_cnt[0]}, 물리만 step "
+                          f"{1e3 * step_wall[1] / max(step_cnt[1], 1):.1f} ms × {step_cnt[1]}, "
+                          f"그 밖 {_other:.2f} s ({100.0 * _other / max(dt, 1e-6):.0f} %) "
+                          f"[집게 bridge {part_wall[0]:.2f} s, 추적 카메라 {part_wall[1]:.2f} s, "
+                          f"스캐너 {scan_wall:.2f} s]")
+                    step_wall, step_cnt = [0.0, 0.0], [0, 0]
+                    part_wall = [0.0, 0.0]
+                if camera_gate is not None:
+                    print(f"[camera-gate] {camera_gate.summary()}")
                 if terrain_scanner is not None:
                     print(f"[run_v3] 지형 스캐너: 최근 (맞은 점, 자기 몸, 광선) "
                           f"{terrain_scanner.last_stats}, 이 구간 계산 시간 "

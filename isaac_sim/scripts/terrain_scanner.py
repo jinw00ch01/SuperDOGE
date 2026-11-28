@@ -115,9 +115,9 @@ class TerrainScanner:
             dist = np.full(len(dw), np.nan)
             own = 0
             root, q, rng_max = r["root"], self._query, self.max_range
-            for k in range(len(dw)):
-                d = dw[k]
-                hit = q.raycast_closest(o, (float(d[0]), float(d[1]), float(d[2])), rng_max)
+            # numpy 원소를 광선마다 꺼내면 느리다 → 파이썬 tuple 목록으로 한 번에 바꿔 둔다.
+            for k, d in enumerate([tuple(v) for v in dw.tolist()]):
+                hit = q.raycast_closest(o, d, rng_max)
                 if not hit["hit"]:
                     continue
                 if str(hit["rigidBody"]).startswith(root) or str(hit["collision"]).startswith(root):

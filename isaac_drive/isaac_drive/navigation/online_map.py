@@ -116,6 +116,14 @@ class OnlineObstacleLayer:
     def update_from_msg(self, msg) -> np.ndarray:
         """nav_msgs/OccupancyGrid → 격자 갱신. return: planner 해상도의 raw 위험 mask."""
         w, h, res = msg.info.width, msg.info.height, float(msg.info.resolution)
+        # 지난번과 똑같은 지도면 다시 계산하지 않는다 (로버가 서 있는 동안은 지도가 안 바뀐다.
+        # 한 번 계산에 10~19 ms: 거리 변환 두 번).
+        key = (w, h, res, bytes(memoryview(msg.data)) if not isinstance(msg.data, list)
+               else bytes((v & 0xFF) for v in msg.data))
+        if key == getattr(self, "_msg_key", None):
+            self.skipped_same = getattr(self, "skipped_same", 0) + 1
+            return self.raw
+        self._msg_key = key
         data = np.asarray(msg.data, dtype=np.int8).reshape(h, w)
         soft = (data > 0) & (data <= 50)
         if soft.any():

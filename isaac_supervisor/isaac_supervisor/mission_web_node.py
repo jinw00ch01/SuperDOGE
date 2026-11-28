@@ -385,6 +385,9 @@ class MissionWebRosNode(Node):
         self._last_state: Dict[str, dict] = {}
         self._last_odom: Dict[str, dict] = {}
         self._last_minimap: Dict[str, dict] = {}
+        self._minimap_sig: Dict[str, tuple] = {}     # 마지막으로 보낸 지도 (바뀌었는지 비교용)
+        self._odom_emit_ns: Dict[str, int] = {}      # 로버별 마지막 odom 전송 시각
+        self._cmd_emit_ns: Dict[str, int] = {}
         self._last_terrain: Dict[str, dict] = {}     # 주변 높낮이 (hazard_map_node 의 요약)
         self._last_minerals: Dict[str, dict] = {}    # 기억한 광물 (mission_manager)
         self._last_path: Dict[str, dict] = {}
@@ -644,6 +647,11 @@ class MissionWebRosNode(Node):
         # twist 는 채우지 않는다 → 수신측 v.x/v.y 가 항상 0. position 변화율로
         # numerical velocity 계산 (per-rover prev cache).
         now_ns = self.get_clock().now().nanoseconds
+        # 화면에는 초당 5 번이면 충분하다 — odom 은 초당 수십 번 오고, 그때마다 브라우저로
+        # 보내면 보내는 쪽(파이썬 Socket.IO)과 받는 쪽(지도 다시 그리기)이 모두 바쁘다.
+        if now_ns - self._odom_emit_ns.get(ns, 0) < int(0.2e9):
+            return
+        self._odom_emit_ns[ns] = now_ns
         speed = 0.0
         prev_map = getattr(self, "_prev_odom_for_speed", None)
         if prev_map is None:
@@ -670,6 +678,10 @@ class MissionWebRosNode(Node):
         self._emit("odom", ns, payload)
 
     def _on_cmd_vel(self, ns: str, msg: Twist) -> None:
+        now_ns = self.get_clock().now().nanoseconds
+        if now_ns - self._cmd_emit_ns.get(ns, 0) < int(0.2e9):      # 화면에는 초당 5 번
+            return
+        self._cmd_emit_ns[ns] = now_ns
         self._emit("cmd_vel", ns, {
             "lin": float(msg.linear.x),
             "ang": float(msg.angular.z),
@@ -778,22 +790,64 @@ class MissionWebRosNode(Node):
         self._emit("terrain", ns, payload)
 
     def _on_minimap(self, ns: str, msg: OccupancyGrid) -> None:
-        # OccupancyGrid -> compact dict the browser can paint on a canvas.
+        """OccupancyGrid → 브라우저가 canvas 에 그릴 수 있는 작은 묶음.
+
+        예전에는 칸 값을 숫자 목록 그대로 보냈다 (500×500 = 25 만 개, 로버마다 초당 3 번).
+        Socket.IO 가 그 목록을 파이썬으로 한 칸씩 훑고 JSON 으로 바꾸느라 이 노드가 CPU 한
+        코어의 76 % 를 썼고 그 80 % 가 여기였다 (로버 3 대, logs/prof1). 지도는 같은 값이 길게
+        이어지므로 "값,개수" 를 이어 붙인 문자열 하나로 보내고, 바뀌지 않았으면 보내지 않는다.
+        """
+        import numpy as np
+        raw = msg.data.tobytes() if hasattr(msg.data, "tobytes") else bytes(
+            (v & 0xFF) for v in msg.data)
+        meta = (int(msg.info.width), int(msg.info.height))
+        if self._minimap_sig.get(ns) == (meta, raw):
+            return
+        self._minimap_sig[ns] = (meta, raw)
+        a = np.frombuffer(raw, dtype=np.int8)
+        if a.size:
+            starts = np.concatenate(([0], np.flatnonzero(a[1:] != a[:-1]) + 1))
+            lens = np.diff(np.concatenate((starts, [a.size])))
+            rle = ",".join(map(str, np.column_stack(
+                (a[starts].astype(np.int64), lens)).ravel().tolist()))
+        else:
+            rle = ""
         payload = {
-            "w": int(msg.info.width),
-            "h": int(msg.info.height),
+            "w": meta[0],
+            "h": meta[1],
             "res": float(msg.info.resolution),
             "ox": float(msg.info.origin.position.x),
             "oy": float(msg.info.origin.position.y),
-            "data": list(msg.data),
+            "rle": rle,
         }
         self._last_minimap[ns] = payload
         self._emit("minimap", ns, payload)
 
 
+def _spin(node) -> None:
+    """노드를 돌린다 — 되면 EventsExecutor(rclpy.experimental)로.
+
+    기본 실행기는 콜백 하나를 처리할 때마다 구독·타이머 전체로 대기 목록을 다시 만든다.
+    콜백 자체보다 그 비용이 크다 (mission_manager: 콜백 3 %, 그 밖 9 %). EventsExecutor 는
+    준비된 것만 처리한다. ROVER_EXECUTOR=classic 이면 예전 실행기를 쓴다."""
+    import os
+    if os.environ.get("ROVER_EXECUTOR", "events") != "classic":
+        try:
+            from rclpy.experimental import EventsExecutor
+        except ImportError:
+            EventsExecutor = None
+        if EventsExecutor is not None:
+            executor = EventsExecutor()
+            executor.add_node(node)
+            node.get_logger().info("실행기: EventsExecutor")
+            executor.spin()
+            return
+    rclpy.spin(node)
+
+
 def _spin_ros(ros_node: Node) -> None:
     try:
-        rclpy.spin(ros_node)
+        _spin(ros_node)
     except Exception:
         pass
 

@@ -426,11 +426,32 @@ class CoverageNode(Node):
         super().destroy_node()
 
 
+def _spin(node) -> None:
+    """노드를 돌린다 — 되면 EventsExecutor(rclpy.experimental)로.
+
+    기본 실행기는 콜백 하나를 처리할 때마다 구독·타이머 전체로 대기 목록을 다시 만든다.
+    콜백 자체보다 그 비용이 크다 (mission_manager: 콜백 3 %, 그 밖 9 %). EventsExecutor 는
+    준비된 것만 처리한다. ROVER_EXECUTOR=classic 이면 예전 실행기를 쓴다."""
+    import os
+    if os.environ.get("ROVER_EXECUTOR", "events") != "classic":
+        try:
+            from rclpy.experimental import EventsExecutor
+        except ImportError:
+            EventsExecutor = None
+        if EventsExecutor is not None:
+            executor = EventsExecutor()
+            executor.add_node(node)
+            node.get_logger().info("실행기: EventsExecutor")
+            executor.spin()
+            return
+    rclpy.spin(node)
+
+
 def main(args: list[str] | None = None) -> None:
     rclpy.init(args=args)
     node = CoverageNode()
     try:
-        rclpy.spin(node)
+        _spin(node)
     except KeyboardInterrupt:
         pass
     finally:

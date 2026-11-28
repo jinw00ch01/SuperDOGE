@@ -65,7 +65,7 @@ class CamIntrinsics:
 def _image_to_bgr(msg: Image) -> np.ndarray:
     if msg.encoding not in ("rgb8", "bgr8"):
         raise ValueError(f"unsupported image encoding: {msg.encoding}")
-    buf = np.frombuffer(bytes(msg.data), dtype=np.uint8)
+    buf = np.frombuffer(msg.data, dtype=np.uint8)          # 복사 없이 본다
     img = buf.reshape(msg.height, msg.width, 3)
     if msg.encoding == "rgb8":
         img = img[..., ::-1]
@@ -170,12 +170,18 @@ class CamChannel:
         self.track_ttl_sec = 120.0
         self.used_memory = 0
 
+        self._done_stamp = None         # 마지막으로 처리한 영상의 stamp
+        self.skipped_same = 0
+        self.skipped_idle = 0
         self.frames_seen = 0
         self.frames_published = 0
         self.detections_total = 0
 
-        node.create_subscription(Image, rgb_topic, self._on_rgb, SENSOR_QOS)
-        node.create_subscription(Image, depth_topic, self._on_depth, SENSOR_QOS)
+        # 영상 구독은 set_active 로 켜고 끈다 — 시뮬레이터는 구독자가 없는 카메라를 그리지 않는다
+        # (isaac_sim/scripts/camera_gate.py). camera_info 는 늘 구독한다 (세지 않는다).
+        self._img_topics = (rgb_topic, depth_topic)
+        self._img_subs: list = []
+        self.set_active(True)
         node.create_subscription(CameraInfo, info_topic, self._on_info, SENSOR_QOS)
         if mode == "world" and odom_topic:
             node.create_subscription(Odometry, odom_topic, self._on_odom, SENSOR_QOS)
@@ -184,6 +190,19 @@ class CamChannel:
         self.pub_ann = None
         if publish_annotated:
             self.pub_ann = node.create_publisher(Image, ann_topic, ANNOTATED_QOS)
+
+    def set_active(self, on: bool) -> None:
+        """영상(컬러·깊이) 구독을 켜거나 끈다."""
+        if on and not self._img_subs:
+            self._img_subs = [
+                self.node.create_subscription(Image, self._img_topics[0], self._on_rgb, SENSOR_QOS),
+                self.node.create_subscription(Image, self._img_topics[1], self._on_depth, SENSOR_QOS),
+            ]
+        elif not on and self._img_subs:
+            for sub in self._img_subs:
+                self.node.destroy_subscription(sub)
+            self._img_subs = []
+            self.last_rgb = None
 
     def _log(self, msg: str, level: str = "info") -> None:
         # rclpy logger caches severity per source line, so call distinct
@@ -291,9 +310,24 @@ class CamChannel:
             yaw_rate = abs(float(np.arctan2(np.sin(dy), np.cos(dy)))) / dt
         return p, _quat_to_matrix(q), yaw_rate
 
-    def tick(self) -> None:
+    def tick(self, infer: bool = True) -> None:
         msg = self.last_rgb
         if msg is None:
+            return
+        # 이미 처리한 영상이면 건너뛴다. 타이머는 벽시계 10 Hz 인데 로버 3 대면 영상이 초당
+        # 6 장쯤만 와서, 추론의 41 % 가 같은 영상을 다시 돌린 것이었다 (logs/tri5: 60 초 동안
+        # 받은 영상 355 장에 추론 600 번). YOLO 3 개를 멈추면 시뮬레이터가 0.24 → 0.37 배속이 된다.
+        key = (msg.header.stamp.sec, msg.header.stamp.nanosec)
+        if key == self._done_stamp:
+            self.skipped_same += 1
+            return
+        self._done_stamp = key
+        if not infer:
+            # 쉬는 중 (손목 카메라를 쓰지 않는 단계) — 추론 없이 영상만 그대로 넘긴다 (HUD 용).
+            # 검출은 내지 않는다: 받는 쪽이 "오래된 검출" 로 보고 믿지 않게.
+            self.skipped_idle += 1
+            if self.pub_ann is not None:
+                self.pub_ann.publish(msg)
             return
         try:
             bgr = _image_to_bgr(msg)
@@ -502,6 +536,11 @@ class YoloPerceptionNode(Node):
         self.declare_parameter("wrist_ann_topic",   "/perception/wrist_image_annotated")
         self.declare_parameter("wrist_frame_id",    "wrist_camera_optical")
         self.declare_parameter("wrist_publish_annotated", True)
+        # 손목 카메라 추론은 팔이 쓸 때만 돌린다 (임무 단계가 아래 목록일 때 + 떠난 뒤 잠깐).
+        # phase_topic 이 비어 있으면 늘 돌린다 (예전 동작).
+        self.declare_parameter("phase_topic", "")
+        self.declare_parameter("wrist_active_phases", "PICK_READY")
+        self.declare_parameter("wrist_hold_sec", 5.0)
 
         model_path = str(self.get_parameter("model_path").value).strip()
         if not model_path:
@@ -515,7 +554,10 @@ class YoloPerceptionNode(Node):
             conf=float(self.get_parameter("conf_threshold").value),
             iou=float(self.get_parameter("iou_threshold").value),
         )
-        self.get_logger().info(f"YOLO loaded: {model_path}")
+        self.get_logger().info(
+            f"YOLO loaded: {model_path} (GPU 대기: "
+            f"{'CPU 쉼' if self.detector.blocking_wait else 'CPU 돌림(기본)'}, "
+            f"정밀도: {'FP16' if self.detector._fp16_kw else 'FP32'})")
 
         self.nav = CamChannel(
             node=self, name="nav", detector=self.detector,
@@ -551,6 +593,15 @@ class YoloPerceptionNode(Node):
                 object_radius_m=float(self.get_parameter("object_radius_m").value),
             )
 
+        self._phase = ""
+        self._wrist_active_until = 0.0
+        self._wrist_phases = {p.strip() for p in str(
+            self.get_parameter("wrist_active_phases").value).split(",") if p.strip()}
+        self._phase_topic = str(self.get_parameter("phase_topic").value).strip()
+        if self._phase_topic and self.wrist is not None:
+            from std_msgs.msg import String
+            self.create_subscription(String, self._phase_topic, self._on_phase, 10)
+
         rate_hz = max(0.5, float(self.get_parameter("publish_rate_hz").value))
         self.create_timer(1.0 / rate_hz, self._tick)
         log_period = max(0.5, float(self.get_parameter("log_period_sec").value))
@@ -559,29 +610,70 @@ class YoloPerceptionNode(Node):
             f"yolo_perception_node ready @ {rate_hz:.1f} Hz "
             f"(nav: world, wrist: {'optical' if self.wrist else 'disabled'})")
 
+    def _on_phase(self, msg) -> None:
+        self._phase = str(msg.data).strip()
+
+    def _wrist_needed(self) -> bool:
+        if not self._phase_topic:
+            return True
+        import time
+        now = time.monotonic()
+        # 단계를 아직 못 받았으면 (임무 관리자가 없거나 뜨는 중) 돌린다.
+        if not self._phase or self._phase in self._wrist_phases:
+            self._wrist_active_until = now + float(self.get_parameter("wrist_hold_sec").value)
+        return now < self._wrist_active_until
+
     def _tick(self) -> None:
         self.nav.tick()
         if self.wrist is not None:
-            self.wrist.tick()
+            need = self._wrist_needed()
+            # HUD 가 손목 영상을 보고 있으면 (검출 표시 영상의 구독자) 영상은 받아서 넘겨 준다.
+            viewed = (self.wrist.pub_ann is not None
+                      and self.wrist.pub_ann.get_subscription_count() > 0)
+            self.wrist.set_active(need or viewed)
+            self.wrist.tick(infer=need)
 
     def _log_status(self) -> None:
         line = (f"nav: seen={self.nav.frames_seen} pub={self.nav.frames_published} "
                 f"dets={self.nav.detections_total} turn_skip={self.nav.skipped_turning} "
+                f"same={self.nav.skipped_same} "
                 f"mem={self.nav.used_memory} "
                 f"have=[{self.nav.have_str()}]")
         if self.wrist is not None:
             line += (f" | wrist: seen={self.wrist.frames_seen} "
                      f"pub={self.wrist.frames_published} "
                      f"dets={self.wrist.detections_total} "
+                     f"same={self.wrist.skipped_same} idle={self.wrist.skipped_idle} "
                      f"have=[{self.wrist.have_str()}]")
         self.get_logger().info(line)
+
+
+def _spin(node) -> None:
+    """노드를 돌린다 — 되면 EventsExecutor(rclpy.experimental)로.
+
+    기본 실행기는 콜백 하나를 처리할 때마다 구독·타이머 전체로 대기 목록을 다시 만든다.
+    콜백 자체보다 그 비용이 크다 (mission_manager: 콜백 3 %, 그 밖 9 %). EventsExecutor 는
+    준비된 것만 처리한다. ROVER_EXECUTOR=classic 이면 예전 실행기를 쓴다."""
+    import os
+    if os.environ.get("ROVER_EXECUTOR", "events") != "classic":
+        try:
+            from rclpy.experimental import EventsExecutor
+        except ImportError:
+            EventsExecutor = None
+        if EventsExecutor is not None:
+            executor = EventsExecutor()
+            executor.add_node(node)
+            node.get_logger().info("실행기: EventsExecutor")
+            executor.spin()
+            return
+    rclpy.spin(node)
 
 
 def main(args: list[str] | None = None) -> None:
     rclpy.init(args=args)
     node = YoloPerceptionNode()
     try:
-        rclpy.spin(node)
+        _spin(node)
     except KeyboardInterrupt:
         pass
     finally:

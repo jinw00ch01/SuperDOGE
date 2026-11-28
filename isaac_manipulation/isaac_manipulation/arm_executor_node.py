@@ -238,27 +238,14 @@ class ArmExecutorNode(Node):
         self.grasp_pub = self.create_publisher(
             Twist, str(self.get_parameter("grasp_command_topic").value), 10)
 
-        self.create_subscription(
-            DetectionArray, str(self.get_parameter("wrist_detections_topic").value),
-            self._on_wrist_detections, SENSOR_QOS)
-
-        self.create_subscription(
-            JointState, str(self.get_parameter("joint_state_topic").value),
-            self._on_joint_states, SENSOR_QOS)
-
-        # rover (= arm base via /ground_truth/odom chassisFrameId="base_link")
-        # world pose — world target IK 에서 mineral world → arm base local 변환에 필요.
-        self.create_subscription(
-            Odometry, str(self.get_parameter("odom_topic").value),
-            self._on_odom, SENSOR_QOS)
-
+        # 구독(손목 검출·관절·odom·집게 상태·손목 깊이)은 팔이 일하는 동안에만 한다 (_io_on/_io_off).
+        # 쉬는 팔이 초당 50 개쯤의 메시지를 받아 넘기느라 CPU 한 코어의 16 % 를 썼다 (콜백 자체는
+        # 0.1 %, 나머지는 rclpy 다중 스레드 실행기의 메시지당 비용) — 로버 3 대면 반 코어.
+        self._io_subs: list = []
         self._grasp_status_lock = threading.Lock()
         self._grasp_status_held: str = ""
         self._grasp_status_mono: float = 0.0   # 마지막 수신 시각 (monotonic)
         self._grasp_status_count: int = 0
-        self.create_subscription(
-            String, str(self.get_parameter("grasp_status_topic").value),
-            self._on_grasp_status, 10)
 
         self._wrist_lock = threading.Lock()
         self._wrist_dets: List[Detection] = []
@@ -266,10 +253,8 @@ class ArmExecutorNode(Node):
         self._wrist_depth: Optional[Image] = None
         self._wrist_depth_ns: int = 0
         self._wrist_K: Optional[np.ndarray] = None
-        self.create_subscription(
-            Image, str(self.get_parameter("wrist_depth_topic").value),
-            self._on_wrist_depth, SENSOR_QOS)
-        self.create_subscription(
+        # camera_info 는 값을 한 번 얻으면 구독을 끊는다.
+        self._wrist_info_sub = self.create_subscription(
             CameraInfo, str(self.get_parameter("wrist_info_topic").value),
             self._on_wrist_info, SENSOR_QOS)
         # Current arm joint positions (rad) from /joint_states_raw. None until
@@ -302,16 +287,16 @@ class ArmExecutorNode(Node):
         self._frozen_deg: Optional[List[float]] = None
 
         self._initial_home_sent = False
-        self.create_timer(1.0, self._send_initial_home_once)
+        self._home_timer = self.create_timer(1.0, self._send_initial_home_once)
 
         self.get_logger().info(
             "arm_executor_node ready: /execute_arm_task (wrist-cam visual servo + DLS-IK)")
 
     def _send_initial_home_once(self) -> None:
-        if self._initial_home_sent:
-            return
-        self._publish_joint_state(HOME_DEG)
-        self._initial_home_sent = True
+        if not self._initial_home_sent:
+            self._publish_joint_state(HOME_DEG)
+            self._initial_home_sent = True
+        self._home_timer.cancel()
 
     def _on_wrist_detections(self, msg: DetectionArray) -> None:
         with self._wrist_lock:
@@ -326,6 +311,46 @@ class ArmExecutorNode(Node):
     def _on_wrist_info(self, msg: CameraInfo) -> None:
         if self._wrist_K is None and msg.k[0] > 0.0:
             self._wrist_K = np.array(msg.k, dtype=np.float64).reshape(3, 3)
+        if self._wrist_K is not None and self._wrist_info_sub is not None:
+            sub, self._wrist_info_sub = self._wrist_info_sub, None
+            self.destroy_subscription(sub)
+
+    def _io_on(self) -> None:
+        """팔이 일을 시작할 때: 필요한 토픽을 구독하고 첫 값이 올 때까지 잠깐 기다린다."""
+        if not self._io_subs:
+            g = lambda n: str(self.get_parameter(n).value)      # noqa: E731
+            self._io_subs = [
+                self.create_subscription(DetectionArray, g("wrist_detections_topic"),
+                                         self._on_wrist_detections, SENSOR_QOS),
+                self.create_subscription(JointState, g("joint_state_topic"),
+                                         self._on_joint_states, SENSOR_QOS),
+                # rover (= arm base) world pose — mineral world → arm base 변환에 필요.
+                self.create_subscription(Odometry, g("odom_topic"), self._on_odom, SENSOR_QOS),
+                self.create_subscription(String, g("grasp_status_topic"),
+                                         self._on_grasp_status, 10),
+                self.create_subscription(Image, g("wrist_depth_topic"),
+                                         self._on_wrist_depth, SENSOR_QOS),
+            ]
+        t_end = time.monotonic() + 2.0
+        while time.monotonic() < t_end and (
+                self._rover_xyz is None or self._current_arm_q_rad is None):
+            time.sleep(0.02)
+
+    def _io_off(self) -> None:
+        """일이 끝나면 구독을 끊고, 다음에 오래된 값을 쓰지 않게 지운다."""
+        subs, self._io_subs = self._io_subs, []
+        for sub in subs:
+            self.destroy_subscription(sub)
+        with self._wrist_lock:
+            self._wrist_depth = None
+            self._wrist_dets = []
+        with self._odom_lock:
+            self._rover_xyz = None
+            self._rover_yaw = None
+            self._rover_R = None
+            self._odom_hist = []
+        self._rtf_hist = []          # 속도 추정값(_rtf)은 남긴다 — 다음 일의 첫 1 초 동안 쓴다
+        self._current_arm_q_rad = None
 
     # ── 시뮬레이션 속도에 맞춘 시계 ─────────────────────────────────────
     # 이 노드의 기다림(팔이 따라올 시간, 집게가 닫힐 시간, 궤적 보간 주기)은 로버 1 대
@@ -437,6 +462,7 @@ class ArmExecutorNode(Node):
         (쥐고 있던 광물도 쥔 채). 다시 움직이려면 "home" 명령을 보낸다.
         """
         self._active_goal = goal_handle
+        self._io_on()
         try:
             return self._run_command(goal_handle)
         except _ArmCanceled:
@@ -449,6 +475,7 @@ class ArmExecutorNode(Node):
                                          message="canceled — arm stopped in place")
         finally:
             self._active_goal = None
+            self._io_off()
 
     def _execute_home(self, goal_handle):
         """멈춰 있던 팔을 HOME 으로 되돌리고 집게를 연다 (E-STOP 해제 뒤)."""

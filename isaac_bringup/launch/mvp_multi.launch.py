@@ -150,6 +150,7 @@ def _rover_group(ns: str, terrain_dir: str, collection_goal: int,
                 "wrist_info_topic":  f"{nsp}/camera/wrist/camera_info",
                 "wrist_det_topic":   f"{nsp}/perception/wrist_detections",
                 "wrist_ann_topic":   f"{nsp}/perception/wrist_image_annotated",
+                "phase_topic":       f"{nsp}/mission/phase",
             }],
         ),
         # T3 coverage — BCD anchor sweep + A* obstacle 회피

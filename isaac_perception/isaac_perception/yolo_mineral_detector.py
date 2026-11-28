@@ -34,9 +34,34 @@ class Detection:
     cy: float
 
 
+def _cuda_wait_blocking() -> bool:
+    """GPU 결과를 기다리는 동안 CPU 를 쉬게 한다 (cudaDeviceScheduleBlockingSync).
+
+    CUDA 의 기본값은 기다리는 동안 CPU 코어 하나를 계속 돌리는 것이다. 시뮬레이터와 GPU 를
+    나눠 쓰면 기다리는 시간이 길어서, 추론 한 번에 CPU 를 20~28 ms 썼다 (벽시계와 같음).
+    이 설정으로 10 ms 가 된다 (걸리는 시간은 같다). CUDA 를 처음 쓰기 전에 불러야 한다.
+    ROVER_YOLO_SPIN=1 이면 건너뛴다."""
+    import os
+    if os.environ.get("ROVER_YOLO_SPIN", "") == "1":
+        return False
+    try:
+        import ctypes
+        import torch  # noqa: F401
+        import torchvision  # noqa: F401  (자기 몫의 CUDA runtime 을 따로 싣는다)
+        ok = False
+        libs = sorted({line.split()[-1] for line in open("/proc/self/maps")
+                       if "libcudart" in line})
+        for path in libs:
+            ok |= ctypes.CDLL(path).cudaSetDeviceFlags(ctypes.c_uint(4)) == 0
+        return ok
+    except Exception:
+        return False
+
+
 class YoloMineralDetector:
     def __init__(self, model_path: str, conf: float = 0.5,
                  iou: float = 0.45, device: Optional[str] = None):
+        self.blocking_wait = _cuda_wait_blocking()
         try:
             from ultralytics import YOLO
         except ImportError as e:
@@ -51,15 +76,41 @@ class YoloMineralDetector:
         self.conf = conf
         self.iou = iou
         self.device = device
+        self._fp16_kw = self._pick_fp16()
         raw_names = self.model.names
         if isinstance(raw_names, dict):
             self.names = [raw_names[i] for i in sorted(raw_names.keys())]
         else:
             self.names = list(raw_names)
 
+    def _pick_fp16(self) -> dict:
+        """GPU 에서는 반정밀도(FP16)로 추론한다 — GPU 시간이 절반이다 (16 → 8 ms).
+
+        실제 카메라 영상 577 장으로 FP32 와 비교: 검출 수가 다른 것 1 장(conf 가 딱 0.50 인 것),
+        검출 115 개의 conf 차이 최대 0.002, 상자 차이 최대 0.53 px, 종류가 바뀐 것 0.
+        ultralytics 판에 따라 인자 이름이 다르다 (quantize / half) → 되는 것을 고른다.
+        ROVER_YOLO_FP32=1 이면 쓰지 않는다."""
+        import os
+        if os.environ.get("ROVER_YOLO_FP32", "") == "1":
+            return {}
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                return {}
+        except Exception:
+            return {}
+        dummy = np.zeros((480, 640, 3), dtype=np.uint8)
+        for kw in ({"quantize": "fp16"}, {"half": True}):
+            try:
+                self.model(dummy, conf=0.5, verbose=False, **kw)
+                return kw
+            except Exception:
+                continue
+        return {}
+
     def detect(self, bgr: np.ndarray) -> List[Detection]:
         """BGR 이미지 → Detection 리스트."""
-        kwargs = {"conf": self.conf, "iou": self.iou, "verbose": False}
+        kwargs = {"conf": self.conf, "iou": self.iou, "verbose": False, **self._fp16_kw}
         if self.device is not None:
             kwargs["device"] = self.device
         results = self.model(bgr, **kwargs)

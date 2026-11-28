@@ -285,7 +285,7 @@
     if (maps.length === 1) return maps[0];
     const ref = maps[0];
     const n = ref.w * ref.h;
-    const out = new Array(n);
+    const out = new Int8Array(n);
     for (let i = 0; i < n; i++) {
       let v = -1;
       for (const m of maps) {
@@ -299,8 +299,36 @@
     return { w: ref.w, h: ref.h, res: ref.res, ox: ref.ox, oy: ref.oy, data: out };
   }
 
+  // 배경(세 로버의 지도를 합쳐 색칠한 그림)은 지도가 바뀐 때에만 다시 만든다. 예전에는
+  // 위치 한 번 받을 때마다 25 만 칸 × 로버 수를 합치고 다시 칠해서 브라우저가 CPU 한 코어를 썼다.
+  let bgDirty = true, bgCache = null;
+  function background() {
+    if (!bgDirty && bgCache) return bgCache;
+    const m = mergeMinimaps();
+    if (!m) return null;
+    const { w, h, data } = m;
+    const tmp = document.createElement("canvas");
+    tmp.width = w; tmp.height = h;
+    const tctx = tmp.getContext("2d");
+    const img = tctx.createImageData(w, h);
+    const px = new Uint32Array(img.data.buffer);        // 0xAABBGGRR (little endian)
+    for (let i = 0; i < w * h; i++) {
+      const v = data[i];
+      px[i] = v < 0 ? 0xFF1E1612 : (v < 50 ? 0xFF4AD8FF : 0xFF5050FF);
+    }
+    tctx.putImageData(img, 0, 0);
+    bgCache = { w, h, res: m.res, ox: m.ox, oy: m.oy, canvas: tmp };
+    bgDirty = false;
+    return bgCache;
+  }
+  // 그리기 요청은 모아서 0.1 초에 한 번만 처리한다.
+  let paintTimer = null;
   function paintMap() {
-    const bgMap = mergeMinimaps();
+    if (paintTimer) return;
+    paintTimer = setTimeout(() => { paintTimer = null; paintMapNow(); }, 100);
+  }
+  function paintMapNow() {
+    const bgMap = background();
     if (!bgMap) {
       ctx.fillStyle = "#050a14";
       ctx.fillRect(0, 0, cvs.width, cvs.height);
@@ -310,23 +338,8 @@
       ctx.fillText("awaiting /mission/minimap...", cvs.width / 2, cvs.height / 2);
       return;
     }
-    const { w, h, data } = bgMap;
-    const img = ctx.createImageData(w, h);
-    for (let i = 0; i < w * h; i++) {
-      const v = data[i];
-      let r, g, b;
-      if (v < 0)        { r =  18; g =  22; b =  30; }
-      else if (v < 50)  { r = 255; g = 216; b =  74; }
-      else              { r = 255; g =  80; b =  80; }
-      const p = i * 4;
-      img.data[p]     = r;
-      img.data[p + 1] = g;
-      img.data[p + 2] = b;
-      img.data[p + 3] = 255;
-    }
-    const tmp = document.createElement("canvas");
-    tmp.width = w; tmp.height = h;
-    tmp.getContext("2d").putImageData(img, 0, 0);
+    const { w, h } = bgMap;
+    const tmp = bgMap.canvas;
     ctx.imageSmoothingEnabled = false;
     ctx.fillStyle = "#050a14";
     ctx.fillRect(0, 0, cvs.width, cvs.height);
@@ -549,9 +562,25 @@
     if (rid === activeRover) paintTerrain(rid);
   });
 
+  // 지도는 "값,개수,값,개수…" 문자열(rle)로 온다 → 칸 배열로 푼다.
+  function unpackMinimap(m) {
+    if (!m || m.data || typeof m.rle !== "string") return m;
+    const out = new Int8Array(m.w * m.h);
+    const parts = m.rle.split(",");
+    let k = 0;
+    for (let i = 0; i + 1 < parts.length; i += 2) {
+      const v = +parts[i], n = +parts[i + 1];
+      if (v !== 0) out.fill(v, k, k + n);
+      k += n;
+    }
+    m.data = out;
+    m.rle = null;
+    return m;
+  }
   sock.on("minimap", (m) => {
     const rid = m.rover_id || "";
-    ensureRover(rid).minimap = m;
+    ensureRover(rid).minimap = unpackMinimap(m);
+    bgDirty = true;
     paintMap();
   });
   sock.on("path", (p) => {

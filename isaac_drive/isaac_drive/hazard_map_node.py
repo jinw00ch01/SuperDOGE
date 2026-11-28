@@ -469,22 +469,30 @@ class HazardMapNode(Node):
         ci, cj = self.em.world_to_cell(float(p[0]), float(p[1]))
         ci, cj = int(ci), int(cj)
         n = (2 * half) // step
-        zz = np.full((n, n), np.nan, np.float32)
-        hz = np.zeros((n, n), bool)
         haz = self._elevation_hazard()
         i0, j0 = ci - half, cj - half
-        for a in range(n):
-            i = i0 + a * step
-            if i < 0 or i + step > self.em.rows:
-                continue
-            for b in range(n):
-                j = j0 + b * step
-                if j < 0 or j + step > self.em.cols:
-                    continue
-                blk = self.em.z[i:i + step, j:j + step]
-                if np.isfinite(blk).any():
-                    zz[a, b] = np.nanmean(blk)
-                    hz[a, b] = bool(haz[i:i + step, j:j + step].any())
+        # 칸 묶음(step × step)마다의 평균 높이·위험 여부. 예전에는 묶음마다 파이썬에서
+        # np.nanmean 을 불러서 (0.5 초마다 수천 번) 이 노드 CPU 의 절반을 여기서 썼다 → 한 번에 계산.
+        m = n * step
+        Z = np.full((m, m), np.nan, np.float32)
+        H = np.zeros((m, m), bool)
+        r0, r1 = max(i0, 0), min(i0 + m, self.em.rows)
+        c0, c1 = max(j0, 0), min(j0 + m, self.em.cols)
+        if r1 > r0 and c1 > c0:
+            Z[r0 - i0:r1 - i0, c0 - j0:c1 - j0] = self.em.z[r0:r1, c0:c1]
+            H[r0 - i0:r1 - i0, c0 - j0:c1 - j0] = haz[r0:r1, c0:c1]
+        Zb = Z.reshape(n, step, n, step)
+        fin = np.isfinite(Zb)
+        cnt = fin.sum(axis=(1, 3))
+        tot = np.where(fin, Zb, 0.0).sum(axis=(1, 3))
+        # 지도 밖으로 걸친 묶음은 비워 둔다 (예전 동작 그대로).
+        ia = i0 + np.arange(n) * step
+        ja = j0 + np.arange(n) * step
+        inside = ((ia >= 0) & (ia + step <= self.em.rows))[:, None] \
+            & ((ja >= 0) & (ja + step <= self.em.cols))[None, :]
+        ok = inside & (cnt > 0)
+        zz = np.where(ok, tot / np.maximum(cnt, 1), np.nan).astype(np.float32)
+        hz = H.reshape(n, step, n, step).any(axis=(1, 3)) & ok
         rel = np.round((zz - ground) / 0.05)
         out["patch"] = {
             "n": n, "cell": round(step * self.em.cell, 3),
@@ -576,11 +584,32 @@ class HazardMapNode(Node):
                 f"(기울기까지 {known.mean() * 100:.1f}%), 급경사·턱 {int(self.em.hazard_mask().sum())} 칸")
 
 
+def _spin(node) -> None:
+    """노드를 돌린다 — 되면 EventsExecutor(rclpy.experimental)로.
+
+    기본 실행기는 콜백 하나를 처리할 때마다 구독·타이머 전체로 대기 목록을 다시 만든다.
+    콜백 자체보다 그 비용이 크다 (mission_manager: 콜백 3 %, 그 밖 9 %). EventsExecutor 는
+    준비된 것만 처리한다. ROVER_EXECUTOR=classic 이면 예전 실행기를 쓴다."""
+    import os
+    if os.environ.get("ROVER_EXECUTOR", "events") != "classic":
+        try:
+            from rclpy.experimental import EventsExecutor
+        except ImportError:
+            EventsExecutor = None
+        if EventsExecutor is not None:
+            executor = EventsExecutor()
+            executor.add_node(node)
+            node.get_logger().info("실행기: EventsExecutor")
+            executor.spin()
+            return
+    rclpy.spin(node)
+
+
 def main(args: list[str] | None = None) -> None:
     rclpy.init(args=args)
     node = HazardMapNode()
     try:
-        rclpy.spin(node)
+        _spin(node)
     except KeyboardInterrupt:
         pass
     finally:
