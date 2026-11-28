@@ -17,13 +17,51 @@ hydra_texture.set_updates_enabled). 구독자가 생기면 다시 켠다 — 화
 camera_info 구독자는 세지 않는다 (영상을 안 보면서 info 만 붙들고 있는 노드가 있다).
 
 구독하는 쪽이 필요할 때만 구독해야 효과가 난다:
-  · yolo_perception_node — 손목 영상은 임무 단계가 APPROACH/PICK_READY 이거나 HUD 가 볼 때만
+  · yolo_perception_node — 손목 영상은 임무 단계가 PICK_READY 이거나 HUD 가 볼 때만
   · arm_executor_node   — 손목 깊이는 팔이 일하는 동안만
   · web_video_server     — 원래 보는 사람이 있을 때만 구독한다
 """
 from __future__ import annotations
 
 import time
+
+
+def merge_wrist_render(stage, rover_root: str) -> bool:
+    """손목 카메라를 한 번만 그린다 (`--wrist-merge on`, 기본). 시뮬레이션을 시작하기 전에 부른다.
+
+    vehicle_v3.usd 는 손목 카메라 하나를 컬러용(RPWristRgb)·깊이용(RPWristDepth) 렌더 대상
+    두 개로 따로 그린다 (같은 자리, 같은 640×480). 몸체 카메라는 렌더 대상 하나에서 컬러와
+    깊이를 같이 꺼낸다 — 손목도 그렇게 잇는다: 깊이·camera_info 발행을 RPWristRgb 로 옮기고
+    RPWristDepth 는 실행되지 않게 끊는다. 집는 동안 로버마다 렌더가 한 번 줄어든다.
+    """
+    import omni.graph.core as og
+
+    nodes = {}
+    from pxr import Usd
+    for prim in Usd.PrimRange(stage.GetPrimAtPath(rover_root)):
+        if prim.GetName() in ("OnTick", "RPWristRgb", "RPWristDepth", "CamWristDepth",
+                              "CamWristInfo") and prim.GetAttribute("node:type").IsValid():
+            nodes[prim.GetName()] = str(prim.GetPath())
+    need = ("RPWristRgb", "RPWristDepth", "CamWristDepth", "CamWristInfo")
+    if any(n not in nodes for n in need):
+        print(f"[camera-gate] {rover_root}: 손목 렌더 대상을 못 찾아 합치지 않음 "
+              f"(찾은 것 {sorted(nodes)})")
+        return False
+    at = lambda name, node: og.Controller.attribute(name, nodes[node])     # noqa: E731
+    try:
+        for helper in ("CamWristDepth", "CamWristInfo"):
+            for port_out, port_in in (("outputs:execOut", "inputs:execIn"),
+                                      ("outputs:renderProductPath", "inputs:renderProductPath")):
+                og.Controller.disconnect(at(port_out, "RPWristDepth"), at(port_in, helper))
+                og.Controller.connect(at(port_out, "RPWristRgb"), at(port_in, helper))
+        if "OnTick" in nodes:
+            og.Controller.disconnect(at("outputs:tick", "OnTick"),
+                                     at("inputs:execIn", "RPWristDepth"))
+        og.Controller.set(at("inputs:enabled", "RPWristDepth"), False)
+    except Exception as exc:
+        print(f"[camera-gate] {rover_root}: 손목 렌더 대상 합치기 실패 ({exc})")
+        return False
+    return True
 
 
 class CameraGate:

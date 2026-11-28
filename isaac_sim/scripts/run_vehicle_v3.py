@@ -100,6 +100,9 @@ _p.add_argument("--scanner-hz", type=float, default=2.0, help="지형 스캐너 
 _p.add_argument("--camera-gate", choices=["on", "off"], default="on",
                 help="on: 영상 토픽을 구독하는 쪽이 없는 카메라는 그리지 않는다 (camera_gate.py). "
                      "off: 모든 카메라를 늘 그린다 (예전 동작)")
+_p.add_argument("--wrist-merge", choices=["on", "off"], default="on",
+                help="on: 손목 카메라의 컬러와 깊이를 렌더 한 번에서 같이 꺼낸다 (몸체 카메라와 같은 방식). "
+                     "off: 따로 두 번 그린다 (예전 동작)")
 _p.add_argument("--link-speed-cap", choices=["off", "model"], default="off",
                 help="로버 link 의 선속도 상한. model = 로버 모델 그대로 (1.5 m/s 에서 속도를 "
                      "잘라 냄 — 주행뿐 아니라 넘어질 때 떨어지는 속도까지). off (기본) = 해제")
@@ -1342,6 +1345,10 @@ def main() -> None:
             n_scripts = _patch_script_nodes(stage, prim_path, ns)
             print(f"[run_v3]   patched {n_topics} topicName attrs, "
                   f"{n_scripts} ScriptNode(s) → namespace /{ns}")
+            if _a.wrist_merge == "on":
+                from camera_gate import merge_wrist_render
+                if merge_wrist_render(stage, prim_path):
+                    print("[run_v3]   손목 카메라: 컬러·깊이를 렌더 한 번으로 합침")
             # per-rover chase cam + OmniGraph (--no-chase 시 skip)
             if not _a.no_chase:
                 ns_norm = ns.strip("/").strip()
